@@ -48,36 +48,65 @@ any future user submissions):
 
 1. **OCR the screenshot** with the current pipeline to get an approximate
    board state, player names, and scores
-2. **Query the Woogles API** to search for the game:
-   - `GET /api/game_metadata/...` or use the Connect RPC API
+2. **Query the Woogles Twirp RPC API** to search for the game:
+   ```bash
+   # Fetch recent games for a player
+   curl -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetRecentGames \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"PlayerName","numGames":20,"offset":0}'
+
+   # Fetch GCG for a known game ID
+   curl -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetGCG \
+     -H 'Content-Type: application/json' \
+     -d '{"gameId":"GdTkgTga"}'
+
+   # Fetch full game document
+   curl -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetGameDocument \
+     -H 'Content-Type: application/json' \
+     -d '{"gameId":"GdTkgTga"}'
+   ```
    - Match on: player names + approximate scores + board pattern
-3. **If found**, extract the exact game state from the Woogles database as
-   golden ground truth — no manual annotation needed
+3. **If found**, replay the GCG to reconstruct the exact board state at the
+   turn matching the screenshot — this is the golden ground truth
 4. **Replay the game** to every turn position and take screenshots at each
    turn, multiplying one game into ~20 test cases
 
-The Woogles frontend uses Connect RPC (protobuf-based). The game history
-endpoint returns the full move list, from which any board state can be
-reconstructed.
+Game IDs on Woogles are short alphanumeric strings (e.g., `GdTkgTga`).
+Game URLs follow the pattern `https://woogles.io/game/<GameID>`.
 
 ### Source 3: GCG game archives
 
-GCG (Game Commentary and Grammar) files encode full Scrabble games:
+GCG (Game Commentary and Grammar) files encode full Scrabble games. Format
+spec: https://www.poslfit.com/scrabble/gcg/
 
 ```
-#player1 Player1Name Player1Name
-#player2 Player2Name Player2Name
->Player1Name: AEIORST 8D SATIRE +66 66
->Player2Name: BDEHLNO 7C BEHOLD +36 36
->Player1Name: CDEIMNW E5 WINCED +30 96
-...
+#player1 Brian Brian Cappelletto
+#player2 Peter Peter Morris
+#title 1991 Worlds Finals Game 3
+>Brian: CEGINOU 8D CUEING +24 24
+>Peter: IINORRW -IINORRW +0 0
+>Brian: AEEEOSY 7E YEA +17 41
+>Peter: AFIIOTU 6D OAF +34 34
 ```
+
+Key notation:
+- Coordinates: `8D` = row 8, column D, horizontal; `D8` = column D, row 8, vertical
+- Lowercase in words = blank tile (e.g., `InHALER` means blank played as N)
+- `?` in rack = blank tile in hand
+- `-TILES` = tile exchange
+- `--` = phoney withdrawal (challenged off)
 
 Sources of GCG files:
-- **Woogles.io game export** — download any completed game as GCG
-- **cross-tables.com** — archives of tournament games
-- **ISC archives** — historical Internet Scrabble Club games
-- **macondo** (liwords dependency) — may have test GCG files
+- **cross-tables.com** — ~48,600 annotated tournament games with download links
+  - Browse: https://www.cross-tables.com/annolistself.php
+  - Direct GCG URLs follow patterns like:
+    `https://cross-tables.com/annotated/selfgcg/171/anno17123.gcg`
+- **Woogles.io API** — fetch any completed game as GCG:
+  `POST /twirp/game_service.GameMetadataService/GetGCG {"gameId":"..."}`
+- **Kaggle: Raw woogles.io games** — monthly-updated dataset by Meg Risdal
+  https://www.kaggle.com/datasets/mrisdal/raw-wooglesio-games
+- **macondo** (liwords dependency) — test GCG files in the repo
+- **Quackle** — open-source Scrabble AI, natively reads/writes GCG
 
 Each GCG file can be replayed to generate a screenshot + CGP at every turn
 position, so a single game yields ~20 test cases across different board
@@ -91,17 +120,27 @@ state, cycle through combinations of:
 
 ### Theme / Color Mode
 - **Dark mode** (`.mode--dark` class on body; SCSS `$modes: dark`)
-- **Light mode** (default; SCSS `$modes: default`)
+- **Light mode** (default `.mode--default`; SCSS `$modes: default`)
 
-Set via: `document.body.classList.add('mode--dark')` or toggle in Settings.
-The Zustand UI store likely persists this to localStorage.
+Zustand store (`useUIStore`) has `themeMode: "light" | "dark"` with
+`toggleTheme()`. Persisted to localStorage key `darkMode`.
+
+Set via Playwright:
+```js
+await page.evaluate(() => localStorage.setItem('darkMode', 'true'));
+await page.reload();
+// Or directly: document.body.classList.replace('mode--default', 'mode--dark');
+```
 
 ### Tile Style
 - liwords has `tile_modes.scss` — different tile visual styles
+- localStorage key: `userTile`; body class: `tile--*`
 - Toggle between available tile themes
 
 ### Board Style
 - liwords has `board_modes.scss` — different board visual styles
+- localStorage key: `userBoard`; body class: `board--*`
+- Special: `bnjyMode` localStorage key for BNJY tile mode
 - Toggle between available board themes
 
 ### Viewport Size (device simulation)
@@ -278,12 +317,30 @@ Screenshot → OCR pipeline → approximate {board, scores, players}
                     Exact game state (golden CGP)
 ```
 
-Matching heuristics:
-- **Player names**: OCR from the screenshot, search Woogles user database
-- **Scores at turn N**: narrow down which turn the screenshot is from
-- **Board pattern**: even a partial board match (occupancy grid) uniquely
-  identifies the turn in a game
-- **Tile tracking area**: the unseen tiles list constrains the game state
+Matching algorithm:
+1. **OCR player names** from the screenshot
+2. **Query `GetRecentGames`** for each player name
+3. For each candidate game, **fetch its GCG** via `GetGCG`
+4. **Replay the GCG** turn by turn, computing board state + scores at each turn
+5. **Match**: find the turn where the board occupancy pattern and scores
+   best match the OCR'd screenshot (occupancy grid + score pair)
+6. The matched turn's exact board state is the golden CGP
+
+The occupancy grid alone (225 bits) is almost always unique to a specific
+turn in a specific game, so even imperfect OCR should match correctly.
+
+Concrete API calls:
+```bash
+# Step 1: Get recent games for player "exampleuser"
+curl -s -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetRecentGames \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"exampleuser","numGames":50,"offset":0}'
+
+# Step 2: For each game ID, fetch the GCG
+curl -s -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetGCG \
+  -H 'Content-Type: application/json' \
+  -d '{"gameId":"GdTkgTga"}'
+```
 
 This is a stretch goal — it requires OCR to already be decent — but it
 creates a virtuous cycle: better OCR → better matching → more ground truth →
