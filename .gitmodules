@@ -1,0 +1,3 @@
+[submodule "magpie"]
+	path = magpie
+	url = https://github.com/jvc56/MAGPIE.git

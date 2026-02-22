@@ -1,0 +1,5 @@
+.env
+build/
+testdata/
+magpie/data/
+magpie/testdata/
