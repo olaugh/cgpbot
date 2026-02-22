@@ -17,7 +17,176 @@ cgpbot/
 
 ## Data Sources
 
-### Source 1: Drive liwords locally with Playwright (synthetic screenshots)
+### Source 1: Curated Woogles Games (primary source)
+
+The primary test data comes from **real games played on Woogles.io**, fetched
+via their public Connect RPC API. No authentication required.
+
+**API base:** `https://woogles.io/api/game_service.GameMetadataService/`
+
+```bash
+# Fetch recent games for a player (paginated)
+curl -s -X POST 'https://woogles.io/api/game_service.GameMetadataService/GetRecentGames' \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"cesar","numGames":50,"offset":0}'
+
+# Fetch GCG for a completed game
+curl -s -X POST 'https://woogles.io/api/game_service.GameMetadataService/GetGCG' \
+  -H 'Content-Type: application/json' \
+  -d '{"gameId":"AmSAGtDHDU"}'
+
+# Fetch full structured game document (protobuf events)
+curl -s -X POST 'https://woogles.io/api/game_service.GameMetadataService/GetGameDocument' \
+  -H 'Content-Type: application/json' \
+  -d '{"gameId":"AmSAGtDHDU"}'
+```
+
+The `GetRecentGames` response includes rich metadata for filtering:
+`challenge_rule` (VOID/DOUBLE/FIVE_POINT), `lexicon`, `is_bot`, `scores`,
+`game_end_reason`, `game_mode`, `rating_mode`. There is no server-side
+search/filter — filtering must be done client-side after fetching.
+
+#### Curated game categories (~50 games)
+
+Each game replayed at every turn yields ~20 board positions, so 50 games
+produce ~1000 turn positions spanning empty through dense boards.
+
+**Category 1: Games with phony plays (10-12 games)**
+
+Phonies are plays that were challenged off the board. In GCG, they appear as:
+```
+>cesar: AADMNSU I7 D.MAN +29 61     ← cesar plays DAMAN
+>cesar: AADMNSU -- -29 32            ← challenged off, score reverts
+```
+In the structured API: `PHONY_TILES_RETURNED` event with `lost_score` field.
+
+Games with phonies are critical because the board state changes mid-turn —
+tiles appear then get removed, which tests whether we capture the correct
+post-challenge board state.
+
+| Game ID | Players | Phonies | Notes |
+|---------|---------|---------|-------|
+| `AmSAGtDHDU` | cesar vs BestBot | 1 | NWL23, DOUBLE challenge |
+| `vih65vN7zw` | BestBot vs cesar | 2 | NWL23 |
+| `x92DfARyWc` | cesar vs BestBot | 2 | NWL23 |
+| `We9r93HF6q` | BestBot vs cesar | 2 | NWL23 |
+| `Ju6yzk8ugd` | tarkovsky7 vs BestBot | 2 | NWL23 |
+| `CTDVDRDQkM` | BestBot vs magrathean | 2 | CSW24 |
+| `UyNCs9cPuf` | CarlSagan121520 vs BestBot | 2 | NWL23 |
+| `h3c2z3Uykv` | magrathean vs budak | both | CSW24, phony + challenge bonus |
+| `DoM4tL9vH2` | thisguy vs squush | yes | Human vs human |
+| `BzAQ3Gifu9` | Heron vs thisguy | yes | Human vs human |
+
+**Category 2: Endgame situations (5-7 games)**
+
+Endgame = bag is empty, players playing out remaining tiles. Dense boards
+with 80+ tiles. In GCG, end-of-game appears as:
+```
+>bnjy: ADEI K8 IDEA +14 450         ← final play-out
+>bnjy: (ETU) +6 456                 ← winner gets opponent's remaining tiles
+```
+
+Detect endgame by tracking tile count: start with 100 tiles (English), when
+`tiles_on_board + tiles_on_racks >= 100`, bag is empty. Typically the last
+4-6 moves of a game. Select games with 25+ moves for rich endgame positions.
+
+**Category 3: Blanks on board (8-10 games)**
+
+97% of Woogles games have blanks. Select games where blanks appear in
+different positions (early, mid, late) and as different letters. Blanks
+render differently in liwords (no point value indicator).
+
+**Category 4: Different board densities (10-12 games)**
+
+| Density | Move count | Examples |
+|---------|------------|----------|
+| Sparse (14-18 moves) | Short/resigned | `bpX9qVgNKy`, `HfdgNM5v4i` |
+| Medium (20-24 moves) | Typical game | `nSStvcU8Du`, `A8Y8jkW87S` |
+| Dense (25-28 moves) | Long endgame | `cWodMqmUWF`, `cZxGeijR6W` |
+
+**Category 5: Different lexicons and languages (8-10 games)**
+
+| Lexicon | Language | Letter Distribution | Notes |
+|---------|----------|---------------------|-------|
+| NWL23 | English (NA) | `english` | Most cesar games |
+| CSW24 | English (World) | `english` | `CTDVDRDQkM`, `YB6rxJBVGU` |
+| ECWL | English (Common) | `english` | Beginner-friendly |
+| RD29 | German | `german` | Ä, Ö, Ü tiles |
+| FRA24 | French | `french` | Accented characters (É, È, etc.) |
+| OSPS50 | Polish | `polish` | Ą, Ć, Ę, Ł, Ń, Ó, Ś, Ź, Ż tiles |
+| NSF25 | Norwegian | `norwegian` | Æ, Ø, Å tiles |
+| FILE2017 | Spanish | `spanish` | Ñ, CH, LL, RR digraphs |
+| DISC2 | Catalan | `catalan` | Ç, L·L, NY tiles |
+
+Non-English games are important because they have different alphabets,
+accented characters, and tile distributions that the OCR pipeline must
+handle correctly. Find these by searching for active players in each
+lexicon on Woogles.
+
+**Category 6: 21x21 Super boards (3-5 games)**
+
+The super crossword game uses a 21x21 board with the `english_super` letter
+distribution. In liwords, this renders with the `.zomgboard` CSS class and
+`--dim: 21` CSS variable. Tiles are smaller and there are more bonus squares.
+
+Find these by filtering `GetRecentGames` for games with
+`rules.board_layout_name` containing "Super" or by looking at games with
+`letter_distribution_name: "english_super"`.
+
+**Category 7: Special end conditions (3-4 games)**
+
+- Time penalty games: `YB6rxJBVGU` (has `(time) -10` notation)
+- Resigned games: `bpX9qVgNKy`
+- Games with exchanges (40% of games have them)
+- FIVE_POINT challenge rule: `YB6rxJBVGU`, `ytJoe9Fd9n`
+
+#### Game fetching script
+
+```python
+import requests, json, os
+
+API = "https://woogles.io/api/game_service.GameMetadataService"
+
+def get_recent_games(username, num=50, offset=0):
+    r = requests.post(f"{API}/GetRecentGames",
+        json={"username": username, "numGames": num, "offset": offset})
+    return r.json().get("game_info", [])
+
+def get_gcg(game_id):
+    r = requests.post(f"{API}/GetGCG", json={"gameId": game_id})
+    return r.json().get("gcg", "")
+
+def fetch_and_filter(username, pages=3):
+    """Fetch games and categorize them."""
+    all_games = []
+    for page in range(pages):
+        games = get_recent_games(username, 50, page * 50)
+        all_games.extend(games)
+
+    for g in all_games:
+        gcg = get_gcg(g["game_id"])
+        g["_gcg"] = gcg
+        g["_has_phony"] = "-- -" in gcg
+        g["_has_blank"] = any("?" in line for line in gcg.split("\n")
+                              if line.startswith(">"))
+        g["_has_exchange"] = any(line.split()[-3].startswith("-")
+                                 for line in gcg.split("\n")
+                                 if line.startswith(">") and " -" in line)
+        g["_move_count"] = sum(1 for line in gcg.split("\n")
+                               if line.startswith(">"))
+    return all_games
+
+# Fetch from known active players
+for player in ["cesar", "BestBot", "magrathean", "thisguy", "josh"]:
+    games = fetch_and_filter(player)
+    phony_games = [g for g in games if g["_has_phony"]]
+    # Save GCGs to testgen/gcg/
+    for g in games:
+        with open(f"testgen/gcg/{g['game_id']}.gcg", "w") as f:
+            f.write(g["_gcg"])
+```
+
+### Source 2: Drive liwords locally with Playwright
 
 liwords runs locally via `docker compose up` (Go API + React frontend +
 PostgreSQL + NATS + Redis). The frontend is React 19 + react-router v7 +
@@ -35,33 +204,30 @@ can also replay GCG files via the annotated game viewer.
 
 **Pipeline:**
 1. Start liwords via Docker Compose
-2. Playwright navigates to `/editor` (or `/anno/:gameID`)
-3. Load a board position (paste CGP, import GCG, or use the API)
-4. Apply variation settings (see "Variation Matrix" below)
-5. Take a fullscreen screenshot
-6. Save the screenshot + the known CGP as a test pair
+2. Use the game fetching script to download GCG files from Woogles
+3. Import GCG files into local liwords via the `ImportGCG` RPC
+4. Playwright navigates to `/editor/:gameID` (or `/anno/:gameID`)
+5. Step through turns to reach desired board position
+6. Apply variation settings (see "Variation Matrix" below)
+7. Take a screenshot
+8. Save the screenshot + the known CGP as a test pair
 
-### Source 2: Match real screenshots to Woogles database
+### Source 3: Match real screenshots to Woogles database
 
 For screenshots taken from real Woogles games (the existing 6 test cases and
 any future user submissions):
 
 1. **OCR the screenshot** with the current pipeline to get an approximate
    board state, player names, and scores
-2. **Query the Woogles Twirp RPC API** to search for the game:
+2. **Query the Woogles API** to search for the game:
    ```bash
    # Fetch recent games for a player
-   curl -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetRecentGames \
+   curl -s -X POST 'https://woogles.io/api/game_service.GameMetadataService/GetRecentGames' \
      -H 'Content-Type: application/json' \
-     -d '{"username":"PlayerName","numGames":20,"offset":0}'
+     -d '{"username":"PlayerName","numGames":50,"offset":0}'
 
    # Fetch GCG for a known game ID
-   curl -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetGCG \
-     -H 'Content-Type: application/json' \
-     -d '{"gameId":"GdTkgTga"}'
-
-   # Fetch full game document
-   curl -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetGameDocument \
+   curl -s -X POST 'https://woogles.io/api/game_service.GameMetadataService/GetGCG' \
      -H 'Content-Type: application/json' \
      -d '{"gameId":"GdTkgTga"}'
    ```
@@ -71,10 +237,15 @@ any future user submissions):
 4. **Replay the game** to every turn position and take screenshots at each
    turn, multiplying one game into ~20 test cases
 
-Game IDs on Woogles are short alphanumeric strings (e.g., `GdTkgTga`).
-Game URLs follow the pattern `https://woogles.io/game/<GameID>`.
+The occupancy grid alone (225 bits for 15x15, or 441 bits for 21x21) is
+almost always unique to a specific turn in a specific game, so even
+imperfect OCR should match correctly.
 
-### Source 3: GCG game archives
+This is a stretch goal — it requires OCR to already be decent — but it
+creates a virtuous cycle: better OCR → better matching → more ground truth →
+even better OCR.
+
+### Source 4: GCG game archives
 
 GCG (Game Commentary and Grammar) files encode full Scrabble games. Format
 spec: https://www.poslfit.com/scrabble/gcg/
@@ -94,18 +265,32 @@ Key notation:
 - Lowercase in words = blank tile (e.g., `InHALER` means blank played as N)
 - `?` in rack = blank tile in hand
 - `-TILES` = tile exchange
-- `--` = phoney withdrawal (challenged off)
+- `--` = phony withdrawal (challenged off); same player, same rack, negative score
+- `(challenge) +5` = successful challenge defense (bonus under FIVE_POINT rules)
+- `(TILES)` = end-of-game rack subtraction (opponent's remaining tiles)
+- `(time) -10` = time penalty
 
-Sources of GCG files:
+Example of a phony play followed by challenge:
+```
+>cesar: AADMNSU I7 D.MAN +29 61
+>cesar: AADMNSU -- -29 32
+```
+
+Example of endgame play-out:
+```
+>bnjy: ADEI K8 IDEA +14 450
+>bnjy: (ETU) +6 456
+```
+
+Additional GCG sources (beyond Woogles API):
 - **cross-tables.com** — ~48,600 annotated tournament games with download links
   - Browse: https://www.cross-tables.com/annolistself.php
   - Direct GCG URLs follow patterns like:
     `https://cross-tables.com/annotated/selfgcg/171/anno17123.gcg`
-- **Woogles.io API** — fetch any completed game as GCG:
-  `POST /twirp/game_service.GameMetadataService/GetGCG {"gameId":"..."}`
 - **Kaggle: Raw woogles.io games** — monthly-updated dataset by Meg Risdal
   https://www.kaggle.com/datasets/mrisdal/raw-wooglesio-games
-- **macondo** (liwords dependency) — test GCG files in the repo
+  (Note: only covers BasicBot games with VOID challenge — no phonies)
+- **macondo** (liwords dependency) — 26 test GCG files in the repo
 - **Quackle** — open-source Scrabble AI, natively reads/writes GCG
 
 Each GCG file can be replayed to generate a screenshot + CGP at every turn
@@ -185,40 +370,73 @@ Implement by:
 - 90%, 100%, 110%, 125% zoom levels
 - Set via: `page.evaluate(() => document.body.style.zoom = '1.1')`
 
+### Board Dimensions
+- **Standard 15x15**: Default CrosswordGame layout (CSS `--dim: 15`)
+- **Super 21x21**: Super crossword game (CSS `--dim: 21`, `.zomgboard` class)
+
+The 21x21 board has smaller tiles at every viewport size, more bonus squares,
+and uses the `english_super` letter distribution (more tiles in the bag).
+
+### Language / Tile Set
+- **English** (NWL23 / CSW24): Standard A-Z tiles
+- **German** (RD29): Includes Ä, Ö, Ü tiles
+- **French** (FRA24): Includes É, È, Ê, Ë, etc.
+- **Polish** (OSPS50): Includes Ą, Ć, Ę, Ł, Ń, Ó, Ś, Ź, Ż
+- **Norwegian** (NSF25): Includes Æ, Ø, Å
+- **Spanish** (FILE2017): Includes Ñ, CH, LL, RR
+- **Catalan** (DISC2): Includes Ç, L·L, NY
+
+Different languages affect:
+- The characters on tiles (accented/special characters)
+- Tile point values and distributions
+- The number of tiles in the bag
+- Lexicon badge display
+
 ### Game State Density
 - **Early game**: 1-3 words, mostly empty board (5-15 tiles)
 - **Mid game**: moderate coverage (30-60 tiles)
-- **Late game**: dense board (60-80+ tiles)
-- **With blanks on board**: at least one lowercase-letter tile
+- **Late game / endgame**: dense board (60-80+ tiles), bag empty
+- **Post-phony**: board state after a word was challenged off
+- **With blanks on board**: at least one blank tile (displayed without points)
 - **With blanks on rack**: blank tile visible in rack
 - **Recently played tiles highlighted**: last move shown in orange/gold
 
 ### Score / UI Variations
 - Low scores vs high scores (affects digit count in score display)
-- Different lexicon badges (NWL23, CSW21, ECWL, etc.)
+- Different lexicon badges (NWL23, CSW24, ECWL, RD29, FRA24, etc.)
 - Tile bag visible vs hidden
 - Timer visible vs hidden
+- Challenge rule indicator (VOID, DOUBLE, FIVE_POINT)
 
 ## Combinatorial Explosion
 
 Rough count:
-- 50 board positions (from ~3 games, each replayed at ~17 turns)
-- 2 color modes
-- 2 tile styles
+- ~1000 board positions (from ~50 Woogles games, each replayed at ~20 turns)
+- 2 color modes (light, dark)
+- 5 board themes (Cheery, Forest, Aflame, Vintage, Mahogany)
+- 4 tile themes (Charcoal, Whitish, Balsa, Tealish)
+- 2 board sizes (15x15, 21x21)
+- 9 languages
 - 12 viewport sizes
-- 4 crop styles
-- 3 zoom levels
+- 6 crop styles
+- 4 zoom levels
 
-**50 x 2 x 2 x 12 x 4 x 3 = 28,800 test cases**
+The full cross-product is astronomically large. Use stratified sampling:
 
-That's way too many. Use stratified sampling:
+1. **Canonical set** (~500 cases): Core positions covering all game
+   categories (phonies, endgames, blanks, each language, 21x21) x
+   {dark, light} x {mobile, desktop}. Full pipeline eval runs against this.
+2. **Stress set** (~1000 cases): Random sample from the full matrix, biased
+   toward edge cases (tiny viewports, extreme zoom, tight crops, rotation,
+   non-English languages, post-phony board states).
+3. **Regression set** (~50-100 cases): Hand-picked cases that previously
+   failed. Add new cases when bugs are found.
 
-1. **Canonical set** (~200 cases): Every board position x {dark, light} x
-   {mobile, desktop} = 50 x 2 x 2. Full pipeline eval runs against this.
-2. **Stress set** (~500 cases): Random sample from the full matrix, biased
-   toward edge cases (tiny viewports, extreme zoom, tight crops, rotation).
-3. **Regression set** (~50 cases): Hand-picked cases that previously failed.
-   Add new cases when bugs are found.
+Priority for initial generation:
+1. English games with phonies and endgames (highest immediate value)
+2. Each non-English language with at least 5 positions
+3. 21x21 super board with at least 10 positions
+4. Variation matrix (themes, viewports, crops) applied to a subset
 
 ## Playwright Script Outline
 
@@ -329,53 +547,60 @@ Matching algorithm:
 The occupancy grid alone (225 bits) is almost always unique to a specific
 turn in a specific game, so even imperfect OCR should match correctly.
 
-Concrete API calls:
-```bash
-# Step 1: Get recent games for player "exampleuser"
-curl -s -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetRecentGames \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"exampleuser","numGames":50,"offset":0}'
-
-# Step 2: For each game ID, fetch the GCG
-curl -s -X POST https://woogles.io/twirp/game_service.GameMetadataService/GetGCG \
-  -H 'Content-Type: application/json' \
-  -d '{"gameId":"GdTkgTga"}'
-```
-
 This is a stretch goal — it requires OCR to already be decent — but it
 creates a virtuous cycle: better OCR → better matching → more ground truth →
 even better OCR.
 
 ## Implementation Steps
 
-### Phase 1: Submodule + Docker setup
+### Phase 1: Scrape Woogles games
+1. Write the game fetching script (Python) to download GCG files from Woogles
+2. Fetch games from known active players: cesar, BestBot, magrathean,
+   thisguy, josh, tarkovsky7, squush, woogie
+3. Filter and categorize: phonies, endgames, blanks, different lexicons
+4. Find non-English games by searching for players in each lexicon
+5. Find 21x21 super games
+6. Save curated GCG files to `testgen/gcg/` with metadata JSON sidecar
+7. Target: ~50 games across all categories
+
+### Phase 2: Submodule + Docker setup
 1. Add liwords as a git submodule
 2. Write a `testgen/docker-compose.override.yml` if needed
 3. Verify `docker compose up` works and `/editor` is accessible
 4. Document the setup in README
 
-### Phase 2: Basic Playwright generation
+### Phase 3: GCG parser + ground truth
+1. Write a GCG parser (TypeScript or Go) that computes board state at each
+   turn, correctly handling:
+   - Phony withdrawals (tiles placed then removed)
+   - Blank tiles (lowercase = blank designating that letter)
+   - Tile exchanges
+   - End-of-game rack subtraction
+2. Output CGP for each turn position — this is the offline ground truth
+3. Test parser against known game states
+
+### Phase 4: Basic Playwright generation
 1. Install Playwright in `testgen/`
-2. Write script to load a hardcoded position in the editor
-3. Take one screenshot in dark mode, one in light mode
-4. Extract CGP from the known position
-5. Verify the test pair works with `cgptest --test`
+2. Import a GCG file into local liwords via the `ImportGCG` RPC
+3. Navigate to the editor, step through turns
+4. Take one screenshot per turn in default settings
+5. Pair with offline-computed CGP ground truth
+6. Verify test pairs work with `cgptest --test`
 
-### Phase 3: GCG replay
-1. Write a GCG parser (TypeScript or Go) that computes board state at each turn
-2. Feed positions into the editor via Playwright
-3. Generate test pairs for every turn of a game
+### Phase 5: Variation matrix
+1. Add theme cycling (dark/light, board themes, tile themes)
+2. Add viewport/device presets
+3. Add crop logic (full page, board-only, margin, off-center)
+4. Add zoom variations
+5. Add non-English language game rendering
+6. Add 21x21 board rendering
+7. Sample from the full matrix to build canonical + stress + regression sets
 
-### Phase 4: Variation matrix
-1. Add viewport/device presets
-2. Add crop logic
-3. Add zoom variations
-4. Sample from the full matrix to build canonical + stress sets
-
-### Phase 5: Woogles game matching (stretch)
-1. Research the Woogles Connect RPC API for game search
-2. Build a matching script that takes a CGP + player names and queries Woogles
-3. Extract golden ground truth for matched games
+### Phase 6: Woogles game matching (stretch)
+1. Build a matching script that takes OCR output + player names and queries
+   Woogles for the source game
+2. Extract golden ground truth for matched games
+3. Add matched games to the regression set
 
 ## Integration with Existing Test Runner
 
@@ -384,11 +609,20 @@ exactly what `run_tests_cli()` in `testapp.cpp` expects (lines 365-464).
 No changes needed to the test runner.
 
 Consider adding metadata to each test case (a `.json` sidecar) recording:
+- Source game ID (Woogles game ID for traceability)
+- Turn number within the game
 - Source (generated vs real screenshot)
 - Device profile
-- Color mode
+- Color mode, board theme, tile theme
+- Board dimensions (15x15 or 21x21)
+- Language / lexicon
 - Board density (tile count)
-- Whether blanks are present
+- Whether blanks are present on board
+- Whether this turn follows a phony withdrawal
+- Whether this is an endgame position (bag empty)
+- Challenge rule
 
 This enables **sliced metrics**: "What's our accuracy on mobile dark mode
-screenshots with >60 tiles on the board?"
+screenshots?" / "How do we perform on German games?" / "Do we handle
+post-phony board states correctly?" / "Is 21x21 accuracy comparable to
+15x15?"
