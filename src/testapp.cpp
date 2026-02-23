@@ -757,6 +757,11 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
         <h3 style="font-size:.85rem;color:#aaa;margin-bottom:8px">Verification Crops</h3>
         <div id="crops-container" style="display:flex;flex-wrap:wrap;gap:8px"></div>
       </div>
+      <div id="transposed-area" style="display:none;margin-top:16px">
+        <h3 style="font-size:.85rem;color:#aaa;margin-bottom:8px">Transposed Board OCR (columns as rows)</h3>
+        <img id="transposed-img" style="max-width:100%;border-radius:6px;image-rendering:pixelated">
+        <div id="transposed-disagree" style="margin-top:8px;font-size:.75rem;line-height:2"></div>
+      </div>
     </div>
   </div>
   <div>
@@ -892,6 +897,20 @@ async function processStream(res){
             cc.appendChild(d);
           }
           ca.style.display='block';
+        }
+        if(data.transposed_image){
+          document.getElementById('transposed-img').src=data.transposed_image;
+          document.getElementById('transposed-area').style.display='block';
+        }
+        if(data.transposed_disagree){
+          const td=document.getElementById('transposed-disagree');
+          if(data.transposed_disagree.length===0){
+            td.innerHTML='<span style="color:#8f8">&#10003; Transposed OCR agrees with main OCR on all occupied cells.</span>';
+          }else{
+            td.innerHTML='Disagreements: '+data.transposed_disagree.map(
+              x=>`<span style="background:#2a1010;border:1px solid #a33;padding:1px 6px;border-radius:3px;margin:2px;display:inline-block">${x.pos}: <b>${x.orig}</b>&rarr;<b style="color:#f88">${x.trans}</b></span>`
+            ).join(' ');
+          }
         }
         if(data.cgp){
           cgpOut.value=data.cgp;
@@ -1641,6 +1660,51 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
+    // Build transposed board image: each column of the real board becomes a row.
+    // transposed cell (tr, tc) = original cell (row=tc, col=tr).
+    // Letters stay upright — cells are only rearranged, not rotated.
+    std::vector<uint8_t> transposed_png;
+    std::string transposed_occ_grid;
+    std::string prompt_t, payload_t;
+    CellResult transposed_cells[15][15] {};
+    bool have_transposed_ocr = false;
+    std::future<GeminiCallResult> transposed_fut;
+
+    if (have_opencv) {
+        int bx_t, by_t, cs_t;
+        if (parse_board_rect_from_log(opencv_dr.log, bx_t, by_t, cs_t)) {
+            cv::Mat raw_t(1, static_cast<int>(buf.size()), CV_8UC1,
+                          const_cast<uint8_t*>(buf.data()));
+            cv::Mat img_t = cv::imdecode(raw_t, cv::IMREAD_COLOR);
+            if (!img_t.empty()) {
+                int tsz = 15 * cs_t;
+                cv::Mat timg(tsz, tsz, CV_8UC3, cv::Scalar(30, 30, 30));
+                for (int tr = 0; tr < 15; tr++) {
+                    for (int tc = 0; tc < 15; tc++) {
+                        // source: original cell (row=tc, col=tr)
+                        int sx = bx_t + tr * cs_t;
+                        int sy = by_t + tc * cs_t;
+                        // dest: transposed position (row=tr, col=tc)
+                        int dx = tc * cs_t;
+                        int dy = tr * cs_t;
+                        if (sx < 0 || sy < 0 ||
+                            sx + cs_t > img_t.cols ||
+                            sy + cs_t > img_t.rows) continue;
+                        img_t(cv::Rect(sx, sy, cs_t, cs_t)).copyTo(
+                            timg(cv::Rect(dx, dy, cs_t, cs_t)));
+                    }
+                }
+                cv::imencode(".png", timg, transposed_png);
+            }
+            // Transposed occupancy: occ[tr][tc] = get_occupied(tc, tr)
+            for (int tr = 0; tr < 15; tr++) {
+                if (tr > 0) transposed_occ_grid += "\\n";
+                for (int tc = 0; tc < 15; tc++)
+                    transposed_occ_grid += get_occupied(tc, tr) ? 'X' : '.';
+            }
+        }
+    }
+
     // Show occupancy mask on the board (empty tiles, no letters)
     if (have_opencv) {
         DebugResult mask_dr;
@@ -1779,12 +1843,55 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"" + b64 + "\"}}"
         "]}]}";
 
+    // Build transposed board Gemini payload
+    if (!transposed_png.empty()) {
+        prompt_t = "Look at this Scrabble board image. Each row shows what was "
+            "originally a COLUMN of the real board — vertical words now appear "
+            "horizontally, reading left to right. Read every cell in the 15x15 grid.";
+        if (!transposed_occ_grid.empty()) {
+            prompt_t += "\\n\\nOccupancy grid (already transposed to match the "
+                "image — X=tile present, .=empty):\\n" + transposed_occ_grid +
+                "\\n\\nEvery X cell MUST have a letter — do NOT return null for any X cell.";
+        }
+        prompt_t += "\\n\\nTile types:";
+        if (is_light_mode) {
+            prompt_t +=
+                "\\n- Regular tiles: BLUE/PURPLE SQUARES with white upright letters "
+                "and a small subscript number — return UPPERCASE."
+                "\\n- Blank tiles: GREEN CIRCLES with italic letters, NO subscript "
+                "— return lowercase.";
+        } else {
+            prompt_t +=
+                "\\n- Regular tiles: beige SQUARES with upright letters and a small "
+                "subscript number — return UPPERCASE."
+                "\\n- Blank tiles: PURPLE CIRCLES (not squares!), italic letters, "
+                "NO subscript — return lowercase.";
+        }
+        prompt_t += "\\n- Empty cells: return null"
+            "\\n\\nReturn ONLY a JSON array of 15 rows x 15 columns. No other text.";
+        std::string b64_t = base64_encode(transposed_png);
+        payload_t = "{\"contents\":[{\"parts\":["
+            "{\"text\":\"" + prompt_t + "\"},"
+            "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"" + b64_t + "\"}}"
+            "]}]}";
+    }
+
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
                       "gemini-2.5-flash:generateContent?key=";
     url += api_key;
 
     auto t0 = std::chrono::steady_clock::now();
-    auto gcr = call_gemini(url, payload, "main", prompt, 60, 2);
+    // Launch original and transposed OCR in parallel
+    auto main_fut = std::async(std::launch::async,
+        [&url, &payload, &prompt]() {
+            return call_gemini(url, payload, "main", prompt, 60, 2);
+        });
+    if (!payload_t.empty())
+        transposed_fut = std::async(std::launch::async,
+            [&url, &payload_t, &prompt_t]() {
+                return call_gemini(url, payload_t, "transposed", prompt_t, 60, 1);
+            });
+    auto gcr = main_fut.get();
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     {
@@ -1853,6 +1960,19 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         sink.write(err.data(), err.size());
         sink.done();
         return;
+    }
+
+    // Join transposed OCR future (launched in parallel with main OCR).
+    // Runs here so it overlaps with the main board parsing and rack detection above.
+    if (transposed_fut.valid()) {
+        auto gcr_t = transposed_fut.get();
+        if (!gcr_t.text.empty()) {
+            have_transposed_ocr = parse_gemini_board(gcr_t.text, transposed_cells);
+            std::string tmsg = "{\"status\":\"Transposed OCR "
+                + std::string(have_transposed_ocr ? "parsed." : "failed to parse.")
+                + "\"}\n";
+            sink.write(tmsg.data(), tmsg.size());
+        }
     }
 
     // Launch rack verification asynchronously — runs concurrently with
@@ -3216,6 +3336,39 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             if (!mismatches.empty())
                 rack_warning = "Rack mismatch: " + mismatches;
         }
+    }
+
+    // Send transposed board image and disagreements with the final corrected board
+    if (have_transposed_ocr && !transposed_png.empty()) {
+        // transposed_cells[c][r] corresponds to original board cell (r, c)
+        std::string disagree_json = "[";
+        bool first_d = true;
+        for (int r = 0; r < 15; r++) {
+            for (int c = 0; c < 15; c++) {
+                char orig_ch = dr.cells[r][c].letter;
+                char trans_ch = transposed_cells[c][r].letter;
+                if (orig_ch == 0 || trans_ch == 0) continue;
+                char orig_u = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(orig_ch)));
+                char trans_u = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(trans_ch)));
+                if (orig_u != trans_u) {
+                    if (!first_d) disagree_json += ",";
+                    first_d = false;
+                    disagree_json += "{\"pos\":\""
+                        + std::string(1, static_cast<char>('A' + c))
+                        + std::to_string(r + 1)
+                        + "\",\"orig\":\"" + orig_u
+                        + "\",\"trans\":\"" + trans_u + "\"}";
+                }
+            }
+        }
+        disagree_json += "]";
+        std::string tmsg = "{\"status\":\"Transposed OCR comparison\","
+            "\"transposed_image\":\"data:image/png;base64,"
+            + base64_encode(transposed_png) + "\","
+            "\"transposed_disagree\":" + disagree_json + "}\n";
+        sink.write(tmsg.data(), tmsg.size());
     }
 
     std::string final_json = make_json_response(dr);
