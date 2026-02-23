@@ -2740,6 +2740,169 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                     }
                 }
 
+                // Word completion: for invalid words with 1-2 suspect cells,
+                // try all letter combinations and apply the unique one (if any)
+                // that makes all words touching those cells valid.
+                // This is deterministic and avoids an extra Gemini round-trip.
+                // 1 suspect: 26 tries. 2 suspects: 26*26=676 tries.
+                if (!suspects.empty()) {
+                    std::set<std::pair<int,int>> suspect_set(
+                        suspects.begin(), suspects.end());
+                    std::vector<std::pair<int,int>> wc_fixed;
+                    std::string wc_detail;
+
+                    // Helper: check if all words touching a set of cells are valid
+                    auto all_touching_valid = [&](
+                            const std::vector<std::pair<int,int>>& sps) -> bool {
+                        auto tw_list = extract_words(dr.cells);
+                        for (const auto& tw : tw_list) {
+                            bool touches = false;
+                            for (const auto& sp2 : sps)
+                                for (const auto& [wr, wc] : tw.cells)
+                                    if (wr == sp2.first && wc == sp2.second)
+                                        { touches = true; break; }
+                            if (touches && !g_kwg.is_valid(tw.word)) return false;
+                        }
+                        return true;
+                    };
+
+                    for (const auto& iw : invalid) {
+                        // Find suspect cells in this invalid word
+                        std::vector<std::pair<int,int>> word_suspects;
+                        for (const auto& pos : iw.cells) {
+                            if (suspect_set.count(pos))
+                                word_suspects.push_back(pos);
+                        }
+                        if (word_suspects.size() < 1 || word_suspects.size() > 2)
+                            continue;
+
+                        // Don't change blank tiles' face letters
+                        bool has_blank = false;
+                        for (const auto& sp2 : word_suspects)
+                            if (dr.cells[sp2.first][sp2.second].is_blank)
+                                { has_blank = true; break; }
+                        if (has_blank) continue;
+
+                        if (word_suspects.size() == 1) {
+                            auto sp = word_suspects[0];
+                            auto orig = dr.cells[sp.first][sp.second];
+                            char orig_upper = static_cast<char>(std::toupper(
+                                static_cast<unsigned char>(orig.letter)));
+
+                            char found = 0;
+                            int found_count = 0;
+                            for (int li = 0; li < 26 && found_count <= 1; li++) {
+                                char l = static_cast<char>('A' + li);
+                                if (l == orig_upper) continue;
+                                dr.cells[sp.first][sp.second].letter = l;
+                                dr.cells[sp.first][sp.second].is_blank = false;
+                                if (all_touching_valid({sp}))
+                                    { found = l; found_count++; }
+                            }
+                            dr.cells[sp.first][sp.second] = orig;
+                            if (found_count != 1) continue;
+
+                            if (!wc_detail.empty()) wc_detail += ", ";
+                            wc_detail +=
+                                std::string(1, static_cast<char>('A' + sp.second))
+                                + std::to_string(sp.first + 1) + ": "
+                                + orig_upper + " -> " + found;
+                            dr.cells[sp.first][sp.second].letter = found;
+                            dr.cells[sp.first][sp.second].confidence = 0.95f;
+                            dr.cells[sp.first][sp.second].is_blank = false;
+                            wc_fixed.push_back(sp);
+                            suspect_set.erase(sp);
+
+                        } else { // 2 suspects
+                            auto sp0 = word_suspects[0], sp1 = word_suspects[1];
+                            auto orig0 = dr.cells[sp0.first][sp0.second];
+                            auto orig1 = dr.cells[sp1.first][sp1.second];
+                            char u0 = static_cast<char>(std::toupper(
+                                static_cast<unsigned char>(orig0.letter)));
+                            char u1 = static_cast<char>(std::toupper(
+                                static_cast<unsigned char>(orig1.letter)));
+
+                            char found0 = 0, found1 = 0;
+                            int found_count = 0;
+                            for (int li0 = 0; li0 < 26 && found_count <= 1; li0++) {
+                                char l0 = static_cast<char>('A' + li0);
+                                dr.cells[sp0.first][sp0.second].letter = l0;
+                                dr.cells[sp0.first][sp0.second].is_blank = false;
+                                for (int li1 = 0; li1 < 26 && found_count <= 1; li1++) {
+                                    char l1 = static_cast<char>('A' + li1);
+                                    if (l0 == u0 && l1 == u1) continue;
+                                    dr.cells[sp1.first][sp1.second].letter = l1;
+                                    dr.cells[sp1.first][sp1.second].is_blank = false;
+                                    if (all_touching_valid({sp0, sp1}))
+                                        { found0 = l0; found1 = l1; found_count++; }
+                                }
+                            }
+                            dr.cells[sp0.first][sp0.second] = orig0;
+                            dr.cells[sp1.first][sp1.second] = orig1;
+                            if (found_count != 1) continue;
+
+                            if (!wc_detail.empty()) wc_detail += ", ";
+                            wc_detail +=
+                                std::string(1, static_cast<char>('A' + sp0.second))
+                                + std::to_string(sp0.first + 1) + ": "
+                                + u0 + " -> " + found0 + ", "
+                                + std::string(1, static_cast<char>('A' + sp1.second))
+                                + std::to_string(sp1.first + 1) + ": "
+                                + u1 + " -> " + found1;
+                            dr.cells[sp0.first][sp0.second].letter = found0;
+                            dr.cells[sp0.first][sp0.second].confidence = 0.95f;
+                            dr.cells[sp0.first][sp0.second].is_blank = false;
+                            dr.cells[sp1.first][sp1.second].letter = found1;
+                            dr.cells[sp1.first][sp1.second].confidence = 0.95f;
+                            dr.cells[sp1.first][sp1.second].is_blank = false;
+                            wc_fixed.push_back(sp0);
+                            wc_fixed.push_back(sp1);
+                            suspect_set.erase(sp0);
+                            suspect_set.erase(sp1);
+                        }
+                    }
+
+                    if (!wc_fixed.empty()) {
+                        std::string msg = "{\"status\":\"Word completion: "
+                            + json_escape(wc_detail) + "\"}\n";
+                        sink.write(msg.data(), msg.size());
+
+                        // Remove fixed cells from suspects
+                        suspects.erase(
+                            std::remove_if(suspects.begin(), suspects.end(),
+                                [&](const auto& p) {
+                                    return suspect_set.find(p)
+                                           == suspect_set.end();
+                                }),
+                            suspects.end());
+
+                        // Rebuild invalid/iw_list for dict_requery prompt
+                        all_words = extract_words(dr.cells);
+                        invalid.clear();
+                        for (const auto& bw : all_words) {
+                            if (!g_kwg.is_valid(bw.word)) {
+                                InvalidWord iw2;
+                                iw2.word = bw.word;
+                                iw2.cells = bw.cells;
+                                iw2.horizontal = bw.horizontal;
+                                if (bw.horizontal)
+                                    iw2.position = "row "
+                                        + std::to_string(bw.cells[0].first + 1);
+                                else
+                                    iw2.position = "col "
+                                        + std::string(1, static_cast<char>(
+                                            'A' + bw.cells[0].second));
+                                invalid.push_back(std::move(iw2));
+                            }
+                        }
+                        iw_list.clear();
+                        for (const auto& iw2 : invalid) {
+                            if (!iw_list.empty()) iw_list += ", ";
+                            iw_list += iw2.word + " (" + iw2.position + ")";
+                        }
+                    }
+                }
+
                 // Re-query suspect cells via Gemini
                 if (!suspects.empty() && have_opencv) {
                     int bx, by, cell_sz;
