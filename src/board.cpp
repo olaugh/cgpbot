@@ -5,6 +5,7 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -473,34 +474,56 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
         }
     }
 
-    // ── Step 4: Precision alignment ─────────────────────────────────────
-    if (is_light || is_mobile) {
-        // Light mode / mobile: pixel-precise offset + size search.
-        // For light mode, use edge-based scoring (premium color spillover).
-        // For dark mobile, use premium center scoring with finer steps.
+    // ── Step 4a: Pixel-precise offset + size search ────────────────────
+    // All modes benefit from sub-step position refinement.  Light mode
+    // uses edge-spillover scoring; dark mode uses premium-center scoring.
+    {
         int half_cell = best_rect.width / 30;
         cv::Rect prec_best = best_rect;
         double prec_score = is_light ? score_edges_light(hsv, best_rect)
                                      : score_premium(hsv, best_rect, false);
 
         int size_range = is_mobile ? 15 : 5;
-        for (int ds = -size_range; ds <= size_range; ds++) {
-            int sz = best_rect.width + ds;
-            if (sz < 100) continue;
-            for (int dy = -half_cell; dy <= half_cell; dy++) {
-                for (int dx = -half_cell; dx <= half_cell; dx++) {
-                    int x = best_rect.x + dx;
-                    int y = best_rect.y + dy;
-                    if (x < 0 || y < 0 ||
-                        x + sz > img.cols || y + sz > img.rows)
-                        continue;
-                    cv::Rect trial(x, y, sz, sz);
-                    double s = is_light ? score_edges_light(hsv, trial)
-                                        : score_premium(hsv, trial, false);
-                    if (s > prec_score) {
-                        prec_score = s;
-                        prec_best = trial;
+        {
+            int n_threads = std::max(1u, std::thread::hardware_concurrency());
+            struct ThreadResult { cv::Rect rect; double score; };
+            std::vector<ThreadResult> results(n_threads, {prec_best, prec_score});
+            std::vector<std::thread> threads(n_threads);
+
+            for (int t = 0; t < n_threads; t++) {
+                threads[t] = std::thread([&, t]() {
+                    cv::Rect local_best = results[t].rect;
+                    double local_score = results[t].score;
+                    for (int ds = -size_range + t; ds <= size_range;
+                         ds += n_threads) {
+                        int sz = best_rect.width + ds;
+                        if (sz < 100) continue;
+                        for (int dy = -half_cell; dy <= half_cell; dy++) {
+                            for (int dx = -half_cell; dx <= half_cell; dx++) {
+                                int x = best_rect.x + dx;
+                                int y = best_rect.y + dy;
+                                if (x < 0 || y < 0 ||
+                                    x + sz > img.cols || y + sz > img.rows)
+                                    continue;
+                                cv::Rect trial(x, y, sz, sz);
+                                double s = is_light
+                                    ? score_edges_light(hsv, trial)
+                                    : score_premium(hsv, trial, false);
+                                if (s > local_score) {
+                                    local_score = s;
+                                    local_best = trial;
+                                }
+                            }
+                        }
                     }
+                    results[t] = {local_best, local_score};
+                });
+            }
+            for (auto& th : threads) th.join();
+            for (int t = 0; t < n_threads; t++) {
+                if (results[t].score > prec_score) {
+                    prec_score = results[t].score;
+                    prec_best = results[t].rect;
                 }
             }
         }
@@ -508,142 +531,104 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
             << " " << prec_best.width << "x" << prec_best.height
             << " score=" << prec_score << "\n";
         best_rect = prec_best;
+    }
 
-        // Dark mobile: further refine with gridline detection.
-        // The center-based scorer is insensitive to sub-pixel cell size
-        // errors that accumulate to ~15px by row 15. Gridline detection
-        // scans cell size at 0.1px precision AND position.
-        if (is_mobile && !is_light) {
-            int approx_cell = best_rect.width / 15;
-            double best_gl_score = -1;
-            double best_gl_cell = approx_cell;
-            int best_gl_x = best_rect.x, best_gl_y = best_rect.y;
+    // ── Step 4b: Gridline refinement via Sobel edge projections ────────
+    // All modes have visible grid lines.  Project |Sobel_x| and |Sobel_y|
+    // onto x/y axes, then search (cell_size, origin_x, origin_y) to
+    // maximize edge magnitude at the 16 expected grid line positions.
+    // X and Y origins are searched independently for each cell_size,
+    // which is both faster and more accurate than a joint 3D search.
+    {
+        // Compute Sobel edge projections within a padded region.
+        int pad = best_rect.width / 10;
+        int rx0 = std::max(0, best_rect.x - pad);
+        int ry0 = std::max(0, best_rect.y - pad);
+        int rx1 = std::min(img.cols, best_rect.x + best_rect.width + pad);
+        int ry1 = std::min(img.rows, best_rect.y + best_rect.height + pad);
 
-            int min_cell_10 = approx_cell * 9;
-            int max_cell_10 = approx_cell * 115 / 10;
-            int pos_range = std::max(3, approx_cell / 4);
+        cv::Mat sobel_x, sobel_y;
+        cv::Sobel(gray, sobel_x, CV_32F, 1, 0, 3);
+        cv::Sobel(gray, sobel_y, CV_32F, 0, 1, 3);
 
-            for (int cell_10 = min_cell_10; cell_10 <= max_cell_10; cell_10++) {
-                double cs = cell_10 / 10.0;
-                int board_sz = static_cast<int>(std::round(cs * 15));
-                for (int dy = -pos_range; dy <= pos_range; dy++) {
-                    int by = best_rect.y + dy;
-                    if (by < 0 || by + board_sz > img.rows) continue;
-                    for (int dx = -pos_range; dx <= pos_range; dx++) {
-                        int bx = best_rect.x + dx;
-                        if (bx < 0 || bx + board_sz > img.cols) continue;
-
-                        double score = 0;
-                        for (int sample = 0; sample < 6; sample++) {
-                            int sy = by + static_cast<int>((2 + sample * 2.2) * cs);
-                            int sx = bx + static_cast<int>((2 + sample * 2.2) * cs);
-                            if (sy >= img.rows || sx >= img.cols) continue;
-
-                            for (int k = 0; k <= 15; k++) {
-                                int gx = bx + static_cast<int>(k * cs);
-                                if (gx >= 0 && gx < gray.cols && sy >= 0 && sy < gray.rows) {
-                                    int sum = 0, cnt = 0;
-                                    for (int ddx = -1; ddx <= 1; ddx++) {
-                                        int xx = gx + ddx;
-                                        if (xx >= 0 && xx < gray.cols)
-                                            { sum += gray.at<uint8_t>(sy, xx); cnt++; }
-                                    }
-                                    float brightness = cnt > 0 ? static_cast<float>(sum) / cnt : 128;
-                                    score += (128.0 - brightness) / 128.0;
-                                }
-
-                                int gy = by + static_cast<int>(k * cs);
-                                if (sx >= 0 && sx < gray.cols && gy >= 0 && gy < gray.rows) {
-                                    int sum = 0, cnt = 0;
-                                    for (int ddy = -1; ddy <= 1; ddy++) {
-                                        int yy = gy + ddy;
-                                        if (yy >= 0 && yy < gray.rows)
-                                            { sum += gray.at<uint8_t>(yy, sx); cnt++; }
-                                    }
-                                    float brightness = cnt > 0 ? static_cast<float>(sum) / cnt : 128;
-                                    score += (128.0 - brightness) / 128.0;
-                                }
-                            }
-                        }
-
-                        if (score > best_gl_score) {
-                            best_gl_score = score;
-                            best_gl_cell = cs;
-                            best_gl_x = bx;
-                            best_gl_y = by;
-                        }
-                    }
-                }
-            }
-
-            int gl_size = static_cast<int>(std::round(best_gl_cell * 15));
-            log << "Mobile grid-line refine: cell=" << best_gl_cell
-                << " (was " << approx_cell << ") pos=" << best_gl_x
-                << "," << best_gl_y << " size=" << gl_size << "\n";
-            best_rect = cv::Rect(best_gl_x, best_gl_y, gl_size, gl_size);
+        // Column-wise sum of |Sobel_x| → peaks at vertical grid lines
+        std::vector<double> vproj(img.cols, 0);
+        for (int y = ry0; y < ry1; y++) {
+            const float* row = sobel_x.ptr<float>(y);
+            for (int x = rx0; x < rx1; x++)
+                vproj[x] += std::abs(row[x]);
         }
-    } else {
-        // Dark desktop: grid-line alignment by looking for dark pixels at
-        // expected grid line positions.
-        int approx_cell = best_rect.width / 15;
-        double best_gl_score = -1;
-        double best_cell = approx_cell;
+        // Row-wise sum of |Sobel_y| → peaks at horizontal grid lines
+        std::vector<double> hproj(img.rows, 0);
+        for (int y = ry0; y < ry1; y++) {
+            const float* row = sobel_y.ptr<float>(y);
+            for (int x = rx0; x < rx1; x++)
+                hproj[y] += std::abs(row[x]);
+        }
 
-        int min_cell_10 = approx_cell * 9;
-        int max_cell_10 = approx_cell * 115 / 10;
-        int bx = best_rect.x, by = best_rect.y;
+        double approx_cs = best_rect.width / 15.0;
+        int pos_range = std::max(3, static_cast<int>(approx_cs / 3));
+
+        // Search cell_size at 0.1px precision in ±5% range.
+        int min_cell_10 = static_cast<int>(approx_cs * 9.5);
+        int max_cell_10 = static_cast<int>(approx_cs * 10.5) + 1;
+
+        double best_total = -1;
+        double best_cs = approx_cs;
+        int best_ox = best_rect.x, best_oy = best_rect.y;
 
         for (int cell_10 = min_cell_10; cell_10 <= max_cell_10; cell_10++) {
             double cs = cell_10 / 10.0;
-            double score = 0;
+            int board_sz = static_cast<int>(std::round(cs * 15));
 
-            for (int sample = 0; sample < 6; sample++) {
-                int sy = by + static_cast<int>((2 + sample * 2.2) * cs);
-                int sx = bx + static_cast<int>((2 + sample * 2.2) * cs);
-                if (sy >= img.rows || sx >= img.cols) continue;
-
+            // Best x-origin for this cell_size
+            double best_v = -1;
+            int bx = best_rect.x;
+            for (int ox = best_rect.x - pos_range; ox <= best_rect.x + pos_range; ox++) {
+                if (ox < 0 || ox + board_sz > img.cols) continue;
+                double v = 0;
                 for (int k = 0; k <= 15; k++) {
-                    int gx = bx + static_cast<int>(k * cs);
-                    if (gx >= 0 && gx < gray.cols && sy >= 0 && sy < gray.rows) {
-                        int sum = 0, cnt = 0;
-                        for (int ddx = -1; ddx <= 1; ddx++) {
-                            int xx = gx + ddx;
-                            if (xx >= 0 && xx < gray.cols)
-                                { sum += gray.at<uint8_t>(sy, xx); cnt++; }
-                        }
-                        float brightness = cnt > 0 ? static_cast<float>(sum) / cnt : 128;
-                        score += (128.0 - brightness) / 128.0;
-                    }
-
-                    int gy = by + static_cast<int>(k * cs);
-                    if (sx >= 0 && sx < gray.cols && gy >= 0 && gy < gray.rows) {
-                        int sum = 0, cnt = 0;
-                        for (int ddy = -1; ddy <= 1; ddy++) {
-                            int yy = gy + ddy;
-                            if (yy >= 0 && yy < gray.rows)
-                                { sum += gray.at<uint8_t>(yy, sx); cnt++; }
-                        }
-                        float brightness = cnt > 0 ? static_cast<float>(sum) / cnt : 128;
-                        score += (128.0 - brightness) / 128.0;
+                    int gx = ox + static_cast<int>(k * cs);
+                    if (gx >= 0 && gx < img.cols) {
+                        v += vproj[gx];
+                        if (gx > 0) v += vproj[gx - 1] * 0.5;
+                        if (gx + 1 < img.cols) v += vproj[gx + 1] * 0.5;
                     }
                 }
+                if (v > best_v) { best_v = v; bx = ox; }
             }
 
-            if (score > best_gl_score) {
-                best_gl_score = score;
-                best_cell = cs;
+            // Best y-origin for this cell_size
+            double best_h = -1;
+            int by = best_rect.y;
+            for (int oy = best_rect.y - pos_range; oy <= best_rect.y + pos_range; oy++) {
+                if (oy < 0 || oy + board_sz > img.rows) continue;
+                double h = 0;
+                for (int k = 0; k <= 15; k++) {
+                    int gy = oy + static_cast<int>(k * cs);
+                    if (gy >= 0 && gy < img.rows) {
+                        h += hproj[gy];
+                        if (gy > 0) h += hproj[gy - 1] * 0.5;
+                        if (gy + 1 < img.rows) h += hproj[gy + 1] * 0.5;
+                    }
+                }
+                if (h > best_h) { best_h = h; by = oy; }
+            }
+
+            double total = best_v + best_h;
+            if (total > best_total) {
+                best_total = total;
+                best_cs = cs;
+                best_ox = bx;
+                best_oy = by;
             }
         }
 
-        int board_size = static_cast<int>(std::round(best_cell * 15));
-        if (bx + board_size > img.cols) bx = img.cols - board_size;
-        if (by + board_size > img.rows) by = img.rows - board_size;
-        bx = std::max(0, bx);
-        by = std::max(0, by);
-
-        log << "Grid-line refine: cell=" << best_cell
-            << " (was " << approx_cell << ") => size=" << board_size << "\n";
-        best_rect = cv::Rect(bx, by, board_size, board_size);
+        int gl_size = static_cast<int>(std::round(best_cs * 15));
+        log << "Grid-line refine: cell=" << best_cs
+            << " (was " << approx_cs << ") pos=" << best_ox
+            << "," << best_oy << " size=" << gl_size << "\n";
+        best_rect = cv::Rect(best_ox, best_oy, gl_size, gl_size);
     }
 
     int cell_size = best_rect.width / 15;
@@ -707,7 +692,8 @@ static tesseract::TessBaseAPI* get_tess() {
 }
 #endif
 
-static bool is_tile(const cv::Mat& cell, bool is_light, std::ostringstream& /*log*/) {
+static bool is_tile(const cv::Mat& cell, bool is_light, int row, int col,
+                    std::ostringstream& /*log*/) {
     int cx = cell.cols / 5, cy = cell.rows / 5;
     int cw = cell.cols * 3 / 5, ch = cell.rows * 3 / 5;
     if (cw <= 0 || ch <= 0) return false;
@@ -749,7 +735,14 @@ static bool is_tile(const cv::Mat& cell, bool is_light, std::ostringstream& /*lo
             // Empty premium squares have contrast=0; tiles have 30-85+.
             // Exclude DW/TW tooltips: low saturation + very bright (S<70, V>210).
             bool is_played = (h >= 78 && h <= 150 && s > 30 && v > 80);
-            if (is_played && contrast > 30 && !(s < 70 && v > 210)) return true;
+            if (is_played && contrast > 30 && !(s < 70 && v > 210)) {
+                // Reject empty TLS/DL squares that look like played tiles.
+                // Empty TLS: V >= 168, played tiles: V <= 159. Use 163 as
+                // threshold (middle of the 9-unit gap).
+                int prem = PREMIUM[row][col];
+                if ((prem == 1 || prem == 2) && v >= 163) return false;
+                return true;
+            }
 
             return false;
         }
@@ -1189,7 +1182,7 @@ static void classify_cells(const CellImages& cell_imgs,
                     cv::Mat cg;
                     cv::cvtColor(ctr, cg, cv::COLOR_BGR2GRAY);
                     cv::meanStdDev(cg, gm, gs);
-                    bool det = is_tile(ci, is_light, log);
+                    bool det = is_tile(ci, is_light, r, c, log);
                     // Temporary: log all cells for dark mode debugging
                     log << "  [" << r+1 << "," << (char)('A'+c) << "]"
                         << (det ? " TILE" : " skip")
@@ -1199,7 +1192,7 @@ static void classify_cells(const CellImages& cell_imgs,
                         << " con=" << (int)gs[0] << "\n";
                 }
             }
-            if (!is_tile(cell_imgs[r][c], is_light, log)) continue;
+            if (!is_tile(cell_imgs[r][c], is_light, r, c, log)) continue;
 
             tile_count++;
             if (tmpl.valid) {

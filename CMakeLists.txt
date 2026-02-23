@@ -69,3 +69,10 @@ target_link_libraries(cgpbot PRIVATE board_lib dpp)
 
 add_executable(cgptest src/testapp.cpp)
 target_link_libraries(cgptest PRIVATE board_lib httplib::httplib)
+
+# ── Gemini parse unit tests ────────────────────────────────────────────────
+
+add_executable(test_gemini_parse tests/test_gemini_parse.cpp)
+target_include_directories(test_gemini_parse PRIVATE src ${OpenCV_INCLUDE_DIRS})
+target_compile_definitions(test_gemini_parse PRIVATE
+    SOURCE_DIR="${CMAKE_SOURCE_DIR}")

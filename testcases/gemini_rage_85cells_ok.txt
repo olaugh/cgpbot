@@ -1,0 +1,25 @@
+```json
+{
+  "board": [
+    [null, null, null, null, null, "R", "A", "G", "E", null, null, "F", "I", "L", "L"],
+    [null, null, null, null, null, null, "S", "O", "N", "I", "C", "A", "T", "E", null],
+    [null, null, null, null, null, null, null, null, null, null, null, null, null, "U", null],
+    [null, null, null, null, null, "F", null, null, null, null, "E", "V", "I", "C", "T"],
+    [null, null, null, null, "D", "A", null, null, null, null, null, null, null, "I", null],
+    [null, null, null, "V", "E", "X", null, null, null, "B", "L", "A", "W", "N", null],
+    [null, null, null, "I", "T", null, null, "R", null, "H", "E", null, null, "E", "T"],
+    [null, null, null, null, "M", null, "K", "O", "R", "A", "I", null, null, null, "O"],
+    [null, null, null, null, "n", null, null, "W", null, "N", null, null, null, null, "B"],
+    [null, null, null, "R", "A", "Z", "E", "E", null, "G", null, null, null, "M", "Y"],
+    [null, null, null, null, "T", null, null, "L", null, null, null, "J", "U", "P", null],
+    [null, "U", "N", "S", "E", "E", null, "I", null, null, null, null, null, null, "N"],
+    [null, "P", "A", "I", "D", null, null, "N", null, null, null, "Q", "U", "A", null],
+    [null, null, null, null, null, null, null, "G", null, null, null, null, null, null, "S"],
+    [null, null, null, "N", null, null, null, "I", null, null, null, "D", null, null, null]
+  ],
+  "rack": "DEOORY?",
+  "lexicon": "NWL23",
+  "bag": "A D H I O O R S T",
+  "scores": [367, 306]
+}
+```

@@ -1,0 +1,25 @@
+```json
+{
+  "board": [
+    [null, null, null, null, null, null, "V", "A", "M", "O", "S", "E", null, null, null],
+    [null, null, null, null, null, "J", null, null, "U", null, null, null, null, null, null],
+    [null, null, null, null, "P", "O", null, "U", "G", null, null, null, null, null, null],
+    [null, null, null, "D", "A", "Y", null, "N", "G", null, null, null, null, null, null],
+    [null, null, null, "U", "H", null, null, "I", "I", null, null, null, null, null, null],
+    ["R", null, null, "P", null, null, null, "I", "N", null, null, null, null, null, null],
+    ["U", null, null, "E", "F", null, null, "T", "s", null, null, null, null, null, null],
+    ["G", null, null, "D", "E", null, null, "I", "I", null, null, null, null, null, null],
+    ["G", null, null, "L", "L", null, null, "E", "E", null, null, null, null, null, null],
+    ["O", null, null, "S", null, null, null, "R", "R", null, null, null, null, null, null],
+    ["L", null, null, "I", null, null, null, "A", "A", null, null, null, null, null, null],
+    ["S", "E", "R", "O", "T", "I", "N", "Y", null, null, null, null, null, null, null],
+    [null, null, null, null, "I", null, "T", null, null, null, null, "F", "A", "V", null],
+    [null, "W", "E", "L", "C", "H", null, "M", "O", "A", "N", "E", "R", null, null],
+    ["K", "E", "N", "O", null, "A", "D", "W", "A", "R", "E", "Z", "E", "E", null]
+  ],
+  "rack": "BINOOQR",
+  "lexicon": "NWL23",
+  "bag": "A E II O U B C D L N S TT X",
+  "scores": [329, 351]
+}
+```

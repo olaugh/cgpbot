@@ -1,0 +1,25 @@
+```json
+{
+  "board": [
+    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null, null, null, null, null, "W", null, null],
+    [null, null, null, null, null, null, null, null, null, null, null, null, "I", null, null],
+    [null, null, null, null, null, "K", null, null, null, null, null, null, "L", null, null],
+    [null, null, null, null, "J", "O", null, "Q", null, null, null, null, "D", null, null],
+    [null, null, null, "B", "A", "R", "F", "I", null, null, null, null, "E", null, null],
+    [null, null, null, null, "P", "I", null, null, null, null, null, null, "R", null, null],
+    [null, null, null, null, "E", null, null, null, null, null, "B", "O", "A", "S", null],
+    [null, null, null, "D", "R", "Y", "S", "T", "O", "N", "E", null, null, null, null],
+    [null, null, null, null, null, null, null, "H", null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, "M", "O", "W", "N", null, null, null, null, null],
+    [null, null, null, null, "T", "Z", "A", "R", null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, "N", null, null, null, null, null, null, null]
+  ],
+  "rack": "EFGNNPS",
+  "lexicon": null,
+  "bag": "?? AAAAAA CC DD EEEEEE EE GG H IIIII LLL M N OOOO RR S TTTT UUUU VV X Y",
+  "scores": [195, 164]
+}
+```

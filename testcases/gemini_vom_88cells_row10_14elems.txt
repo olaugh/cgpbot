@@ -1,0 +1,25 @@
+```json
+{
+  "board": [
+    [null, null, null, null, null, null, null, null, null, "V", null, null, "G", null, null],
+    [null, null, null, "L", null, "D", null, null, null, "J", "O", "W", "A", "R", null],
+    [null, null, "T", "U", "T", "U", null, null, null, null, "M", null, "B", null, null],
+    ["T", null, null, "M", "U", "D", null, null, null, null, null, null, null, "B", null],
+    ["A", null, "W", "E", "X", "E", null, null, null, null, null, "F", "Y", null, null],
+    ["O", "Z", "O", "N", "E", null, null, null, null, null, "V", "O", "R", "R", null],
+    [null, "E", "F", null, "D", null, null, null, null, "I", null, "R", "E", null, null],
+    ["A", "L", null, "P", "O", "N", "C", "E", null, "R", null, "E", null, null, null],
+    ["C", null, null, "I", "S", "O", null, null, "H", "E", "E", "L", null, null, null],
+    ["I", null, null, null, "Y", "I", "K", "E", "D", null, "A", null, null, null],
+    ["N", "A", "P", "O", "O", "S", null, null, "A", null, "Q", "I", null, "N", null],
+    ["I", null, null, null, null, null, null, null, "T", null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null, "A", null, null, null, null, null, null],
+    [null, "S", "H", "I", "R", "R", "I", "N", "G", null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null, "A", null, null, null, null, null, null]
+  ],
+  "rack": "EGNSU??",
+  "lexicon": "CSW24",
+  "bag": "A EE I L R TT",
+  "scores": [353, 366]
+}
+```

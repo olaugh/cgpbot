@@ -3,3 +3,4 @@ build/
 testdata/
 magpie/data/
 magpie/testdata/
+.gemini_cache/

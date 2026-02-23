@@ -1,0 +1,25 @@
+```json
+{
+  "board": [
+    [null, null, null, null, null, null, null, "F", null, "P", "H", "A", "G", "E", "S"],
+    [null, null, null, null, null, null, "W", "U", "R", "L", "I", "E", null, "A", null],
+    [null, null, null, null, null, null, null, "O", null, null, null, null, "R", null, null],
+    [null, null, null, null, null, null, null, "W", null, null, null, null, "R", null, null],
+    [null, "Y", "U", "C", "A", null, null, "I", null, "A", "H", null, "O", null, null],
+    [null, null, null, null, "F", "A", null, "E", null, "Z", "O", null, "T", null, "V"],
+    [null, null, null, null, "O", null, null, "I", null, "I", "N", null, "E", "E", "L"],
+    [null, null, null, "P", "R", "I", "N", "T", "E", "D", null, null, null, "A", "Y"],
+    [null, null, null, null, "E", null, null, null, "L", "O", "O", "K", "E", null, null],
+    [null, "V", "I", "N", "S", null, null, null, null, null, null, null, null, null, "S"],
+    [null, null, null, null, "A", "L", "L", "e", "G", "I", "N", "G", null, "T", null],
+    [null, null, null, "Q", "I", null, null, null, null, null, null, null, null, null, "O"],
+    [null, null, null, "A", "D", null, null, null, null, null, null, null, null, null, "B"],
+    [null, null, null, "I", null, null, null, null, null, null, null, null, null, "E", "T"],
+    ["B", "I", "N", "D", null, null, null, null, null, null, null, null, null, null, "E"]
+  ],
+  "rack": "CEJOTX?",
+  "lexicon": "CSW24",
+  "bag": "",
+  "scores": [377, 428]
+}
+```

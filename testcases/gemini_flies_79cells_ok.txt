@@ -1,0 +1,25 @@
+```json
+{
+  "board": [
+    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, "C", null, null, null, null, null, null, null, null, null],
+    [null, null, "F", "A", "B", "L", "E", null, null, null, null, null, null, null, null],
+    [null, null, null, null, "O", "U", "T", "W", "E", "I", "G", "H", null, null, null],
+    [null, null, null, "E", "Y", "E", null, "O", null, "N", "O", "E", "L", null, "P"],
+    [null, null, null, null, null, "Y", "A", "M", null, null, null, null, null, null, "R"],
+    [null, null, null, null, null, null, "Z", "A", "P", "S", null, null, null, null, "I"],
+    [null, null, null, null, null, "Q", "I", "N", null, "A", null, null, null, null, "S"],
+    [null, null, null, null, null, null, "D", null, null, "T", null, null, null, null, "O"],
+    [null, null, null, null, null, "J", "O", null, null, "A", null, null, null, null, "N"],
+    [null, null, null, null, "T", "O", null, null, null, "R", "U", "R", "U", null, "E"],
+    [null, null, "L", "A", "G", null, null, "C", "r", "A", "T", "E", "R", "E", "D"],
+    [null, null, "V", "O", "X", null, null, "H", null, "S", "A", "I", "D", null, null],
+    [null, null, null, "G", "I", null, null, "I", null, null, null, null, null, null, null],
+    ["F", "L", "I", "E", "S", null, null, "V", null, null, null, null, null, null, null]
+  ],
+  "rack": "ADINNU?",
+  "lexicon": null,
+  "bag": "B E EE I K M N O RR TT W",
+  "scores": [412, 340]
+}
+```

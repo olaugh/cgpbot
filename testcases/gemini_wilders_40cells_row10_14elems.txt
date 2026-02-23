@@ -1,0 +1,34 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "```json\n{\n  \"board\": [\n    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],\n    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],\n    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],\n    [null, null, null, null, null, null, null, null, null, null, null, null, \"W\", null, null],\n    [null, null, null, null, null, null, null, null, null, null, null, null, \"I\", null, null],\n    [null, null, null, null, null, \"K\", null, null, null, null, null, null, \"L\", null, null],\n    [null, null, null, null, \"J\", \"O\", null, \"Q\", null, null, null, null, \"D\", null, null],\n    [null, null, null, \"B\", \"A\", \"R\", \"F\", \"I\", null, null, null, null, \"E\", null, null],\n    [null, null, null, null, \"P\", \"I\", null, null, null, null, null, null, \"R\", null, null],\n    [null, null, null, null, \"E\", null, null, null, null, \"B\", \"O\", \"A\", \"S\", null, null],\n    [null, null, null, null, \"D\", \"R\", \"Y\", \"S\", \"T\", \"O\", \"N\", \"E\", null, null],\n    [null, null, null, null, null, null, null, \"H\", null, null, null, null, null, null, null],\n    [null, null, null, null, null, null, \"M\", \"O\", \"W\", \"N\", null, null, null, null, null],\n    [null, null, null, null, \"T\", \"Z\", \"A\", \"R\", null, null, null, null, null, null, null],\n    [null, null, null, null, null, null, null, \"N\", null, null, null, null, null, null, null]\n  ],\n  \"rack\": \"EFGNNPS\",\n  \"lexicon\": null,\n  \"bag\": \"?? AAAAAA CC DD EEEEEE EE GG H IIIIII LLL M N OOOO RR S TTTT UUUU VV X Y\",\n  \"scores\": [195, 164]\n}\n```"
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 1035,
+    "candidatesTokenCount": 624,
+    "totalTokenCount": 7017,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 777
+      },
+      {
+        "modality": "IMAGE",
+        "tokenCount": 258
+      }
+    ],
+    "thoughtsTokenCount": 5358
+  },
+  "modelVersion": "gemini-2.5-flash",
+  "responseId": "suKbaYGfF_mcjMcP4-PM8QM"
+}

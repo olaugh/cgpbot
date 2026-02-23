@@ -6,11 +6,13 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -93,21 +95,24 @@ public:
 static KWGChecker g_kwg;
 static std::string g_kwg_lexicon;  // which lexicon is loaded
 
-static bool ensure_kwg_loaded(const std::string& lexicon) {
-    if (g_kwg.loaded() && g_kwg_lexicon == lexicon) return true;
-    // Try magpie/data/lexica/<LEXICON>.kwg
+static bool load_kwg_from_path(KWGChecker& kwg, const std::string& lexicon) {
     std::string path = "magpie/data/lexica/" + lexicon + ".kwg";
     if (!fs::exists(path)) {
-        // Fallback: try testdata
         path = "magpie/testdata/lexica/" + lexicon + ".kwg";
     }
     if (!fs::exists(path)) return false;
-    if (g_kwg.load(path)) {
+    return kwg.load(path);
+}
+
+static bool ensure_kwg_loaded(const std::string& lexicon) {
+    if (g_kwg.loaded() && g_kwg_lexicon == lexicon) return true;
+    if (load_kwg_from_path(g_kwg, lexicon)) {
         g_kwg_lexicon = lexicon;
         return true;
     }
     return false;
 }
+
 
 // ---------------------------------------------------------------------------
 // Word extraction from a 15x15 board.
@@ -157,6 +162,29 @@ static std::vector<BoardWord> extract_words(const CellResult board[15][15]) {
         }
     }
     return words;
+}
+
+// ---------------------------------------------------------------------------
+// Lexicon inference: if Gemini didn't detect a lexicon from the screenshot,
+// check board words against NWL23 and CSW24. If any word is valid in CSW24
+// but not NWL23, the game is likely using CSW24.
+// ---------------------------------------------------------------------------
+static std::string infer_lexicon(const CellResult board[15][15],
+                                 std::vector<std::string>* csw_only_out = nullptr) {
+    KWGChecker nwl, csw;
+    if (!load_kwg_from_path(nwl, "NWL23")) return "NWL23";
+    if (!load_kwg_from_path(csw, "CSW24")) return "NWL23";
+
+    auto words = extract_words(board);
+    std::vector<std::string> csw_only;
+    for (const auto& bw : words) {
+        if (bw.word.find('?') != std::string::npos) continue;
+        if (csw.is_valid(bw.word) && !nwl.is_valid(bw.word))
+            csw_only.push_back(bw.word);
+    }
+    if (csw_only_out) *csw_only_out = csw_only;
+    if (!csw_only.empty()) return "CSW24";
+    return "NWL23";
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +337,129 @@ static void gemini_log(const std::string& label,
     }
 }
 
+// Forward declaration — defined in gemini_parse.h, included later.
+static inline std::string extract_gemini_text(const std::string& json);
+
+// ---------------------------------------------------------------------------
+// Call Gemini API with automatic retry on empty response.
+// Writes payload to temp file, calls curl, reads response, extracts text.
+// Retries up to max_retries times (with 1s delay) if extract_gemini_text
+// returns empty.
+// ---------------------------------------------------------------------------
+struct GeminiCallResult {
+    std::string raw_response;
+    std::string text;       // extract_gemini_text result
+    int attempts;           // how many attempts were made
+    bool cached;            // true if served from cache
+};
+
+// ---------------------------------------------------------------------------
+// Gemini response cache — keyed on exact payload string.
+// Cache files stored in .gemini_cache/ directory.
+// ---------------------------------------------------------------------------
+static const std::string GEMINI_CACHE_DIR = ".gemini_cache";
+
+static std::string cache_key(const std::string& payload) {
+    std::size_t h = std::hash<std::string>{}(payload);
+    char buf[20];
+    std::snprintf(buf, sizeof(buf), "%016zx", h);
+    return std::string(buf);
+}
+
+static bool gemini_cache_lookup(const std::string& payload, std::string& raw_response) {
+    std::string path = GEMINI_CACHE_DIR + "/" + cache_key(payload);
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    raw_response.assign(std::istreambuf_iterator<char>(f),
+                        std::istreambuf_iterator<char>());
+    return !raw_response.empty();
+}
+
+static void gemini_cache_store(const std::string& payload, const std::string& raw_response) {
+    fs::create_directories(GEMINI_CACHE_DIR);
+    std::string path = GEMINI_CACHE_DIR + "/" + cache_key(payload);
+    std::ofstream f(path, std::ios::binary);
+    if (f) f.write(raw_response.data(), raw_response.size());
+}
+
+static GeminiCallResult call_gemini(const std::string& url,
+                                    const std::string& payload,
+                                    const std::string& log_label,
+                                    const std::string& log_prompt,
+                                    int timeout_sec = 30,
+                                    int max_retries = 1) {
+    GeminiCallResult result;
+    result.attempts = 0;
+    result.cached = false;
+
+    // Check cache first
+    if (gemini_cache_lookup(payload, result.raw_response)) {
+        result.text = extract_gemini_text(result.raw_response);
+        if (!result.text.empty()) {
+            result.cached = true;
+            result.attempts = 0;
+            gemini_log(log_label + " [CACHED]", log_prompt, result.text);
+            return result;
+        }
+    }
+
+    for (int attempt = 0; attempt <= max_retries; attempt++) {
+        result.attempts = attempt + 1;
+
+        if (attempt > 0) {
+            // Brief delay before retry
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        // Write payload to temp file
+        char tmppath[] = "/tmp/gemini_call_XXXXXX";
+        int fd = mkstemp(tmppath);
+        if (fd < 0) continue;
+
+        ssize_t written = 0;
+        size_t total = payload.size();
+        while (written < static_cast<ssize_t>(total)) {
+            ssize_t n = write(fd, payload.data() + written, total - written);
+            if (n <= 0) break;
+            written += n;
+        }
+        close(fd);
+
+        std::string cmd = "curl -s --max-time " + std::to_string(timeout_sec)
+            + " -X POST -H 'Content-Type: application/json' -d @"
+            + std::string(tmppath) + " '" + url + "'";
+
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            unlink(tmppath);
+            continue;
+        }
+
+        result.raw_response.clear();
+        char chunk[8192];
+        size_t n;
+        while ((n = fread(chunk, 1, sizeof(chunk), pipe)) > 0)
+            result.raw_response.append(chunk, n);
+        pclose(pipe);
+        unlink(tmppath);
+
+        result.text = extract_gemini_text(result.raw_response);
+
+        std::string suffix = (attempt > 0)
+            ? " (retry " + std::to_string(attempt) + ")" : "";
+        gemini_log(log_label + suffix, log_prompt,
+            result.text.empty() ? result.raw_response : result.text);
+
+        if (!result.text.empty()) {
+            // Store successful response in cache
+            gemini_cache_store(payload, result.raw_response);
+            break;
+        }
+    }
+
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // URL safety check for /fetch-url proxy.
 // ---------------------------------------------------------------------------
@@ -359,6 +510,17 @@ static std::array<std::array<char, 15>, 15> parse_cgp_board(const std::string& c
     return board;
 }
 
+// Forward declarations for run_tests_cli.
+static bool parse_board_rect_from_log(const std::string& log,
+                                       int& bx, int& by, int& cell_sz,
+                                       int* board_w);
+static bool detect_board_mode(const std::vector<uint8_t>& image_data,
+                               int bx, int by, int cell_sz);
+static void detect_tiles_by_color(const std::vector<uint8_t>& image_data,
+                                   int bx, int by, int cell_sz,
+                                   bool occupied[15][15],
+                                   bool is_light_mode, int board_w);
+
 // ---------------------------------------------------------------------------
 // Run all test cases from testdata/ directory (CLI mode).
 // ---------------------------------------------------------------------------
@@ -369,9 +531,7 @@ static int run_tests_cli() {
     }
 
     int total_cases = 0, passed_cases = 0;
-    int total_tiles = 0, correct_tiles = 0;
     int total_occ_expected = 0, total_occ_correct = 0, total_occ_false_pos = 0;
-    int total_letter_attempts = 0, total_letter_correct = 0;
 
     std::vector<fs::directory_entry> entries;
     for (const auto& e : fs::directory_iterator("testdata"))
@@ -402,49 +562,58 @@ static int run_tests_cli() {
 
         DebugResult dr = process_board_image_debug(img_data);
 
-        auto expected = parse_cgp_board(expected_cgp);
-        auto got = parse_cgp_board(dr.cgp);
+        // Color-based occupancy detection (same as Gemini pipeline)
+        bool color_occupied[15][15] = {};
+        bool have_color = false;
+        int bx, by, cell_sz, board_w = 0;
+        if (parse_board_rect_from_log(dr.log, bx, by, cell_sz, &board_w)) {
+            bool is_light = detect_board_mode(img_data, bx, by, cell_sz);
+            detect_tiles_by_color(img_data, bx, by, cell_sz, color_occupied,
+                                  is_light, board_w);
+            have_color = true;
+        }
 
-        int case_total = 0, case_correct = 0;
+        auto expected = parse_cgp_board(expected_cgp);
+
         int occ_expected = 0, occ_correct = 0, occ_false_pos = 0;
-        int letter_attempts = 0, letter_correct = 0;
+        std::string fp_cells, fn_cells;
         for (int r = 0; r < 15; r++) {
             for (int c = 0; c < 15; c++) {
                 bool exp_occ = (expected[r][c] != 0);
-                bool got_occ = (got[r][c] != 0);
+                bool got_occ = have_color ? color_occupied[r][c]
+                                          : (dr.cells[r][c].letter != 0);
                 if (exp_occ) {
                     occ_expected++;
-                    if (got_occ) {
-                        occ_correct++;
-                        letter_attempts++;
-                        if (got[r][c] == expected[r][c]) letter_correct++;
+                    if (got_occ) occ_correct++;
+                    else {
+                        if (!fn_cells.empty()) fn_cells += " ";
+                        fn_cells += static_cast<char>('A' + c);
+                        fn_cells += std::to_string(r + 1);
                     }
                 } else if (got_occ) {
                     occ_false_pos++;
-                }
-                if (exp_occ || got_occ) {
-                    case_total++;
-                    if (expected[r][c] == got[r][c]) case_correct++;
+                    if (!fp_cells.empty()) fp_cells += " ";
+                    fp_cells += static_cast<char>('A' + c);
+                    fp_cells += std::to_string(r + 1);
                 }
             }
         }
 
         total_cases++;
-        total_tiles += case_total;
-        correct_tiles += case_correct;
         total_occ_expected += occ_expected;
         total_occ_correct += occ_correct;
         total_occ_false_pos += occ_false_pos;
-        total_letter_attempts += letter_attempts;
-        total_letter_correct += letter_correct;
 
         double occ_pct = occ_expected > 0 ? (100.0 * occ_correct / occ_expected) : 100.0;
-        double let_pct = letter_attempts > 0 ? (100.0 * letter_correct / letter_attempts) : 0.0;
-        std::printf("%-25s occ %3d/%3d (%.0f%%) +%d fp  letters %3d/%3d (%.0f%%)\n",
+        int fn = occ_expected - occ_correct;
+        std::printf("%-20s occ %3d/%3d (%.0f%%) +%d fp -%d fn",
                     name.c_str(), occ_correct, occ_expected, occ_pct,
-                    occ_false_pos, letter_correct, letter_attempts, let_pct);
+                    occ_false_pos, fn);
+        if (!fp_cells.empty()) std::printf("  FP:[%s]", fp_cells.c_str());
+        if (!fn_cells.empty()) std::printf("  FN:[%s]", fn_cells.c_str());
+        std::printf("\n");
 
-        if (case_correct == case_total) passed_cases++;
+        if (occ_correct == occ_expected && occ_false_pos == 0) passed_cases++;
     }
 
     if (total_cases == 0) {
@@ -453,12 +622,10 @@ static int run_tests_cli() {
     }
 
     double occ_overall = total_occ_expected > 0 ? (100.0 * total_occ_correct / total_occ_expected) : 100.0;
-    double let_overall = total_letter_attempts > 0 ? (100.0 * total_letter_correct / total_letter_attempts) : 0.0;
-    std::printf("\n%d test case(s), %d passed\n", total_cases, passed_cases);
-    std::printf("Occupancy: %d/%d (%.1f%%) +%d false positives\n",
-                total_occ_correct, total_occ_expected, occ_overall, total_occ_false_pos);
-    std::printf("Letters:   %d/%d (%.1f%%)\n",
-                total_letter_correct, total_letter_attempts, let_overall);
+    std::printf("\n%d test case(s), %d perfect occupancy\n", total_cases, passed_cases);
+    std::printf("Occupancy: %d/%d (%.1f%%) +%d fp -%d fn\n",
+                total_occ_correct, total_occ_expected, occ_overall,
+                total_occ_false_pos, total_occ_expected - total_occ_correct);
 
     return (passed_cases == total_cases) ? 0 : 1;
 }
@@ -1122,169 +1289,22 @@ static std::string json_extract_string(const std::string& body,
     return body.substr(q1 + 1, q2 - q1 - 1);
 }
 
-// ---------------------------------------------------------------------------
-// Extract the "text" string value from a Gemini API JSON response.
-// Handles escaped characters within the string value.
-// ---------------------------------------------------------------------------
-static std::string extract_gemini_text(const std::string& json) {
-    // Find the LAST "text" key — Gemini 2.5 models may have thinking parts
-    // before the actual response, each with their own "text" key.
-    size_t last_text = std::string::npos;
-    size_t search = 0;
-    while (true) {
-        size_t found = json.find("\"text\"", search);
-        if (found == std::string::npos) break;
-        last_text = found;
-        search = found + 6;
-    }
-    if (last_text == std::string::npos) return {};
-
-    size_t pos = json.find(':', last_text + 6);
-    if (pos == std::string::npos) return {};
-    pos++;
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'
-           || json[pos] == '\n' || json[pos] == '\r'))
-        pos++;
-    if (pos >= json.size() || json[pos] != '"') return {};
-    pos++; // skip opening quote
-
-    std::string result;
-    while (pos < json.size() && json[pos] != '"') {
-        if (json[pos] == '\\' && pos + 1 < json.size()) {
-            pos++;
-            switch (json[pos]) {
-                case '"':  result += '"';  break;
-                case '\\': result += '\\'; break;
-                case 'n':  result += '\n'; break;
-                case 't':  result += '\t'; break;
-                case 'r':  result += '\r'; break;
-                default:   result += json[pos]; break;
-            }
-        } else {
-            result += json[pos];
-        }
-        pos++;
-    }
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// Parse Gemini's 15x15 JSON array response into CellResult grid.
-// Expected: [["A","B",null,...], ...] — uppercase=tile, lowercase=blank, null=empty
-// ---------------------------------------------------------------------------
-static bool parse_gemini_board(const std::string& text,
-                                CellResult cells[15][15]) {
-    std::string s = text;
-
-    // Strip markdown code fences if present
-    size_t fence_start = s.find("```");
-    if (fence_start != std::string::npos) {
-        size_t line_end = s.find('\n', fence_start);
-        if (line_end != std::string::npos)
-            s = s.substr(line_end + 1);
-        size_t fence_end = s.rfind("```");
-        if (fence_end != std::string::npos)
-            s = s.substr(0, fence_end);
-    }
-
-    // Initialize cells to empty
-    for (int r = 0; r < 15; r++)
-        for (int c = 0; c < 15; c++)
-            cells[r][c] = {};
-
-    size_t pos = 0;
-    auto skip_ws = [&]() {
-        while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t'
-               || s[pos] == '\n' || s[pos] == '\r'))
-            pos++;
-    };
-
-    // Find the board array start — look for "board" key first, fallback to first [
-    size_t board_start;
-    auto board_key = s.find("\"board\"");
-    if (board_key != std::string::npos)
-        board_start = s.find('[', board_key);
-    else
-        board_start = s.find('[');
-    if (board_start == std::string::npos) return false;
-    pos = board_start + 1; // skip outer [
-
-    for (int r = 0; r < 15; r++) {
-        skip_ws();
-        if (r > 0) {
-            if (pos < s.size() && s[pos] == ',') pos++;
-            skip_ws();
-        }
-        if (pos >= s.size() || s[pos] != '[') return false;
-        pos++; // skip inner [
-
-        for (int c = 0; c < 15; c++) {
-            skip_ws();
-            if (c > 0) {
-                if (pos < s.size() && s[pos] == ',') pos++;
-                skip_ws();
-            }
-
-            if (pos < s.size() && s[pos] == '"') {
-                pos++; // skip opening quote
-                if (pos < s.size()) {
-                    char ch = s[pos];
-                    pos++;
-                    if (pos < s.size() && s[pos] == '"') pos++; // skip closing quote
-
-                    cells[r][c].letter = ch;
-                    cells[r][c].confidence = 1.0f;
-                    if (ch >= 'a' && ch <= 'z')
-                        cells[r][c].is_blank = true;
-                }
-            } else if (pos + 4 <= s.size() && s.substr(pos, 4) == "null") {
-                pos += 4;
-                // cell stays empty (default)
-            }
-        }
-
-        skip_ws();
-        if (pos < s.size() && s[pos] == ']') pos++; // skip inner ]
-    }
-
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Build CGP board string from CellResult grid.
-// ---------------------------------------------------------------------------
-static std::string cells_to_cgp(const CellResult cells[15][15]) {
-    std::string result;
-    for (int r = 0; r < 15; r++) {
-        if (r > 0) result += '/';
-        int empty = 0;
-        for (int c = 0; c < 15; c++) {
-            if (cells[r][c].letter == 0) {
-                empty++;
-            } else {
-                if (empty > 0) {
-                    result += std::to_string(empty);
-                    empty = 0;
-                }
-                result += cells[r][c].letter;
-            }
-        }
-        if (empty > 0)
-            result += std::to_string(empty);
-    }
-    return result;
-}
+// Gemini response parsing (shared with unit tests)
+#include "gemini_parse.h"
 
 // ---------------------------------------------------------------------------
 // Parse board rectangle from OpenCV pipeline log.
 // ---------------------------------------------------------------------------
 static bool parse_board_rect_from_log(const std::string& log,
-                                       int& bx, int& by, int& cell_sz) {
+                                       int& bx, int& by, int& cell_sz,
+                                       int* board_w = nullptr) {
     auto pos = log.find("Final: rect=");
     if (pos == std::string::npos) return false;
     int bw, bh;
-    return sscanf(log.c_str() + pos, "Final: rect=%d,%d %dx%d cell=%d",
-                  &bx, &by, &bw, &bh, &cell_sz) == 5;
+    bool ok = sscanf(log.c_str() + pos, "Final: rect=%d,%d %dx%d cell=%d",
+                     &bx, &by, &bw, &bh, &cell_sz) == 5;
+    if (ok && board_w) *board_w = bw;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,13 +1343,16 @@ static bool detect_board_mode(const std::vector<uint8_t>& image_data,
 }
 
 // ---------------------------------------------------------------------------
-// Color-based tile detection. Tiles are beige/tan (warm hue, low saturation,
-// bright) and have internal contrast from letter text + subscript.
+// Color-based tile detection using corner-sampled HSV with subpixel cell
+// coordinates.  Corners (top-left, top-right, bottom-left — skip bottom-right
+// where subscript lives) give the background color without letter
+// interference, avoiding mis-detection of heavy letters like W/M.
 // ---------------------------------------------------------------------------
 static void detect_tiles_by_color(const std::vector<uint8_t>& image_data,
                                    int bx, int by, int cell_sz,
                                    bool occupied[15][15],
-                                   bool is_light_mode = false) {
+                                   bool is_light_mode = false,
+                                   int board_w = 0) {
     cv::Mat raw(1, static_cast<int>(image_data.size()), CV_8UC1,
                 const_cast<uint8_t*>(image_data.data()));
     cv::Mat img = cv::imdecode(raw, cv::IMREAD_COLOR);
@@ -1343,14 +1366,22 @@ static void detect_tiles_by_color(const std::vector<uint8_t>& image_data,
     cv::Mat hsv;
     cv::cvtColor(img, hsv, cv::COLOR_BGR2HSV);
 
-    int inset = std::max(2, cell_sz / 4);
+    // Subpixel cell width: use board_w if provided, else cell_sz.
+    double cell_w = (board_w > 0) ? board_w / 15.0 : static_cast<double>(cell_sz);
+    double inset_frac = 0.15;
 
     for (int r = 0; r < 15; r++) {
         for (int c = 0; c < 15; c++) {
-            int x0 = std::clamp(bx + c * cell_sz + inset, 0, img.cols - 1);
-            int y0 = std::clamp(by + r * cell_sz + inset, 0, img.rows - 1);
-            int x1 = std::clamp(bx + (c + 1) * cell_sz - inset, 1, img.cols);
-            int y1 = std::clamp(by + (r + 1) * cell_sz - inset, 1, img.rows);
+            // Subpixel cell boundaries with inset
+            double fx0 = bx + c * cell_w + cell_w * inset_frac;
+            double fy0 = by + r * cell_w + cell_w * inset_frac;
+            double fx1 = bx + (c + 1) * cell_w - cell_w * inset_frac;
+            double fy1 = by + (r + 1) * cell_w - cell_w * inset_frac;
+
+            int x0 = std::clamp(static_cast<int>(fx0), 0, img.cols - 1);
+            int y0 = std::clamp(static_cast<int>(fy0), 0, img.rows - 1);
+            int x1 = std::clamp(static_cast<int>(fx1), 1, img.cols);
+            int y1 = std::clamp(static_cast<int>(fy1), 1, img.rows);
 
             if (x1 <= x0 || y1 <= y0) {
                 occupied[r][c] = false;
@@ -1358,40 +1389,62 @@ static void detect_tiles_by_color(const std::vector<uint8_t>& image_data,
             }
 
             cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
-            cv::Scalar mh = cv::mean(hsv(roi));
-            double h = mh[0], s = mh[1], v = mh[2]; // H:0-180 S:0-255 V:0-255
 
-            // Brightness variance — tiles have dark letter text on light bg
+            // Brightness contrast — tiles have letter text
             cv::Mat gray;
             cv::cvtColor(img(roi), gray, cv::COLOR_BGR2GRAY);
             cv::Scalar gm, gs;
             cv::meanStdDev(gray, gm, gs);
 
-            if (is_light_mode) {
-                // Light mode: tiles are blue/purple squares on white bg
-                bool is_blue_tile = (h >= 100 && h <= 140 && s > 40 &&
-                                     v >= 40 && v <= 200);
-                // Blank tiles: green circle with italic letter
-                bool is_green_blank = (h >= 40 && h <= 85 && s > 40 && v > 60);
-                // Recently played: orange/gold highlight
-                bool is_orange = (h >= 10 && h <= 30 && s > 80 && v > 150);
-                // Text contrast on colored tile background
-                bool has_text = (gs[0] > 15 && v < 180 && s > 30);
+            // Corner-sampled HSV: average of top-left, top-right,
+            // bottom-left corners (skip bottom-right where subscript
+            // lives).  Gives background color immune to heavy-letter
+            // interference for both light and dark modes.
+            int rw = x1 - x0, rh = y1 - y0;
+            int csz = std::max(2, std::min(rw, rh) / 5);
+            cv::Scalar c_tl = cv::mean(hsv(cv::Rect(x0, y0, csz, csz)));
+            cv::Scalar c_tr = cv::mean(hsv(cv::Rect(x1-csz, y0, csz, csz)));
+            cv::Scalar c_bl = cv::mean(hsv(cv::Rect(x0, y1-csz, csz, csz)));
+            double h = (c_tl[0] + c_tr[0] + c_bl[0]) / 3.0;
+            double s = (c_tl[1] + c_tr[1] + c_bl[1]) / 3.0;
+            double v = (c_tl[2] + c_tr[2] + c_bl[2]) / 3.0;
 
-                occupied[r][c] = is_blue_tile || is_green_blank ||
+            // Center sample — blank tiles have a colored circle here
+            int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+            cv::Scalar c_center = cv::mean(hsv(cv::Rect(cx - csz/2, cy - csz/2, csz, csz)));
+            double ch = c_center[0], cs_val = c_center[1], cv_val = c_center[2];
+
+            if (is_light_mode) {
+                // Require gs[0] > 10 to exclude empty premium squares
+                // (TLS/DL) which share similar H/S/V but have no letter text.
+                bool is_blue_tile = (h >= 95 && h <= 145 && s > 30 &&
+                                     v >= 40 && v <= 210 && gs[0] > 10);
+                // Blank tile: tile-colored corners (blue) + lavender circle center
+                bool corner_is_tile = (h >= 95 && h <= 145 && s > 30 && v >= 40);
+                bool center_is_lavender = (ch >= 120 && ch <= 160 && cs_val > 15 && cv_val > 150);
+                bool is_blank = corner_is_tile && center_is_lavender;
+                bool is_orange = (h >= 8 && h <= 35 && s > 60 && v > 140);
+                bool has_text = (gs[0] > 15 && v < 190 && s > 25);
+
+                occupied[r][c] = is_blue_tile || is_blank ||
                                  is_orange || has_text;
             } else {
-                // Dark mode: tiles are beige/tan on dark green board
-                // Tile: warm beige (H ~10-35, low-medium S, bright V)
-                bool is_beige = (h >= 8 && h <= 38 && s < 140 && v > 130);
-
-                // Blank tile: purple circle (H ~130-155 in OpenCV = 260-310°)
-                bool is_purple = (h >= 120 && h <= 160 && s > 30 && v > 60);
-
+                // Tile: warm beige — recently-played / golden tiles
+                bool is_beige = (h >= 8 && h <= 38 && s > 40 && v > 130);
+                // Tile: bright desaturated — normal tiles in dark mode have
+                // cream/off-white corners (S≈15, V≈186) while premium squares
+                // are all strongly saturated (S>100).
+                bool is_light_tile = (s < 30 && v > 130);
+                // Blank tile: tile-colored corners + purple circle center
+                bool corner_is_tile = is_beige || is_light_tile;
+                bool center_is_purple = (ch >= 120 && ch <= 160 && cs_val > 30 && cv_val > 60);
+                bool is_blank = corner_is_tile && center_is_purple;
                 // High internal contrast on a light, desaturated background
-                bool has_text = (gs[0] > 20 && gm[0] > 110 && s < 120);
+                // — but exclude empty board cells (H≈120-150, S<30) which
+                // have gs≈40-57 from grid lines.
+                bool has_text = (gs[0] > 20 && gm[0] > 110 && s >= 30);
 
-                occupied[r][c] = is_beige || is_purple || has_text;
+                occupied[r][c] = is_beige || is_light_tile || is_blank || has_text;
             }
         }
     }
@@ -1544,11 +1597,11 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     std::vector<RackTile> rack_tiles;
     bool is_light_mode = false;
     if (have_opencv) {
-        int bx, by, cell_sz;
-        if (parse_board_rect_from_log(opencv_dr.log, bx, by, cell_sz)) {
+        int bx, by, cell_sz, board_w = 0;
+        if (parse_board_rect_from_log(opencv_dr.log, bx, by, cell_sz, &board_w)) {
             is_light_mode = detect_board_mode(buf, bx, by, cell_sz);
             detect_tiles_by_color(buf, bx, by, cell_sz, color_occupied,
-                                  is_light_mode);
+                                  is_light_mode, board_w);
             have_color = true;
             rack_tiles = detect_rack_tiles(buf, bx, by, cell_sz,
                                            is_light_mode);
@@ -1635,8 +1688,8 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         prompt += "\\n\\nI have already detected which cells contain tiles using "
             "computer vision. Here is the occupancy grid where X = tile present "
             "and . = empty cell:\\n" + occupancy_grid +
-            "\\n\\nUse this grid to know EXACTLY which cells have tiles and which "
-            "are empty. Cells marked '.' MUST be null in your response. "
+            "\\n\\nCells marked '.' are likely empty, but if you can clearly see "
+            "a tile there, include it. "
             "Every cell marked 'X' MUST have a letter — do NOT return null "
             "for any X cell.";
     }
@@ -1670,10 +1723,15 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             "tiles. If you only see 6 letters, one tile is a blank (?).";
     } else {
         prompt +=
-            "\\n- REGULAR tiles: beige/tan SQUARES with upright letters and a small "
-            "subscript number (point value) in the bottom-right corner."
-            "\\n- BLANK tiles on the BOARD: PURPLE CIRCLES with italic/left-tilting "
-            "letters and NO subscript."
+            "\\n- REGULAR tiles: beige/tan SQUARES with upright letters AND a small "
+            "subscript number (point value) in the bottom-right corner. "
+            "The subscript IS the key indicator — if you see a small number, "
+            "it is ALWAYS a regular tile."
+            "\\n- BLANK tiles on the BOARD: PURPLE CIRCLES (not squares!) with "
+            "italic letters and NO subscript number. The tile SHAPE changes from "
+            "square to circle for blanks."
+            "\\n- IMPORTANT: If the tile is a SQUARE (not circle), it is ALWAYS "
+            "a regular tile — return UPPERCASE even if the letter looks italic."
             "\\n- BLANK tiles on the RACK: plain BEIGE tiles with NO letter and NO "
             "subscript number — they look like empty beige squares. Any rack tile "
             "that has no visible letter on it is a blank (?). "
@@ -1721,69 +1779,29 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"" + b64 + "\"}}"
         "]}]}";
 
-    // Write payload to temp file (too large for command-line arg)
-    char tmppath[] = "/tmp/gemini_XXXXXX";
-    int fd = mkstemp(tmppath);
-    if (fd < 0) {
-        std::string err = "{\"status\":\"Error: failed to create temp file\"}\n";
-        sink.write(err.data(), err.size());
-        sink.done();
-        return;
-    }
-    ssize_t written = 0;
-    size_t total = payload.size();
-    while (written < static_cast<ssize_t>(total)) {
-        ssize_t n = write(fd, payload.data() + written, total - written);
-        if (n <= 0) break;
-        written += n;
-    }
-    close(fd);
-
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
                       "gemini-2.5-flash:generateContent?key=";
     url += api_key;
 
-    std::string cmd = "curl -s --max-time 60 -X POST "
-        "-H 'Content-Type: application/json' "
-        "-d @" + std::string(tmppath) + " "
-        "'" + url + "'";
-
     auto t0 = std::chrono::steady_clock::now();
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
-        unlink(tmppath);
-        std::string err = "{\"status\":\"Error: failed to execute curl\"}\n";
-        sink.write(err.data(), err.size());
-        sink.done();
-        return;
-    }
-
-    std::string response;
-    char chunk[8192];
-    size_t n;
-    while ((n = fread(chunk, 1, sizeof(chunk), pipe)) > 0) {
-        response.append(chunk, n);
-    }
-    pclose(pipe);
-    unlink(tmppath);
-
+    auto gcr = call_gemini(url, payload, "main", prompt, 60, 2);
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     {
+        std::string retry_note = gcr.attempts > 1
+            ? " after " + std::to_string(gcr.attempts) + " attempts" : "";
         std::string msg = "{\"status\":\"Gemini responded ("
             + std::to_string(ms) + " ms, "
-            + std::to_string(response.size() / 1024) + " KB). Parsing...\"}\n";
+            + std::to_string(gcr.raw_response.size() / 1024) + " KB"
+            + retry_note + "). Parsing...\"}\n";
         sink.write(msg.data(), msg.size());
     }
 
-    // Parse Gemini response
-    gemini_log("main", prompt, response);  // always log raw response
-    std::string text = extract_gemini_text(response);
+    std::string text = gcr.text;
     if (text.empty()) {
-        std::string err_msg = json_extract_string(response, "message");
+        std::string err_msg = json_extract_string(gcr.raw_response, "message");
         if (err_msg.empty()) {
-            // Show first 500 chars of raw response for debugging
-            std::string preview = response.substr(0, 500);
+            std::string preview = gcr.raw_response.substr(0, 500);
             err_msg = "Failed to parse Gemini response. Raw: " + preview;
         }
         std::string err = "{\"status\":\"Error: " + json_escape(err_msg) + "\"}\n";
@@ -1837,6 +1855,72 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         return;
     }
 
+    // Launch rack verification asynchronously — runs concurrently with
+    // board post-processing (realignment, retry-missing, bag-math).
+    std::future<std::string> rack_verify_future;
+    bool rack_verify_launched = false;
+    if (!rack_tiles.empty() && rack_tiles.size() <= 7 &&
+        (static_cast<int>(gemini_rack.size()) != static_cast<int>(rack_tiles.size())
+         || std::any_of(rack_tiles.begin(), rack_tiles.end(),
+                        [](const RackTile& rt) { return rt.is_blank; }))) {
+        // Build payload on main thread (needs rack_tiles data)
+        std::string rack_prompt =
+            "These are cropped images of Scrabble rack tiles, in order left to right. "
+            "Identify each tile's letter. "
+            "Regular tiles are beige with a letter and a subscript number (return UPPERCASE). "
+            "BLANK tiles are beige with NO letter and NO subscript \\u2014 return '?' for these. "
+            "Return ONLY a JSON array of strings, one per image. "
+            "Example: [\\\"B\\\", \\\"I\\\", \\\"?\\\"]";
+        std::string rack_payload = "{\"contents\":[{\"parts\":["
+            "{\"text\":\"" + rack_prompt + "\"}";
+        std::string rack_msg = "{\"status\":\"Verifying rack ("
+            + std::to_string(rack_tiles.size()) + " tiles detected)...\",\"crops\":[";
+        for (size_t ri = 0; ri < rack_tiles.size(); ri++) {
+            std::string b64r = base64_encode(rack_tiles[ri].png);
+            rack_payload += ",{\"inlineData\":{\"mimeType\":\"image/png\","
+                "\"data\":\"" + b64r + "\"}}";
+            if (ri > 0) rack_msg += ",";
+            rack_msg += "{\"pos\":\"R" + std::to_string(ri + 1) +
+                "\",\"cur\":\"" +
+                (ri < gemini_rack.size()
+                    ? std::string(1, gemini_rack[ri])
+                    : std::string("?")) +
+                "\",\"img\":\"data:image/png;base64," + b64r + "\"}";
+        }
+        rack_payload += "]}]}";
+        rack_msg += "]}\n";
+        sink.write(rack_msg.data(), rack_msg.size());
+
+        // Launch async Gemini call
+        rack_verify_launched = true;
+        rack_verify_future = std::async(std::launch::async,
+            [rack_payload = std::move(rack_payload),
+             rack_prompt = std::move(rack_prompt),
+             url]() -> std::string {
+                auto gcr = call_gemini(url, rack_payload, "verify_rack",
+                                       rack_prompt, 30, 1);
+                std::string result;
+                if (!gcr.text.empty()) {
+                    std::string textr = gcr.text;
+                    size_t ri = 0;
+                    while (ri < textr.size() && textr[ri] != '[') ri++;
+                    ri++;
+                    while (ri < textr.size()) {
+                        while (ri < textr.size() && textr[ri] != '"'
+                               && textr[ri] != ']') ri++;
+                        if (ri >= textr.size() || textr[ri] == ']') break;
+                        ri++;
+                        if (ri < textr.size()) {
+                            result += textr[ri];
+                            ri++;
+                            if (ri < textr.size() && textr[ri] == '"') ri++;
+                        }
+                    }
+                }
+                return result;
+            });
+    }
+
     // Step 3.5: Row realignment — Gemini often returns correct letters
     // but shifted horizontally from the occupancy mask positions.
     // For each row, find contiguous blocks in both mask and Gemini output.
@@ -1868,50 +1952,88 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                     } else c++;
                 }
             }
-            // Try to match blocks: same number and same lengths
-            if (mask_blocks.size() != gem_blocks.size() ||
-                mask_blocks.empty()) continue;
-            bool lengths_match = true;
-            for (size_t i = 0; i < mask_blocks.size(); i++) {
-                if (mask_blocks[i].len != gem_blocks[i].len) {
-                    lengths_match = false;
-                    break;
+            if (mask_blocks.empty()) continue;
+
+            // Compute total tiles in each
+            int mask_total = 0, gem_total = 0;
+            for (const auto& b : mask_blocks) mask_total += b.len;
+            for (const auto& b : gem_blocks) gem_total += b.len;
+
+            // Strategy 1: block-by-block realignment (same count, same lengths)
+            bool do_block_realign = false;
+            if (mask_blocks.size() == gem_blocks.size()) {
+                bool lengths_match = true;
+                for (size_t i = 0; i < mask_blocks.size(); i++) {
+                    if (mask_blocks[i].len != gem_blocks[i].len) {
+                        lengths_match = false;
+                        break;
+                    }
+                }
+                if (lengths_match) {
+                    bool any_shifted = false;
+                    for (size_t i = 0; i < mask_blocks.size(); i++) {
+                        if (mask_blocks[i].start != gem_blocks[i].start) {
+                            any_shifted = true;
+                            break;
+                        }
+                    }
+                    do_block_realign = any_shifted;
                 }
             }
-            if (!lengths_match) continue;
-            // Check if any block is shifted
-            bool any_shifted = false;
-            for (size_t i = 0; i < mask_blocks.size(); i++) {
-                if (mask_blocks[i].start != gem_blocks[i].start) {
-                    any_shifted = true;
-                    break;
-                }
-            }
-            if (!any_shifted) continue;
-            // Realign: save letters, clear row, place at mask positions
+
+            // Strategy 2: flat realignment — total tile counts match but
+            // blocks differ (Gemini merged gaps or returned wrong row length).
+            // Map Gemini tiles left-to-right into mask positions.
+            bool do_flat_realign = !do_block_realign
+                && mask_total == gem_total && gem_total > 0
+                && mask_blocks.size() != gem_blocks.size();
+
+            if (!do_block_realign && !do_flat_realign) continue;
+
             CellResult saved[15];
             for (int c = 0; c < 15; c++) saved[c] = dr.cells[r][c];
             for (int c = 0; c < 15; c++) dr.cells[r][c] = {};
-            for (size_t i = 0; i < mask_blocks.size(); i++) {
-                for (int j = 0; j < mask_blocks[i].len; j++) {
-                    dr.cells[r][mask_blocks[i].start + j] =
-                        saved[gem_blocks[i].start + j];
+
+            if (do_block_realign) {
+                for (size_t i = 0; i < mask_blocks.size(); i++) {
+                    for (int j = 0; j < mask_blocks[i].len; j++) {
+                        dr.cells[r][mask_blocks[i].start + j] =
+                            saved[gem_blocks[i].start + j];
+                    }
+                    if (mask_blocks[i].start != gem_blocks[i].start) {
+                        std::string letters;
+                        for (int j = 0; j < mask_blocks[i].len; j++)
+                            letters += static_cast<char>(std::toupper(
+                                static_cast<unsigned char>(
+                                    saved[gem_blocks[i].start + j].letter)));
+                        realign_log += "Row " + std::to_string(r + 1)
+                            + ": shifted " + letters + " from cols "
+                            + std::to_string(gem_blocks[i].start + 1) + "-"
+                            + std::to_string(gem_blocks[i].start + gem_blocks[i].len)
+                            + " to " + std::to_string(mask_blocks[i].start + 1)
+                            + "-" + std::to_string(mask_blocks[i].start + mask_blocks[i].len)
+                            + "\n";
+                    }
                 }
-                if (mask_blocks[i].start != gem_blocks[i].start) {
-                    // Collect letters for log
-                    std::string letters;
-                    for (int j = 0; j < mask_blocks[i].len; j++)
-                        letters += static_cast<char>(std::toupper(
-                            static_cast<unsigned char>(
-                                saved[gem_blocks[i].start + j].letter)));
-                    realign_log += "Row " + std::to_string(r + 1)
-                        + ": shifted " + letters + " from cols "
-                        + std::to_string(gem_blocks[i].start + 1) + "-"
-                        + std::to_string(gem_blocks[i].start + gem_blocks[i].len)
-                        + " to " + std::to_string(mask_blocks[i].start + 1)
-                        + "-" + std::to_string(mask_blocks[i].start + mask_blocks[i].len)
-                        + "\n";
-                }
+            } else {
+                // Flat realign: collect all Gemini tiles, place into mask slots
+                std::vector<CellResult> gem_tiles;
+                for (const auto& b : gem_blocks)
+                    for (int j = 0; j < b.len; j++)
+                        gem_tiles.push_back(saved[b.start + j]);
+                int ti = 0;
+                for (const auto& b : mask_blocks)
+                    for (int j = 0; j < b.len && ti < (int)gem_tiles.size(); j++)
+                        dr.cells[r][b.start + j] = gem_tiles[ti++];
+
+                std::string letters;
+                for (const auto& t : gem_tiles)
+                    letters += static_cast<char>(std::toupper(
+                        static_cast<unsigned char>(t.letter)));
+                realign_log += "Row " + std::to_string(r + 1)
+                    + ": flat-realigned " + letters + " ("
+                    + std::to_string(gem_blocks.size()) + " blocks -> "
+                    + std::to_string(mask_blocks.size()) + " blocks)\n";
             }
         }
         if (!realign_log.empty()) {
@@ -1921,27 +2043,43 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
-    // Step 4: Enforce occupancy mask — clear non-occupied cells
+    // Step 4: Strict occupancy enforcement — clear all non-occupied cells.
+    // Save Gemini's original readings for disputed cells (Gemini found a
+    // letter but color detection says empty) so we can re-verify with crops.
+    struct DisputedCell { int r, c; CellResult orig; };
+    std::vector<DisputedCell> disputed;
     if (have_color || have_opencv) {
         for (int r = 0; r < 15; r++)
             for (int c = 0; c < 15; c++)
-                if (!get_occupied(r, c) && dr.cells[r][c].letter != 0)
+                if (!get_occupied(r, c) && dr.cells[r][c].letter != 0) {
+                    // Save before clearing — we'll re-verify with crops
+                    disputed.push_back({r, c, dr.cells[r][c]});
                     dr.cells[r][c] = {};
+                }
     }
 
-    // Step 5: Re-query Gemini for occupied cells it missed (crop + retry)
-    struct MissPos { int r, c; };
-    std::vector<MissPos> missing;
+    // Step 5: Re-query Gemini for cells needing verification (crop + retry)
+    // Two categories:
+    //   (a) occupied cells Gemini missed
+    //   (b) disputed cells (Gemini found letter, color says empty)
+    std::vector<RetryCell> retry_cells;
     if (have_color || have_opencv) {
         for (int r = 0; r < 15; r++)
             for (int c = 0; c < 15; c++)
                 if (get_occupied(r, c) && dr.cells[r][c].letter == 0)
-                    missing.push_back({r, c});
+                    retry_cells.push_back({r, c, false});
     }
+    for (const auto& d : disputed)
+        retry_cells.push_back({d.r, d.c, true});
 
-    if (!missing.empty() && have_opencv) {
+    if (!retry_cells.empty() && have_opencv) {
+        int n_missing = 0, n_disputed = 0;
+        for (const auto& rc : retry_cells)
+            if (rc.is_disputed) n_disputed++; else n_missing++;
         std::string msg = "{\"status\":\"Re-querying "
-            + std::to_string(missing.size()) + " unclear cell(s)...\"}\n";
+            + std::to_string(n_missing) + " missed + "
+            + std::to_string(n_disputed)
+            + " disputed cell(s)...\"}\n";
         sink.write(msg.data(), msg.size());
 
         int bx, by, cell_sz;
@@ -1953,21 +2091,28 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             if (!img.empty()) {
                 // Build multi-image retry with cropped cells
                 std::string retry_prompt =
-                    "Here are cropped images of individual Scrabble tiles. "
-                    "For each image, identify the letter on the tile. "
-                    "Regular tiles are beige with a subscript (return UPPERCASE). "
-                    "Blank tiles are purple circles with italic letters "
-                    "(return lowercase). "
-                    "Return ONLY a JSON array of single letters, one per image. "
-                    "Example: [\\\"F\\\", \\\"s\\\"]";
+                    "Here are cropped images of individual Scrabble board cells. "
+                    "Some cells have tiles, some may be EMPTY (no tile). "
+                    "For each image: "
+                    "- If there IS a tile: return the letter. "
+                    "Regular tiles are beige SQUARES with a small subscript "
+                    "number in the bottom-right (return UPPERCASE). "
+                    "Blank tiles are PURPLE CIRCLES (round, not square) with "
+                    "italic letters and NO subscript (return lowercase). "
+                    "If the tile is SQUARE with a subscript, it is ALWAYS "
+                    "regular — return UPPERCASE. "
+                    "- If the cell is EMPTY (board background, no tile): "
+                    "return null. "
+                    "Return ONLY a JSON array. "
+                    "Example: [\\\"F\\\", null, \\\"s\\\", \\\"A\\\"]";
 
                 std::string retry_payload = "{\"contents\":[{\"parts\":["
                     "{\"text\":\"" + retry_prompt + "\"}";
 
                 int pad = cell_sz / 8;
-                for (const auto& mc : missing) {
-                    int cx = std::max(0, bx + mc.c * cell_sz - pad);
-                    int cy = std::max(0, by + mc.r * cell_sz - pad);
+                for (const auto& rc : retry_cells) {
+                    int cx = std::max(0, bx + rc.c * cell_sz - pad);
+                    int cy = std::max(0, by + rc.r * cell_sz - pad);
                     int cw = std::min(cell_sz + 2 * pad, img.cols - cx);
                     int ch = std::min(cell_sz + 2 * pad, img.rows - cy);
                     cv::Mat cell_img = img(cv::Rect(cx, cy, cw, ch));
@@ -1978,66 +2123,16 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                 }
                 retry_payload += "]}]}";
 
-                char tmppath2[] = "/tmp/gemini2_XXXXXX";
-                int fd2 = mkstemp(tmppath2);
-                if (fd2 >= 0) {
-                    ssize_t w2 = 0;
-                    size_t t2 = retry_payload.size();
-                    while (w2 < static_cast<ssize_t>(t2)) {
-                        ssize_t nn = write(fd2, retry_payload.data() + w2, t2 - w2);
-                        if (nn <= 0) break;
-                        w2 += nn;
-                    }
-                    close(fd2);
-
-                    std::string cmd2 = "curl -s --max-time 30 -X POST "
-                        "-H 'Content-Type: application/json' "
-                        "-d @" + std::string(tmppath2) + " '" + url + "'";
-
-                    FILE* pipe2 = popen(cmd2.c_str(), "r");
-                    if (pipe2) {
-                        std::string resp2;
-                        char ch2[8192];
-                        size_t nn;
-                        while ((nn = fread(ch2, 1, sizeof(ch2), pipe2)) > 0)
-                            resp2.append(ch2, nn);
-                        pclose(pipe2);
-
-                        std::string text2 = extract_gemini_text(resp2);
-                        gemini_log("retry_missing", retry_prompt, text2.empty() ? resp2 : text2);
-                        if (!text2.empty()) {
-                            // Strip markdown fences
-                            std::string s2 = text2;
-                            auto f1 = s2.find("```");
-                            if (f1 != std::string::npos) {
-                                auto nl = s2.find('\n', f1);
-                                if (nl != std::string::npos) s2 = s2.substr(nl + 1);
-                                auto f2 = s2.rfind("```");
-                                if (f2 != std::string::npos) s2 = s2.substr(0, f2);
-                            }
-                            // Parse ["F", "s", ...]
-                            size_t idx = 0, mi = 0;
-                            while (idx < s2.size() && s2[idx] != '[') idx++;
-                            idx++;
-                            while (idx < s2.size() && mi < missing.size()) {
-                                while (idx < s2.size() && s2[idx] != '"'
-                                       && s2[idx] != ']') idx++;
-                                if (idx >= s2.size() || s2[idx] == ']') break;
-                                idx++; // skip opening "
-                                if (idx < s2.size()) {
-                                    char ltr = s2[idx];
-                                    auto& cell = dr.cells[missing[mi].r][missing[mi].c];
-                                    cell.letter = ltr;
-                                    cell.confidence = 0.8f;
-                                    cell.is_blank = (ltr >= 'a' && ltr <= 'z');
-                                    mi++;
-                                    idx++;
-                                    if (idx < s2.size() && s2[idx] == '"') idx++;
-                                }
-                            }
+                auto gcr2 = call_gemini(url, retry_payload,
+                    "retry_verify", retry_prompt, 30, 1);
+                if (!gcr2.text.empty()) {
+                    auto results = parse_retry_response(gcr2.text, retry_cells);
+                    for (size_t mi = 0; mi < results.size(); mi++) {
+                        if (results[mi].letter != 0) {
+                            dr.cells[retry_cells[mi].r]
+                                    [retry_cells[mi].c] = results[mi];
                         }
                     }
-                    unlink(tmppath2);
                 }
             }
         }
@@ -2051,6 +2146,102 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                     dr.cells[r][c].letter = '?';
                     dr.cells[r][c].confidence = 0.0f;
                 }
+    }
+
+    // Step 5.5: Board connectivity check — find islands not connected to center
+    if (have_opencv) {
+        auto conn = check_board_connectivity(dr.cells);
+        if (conn.center_empty || !conn.islands.empty()) {
+            // Build status message
+            std::string conn_msg = "{\"status\":\"Connectivity: ";
+            if (conn.center_empty)
+                conn_msg += "center empty, ";
+            if (!conn.islands.empty())
+                conn_msg += std::to_string(conn.islands.size()) + " island(s), ";
+            conn_msg += std::to_string(conn.bridge_candidates.size())
+                + " bridge candidate(s)\"}\n";
+            sink.write(conn_msg.data(), conn_msg.size());
+
+            // Build requery list: bridge candidates + island tiles (disputed)
+            std::vector<RetryCell> conn_retry;
+            for (const auto& [br, bc] : conn.bridge_candidates)
+                conn_retry.push_back({br, bc, false});
+            for (const auto& island : conn.islands)
+                for (const auto& [ir, ic] : island)
+                    conn_retry.push_back({ir, ic, true});
+
+            if (!conn_retry.empty()) {
+                int bx, by, cell_sz;
+                if (parse_board_rect_from_log(opencv_dr.log, bx, by, cell_sz)) {
+                    cv::Mat raw_c(1, static_cast<int>(buf.size()), CV_8UC1,
+                                const_cast<uint8_t*>(buf.data()));
+                    cv::Mat img_c = cv::imdecode(raw_c, cv::IMREAD_COLOR);
+
+                    if (!img_c.empty()) {
+                        std::string conn_prompt =
+                            "Here are cropped images of individual Scrabble board cells. "
+                            "Some cells have tiles, some may be EMPTY (no tile). "
+                            "For each image: "
+                            "- If there IS a tile: return the letter. "
+                            "Regular tiles are beige SQUARES with a small subscript "
+                            "number in the bottom-right (return UPPERCASE). "
+                            "Blank tiles are PURPLE CIRCLES (round, not square) with "
+                            "italic letters and NO subscript (return lowercase). "
+                            "If the tile is SQUARE with a subscript, it is ALWAYS "
+                            "regular — return UPPERCASE. "
+                            "- If the cell is EMPTY (board background, no tile): "
+                            "return null. "
+                            "Return ONLY a JSON array. "
+                            "Example: [\\\"F\\\", null, \\\"s\\\", \\\"A\\\"]";
+
+                        std::string conn_payload = "{\"contents\":[{\"parts\":["
+                            "{\"text\":\"" + conn_prompt + "\"}";
+
+                        int pad = cell_sz / 8;
+                        for (const auto& rc : conn_retry) {
+                            int cx = std::max(0, bx + rc.c * cell_sz - pad);
+                            int cy = std::max(0, by + rc.r * cell_sz - pad);
+                            int cw = std::min(cell_sz + 2 * pad, img_c.cols - cx);
+                            int ch = std::min(cell_sz + 2 * pad, img_c.rows - cy);
+                            cv::Mat cell_img = img_c(cv::Rect(cx, cy, cw, ch));
+                            std::vector<uint8_t> png_buf;
+                            cv::imencode(".png", cell_img, png_buf);
+                            conn_payload += ",{\"inlineData\":{\"mimeType\":\"image/png\","
+                                "\"data\":\"" + base64_encode(png_buf) + "\"}}";
+                        }
+                        conn_payload += "]}]}";
+
+                        auto gcrc = call_gemini(url, conn_payload,
+                            "connectivity", conn_prompt, 30, 1);
+                        if (!gcrc.text.empty()) {
+                            auto results = parse_retry_response(gcrc.text, conn_retry);
+                            int filled = 0;
+                            for (size_t mi = 0; mi < results.size(); mi++) {
+                                if (results[mi].letter != 0) {
+                                    dr.cells[conn_retry[mi].r]
+                                            [conn_retry[mi].c] = results[mi];
+                                    filled++;
+                                }
+                            }
+                            if (filled > 0) {
+                                std::string fmsg = "{\"status\":\"Connectivity: filled "
+                                    + std::to_string(filled) + " cell(s)\"}\n";
+                                sink.write(fmsg.data(), fmsg.size());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Re-check connectivity after fixes
+            auto conn2 = check_board_connectivity(dr.cells);
+            if (!conn2.islands.empty()) {
+                std::string wmsg = "{\"status\":\"Warning: "
+                    + std::to_string(conn2.islands.size())
+                    + " island(s) still disconnected\"}\n";
+                sink.write(wmsg.data(), wmsg.size());
+            }
+        }
     }
 
     // Step 6: Bag-math validation — re-query cells with over-counted letters
@@ -2144,9 +2335,10 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                             ". For each image, carefully identify the letter. "
                             "Pay close attention to similar-looking letters "
                             "(H vs I vs N, O vs Q vs D, etc). "
-                            "Regular tiles are beige with a subscript (UPPERCASE). "
-                            "Blank tiles are purple circles with italic letters "
-                            "(lowercase). "
+                            "Regular tiles are beige SQUARES with a small subscript "
+                            "number (UPPERCASE). Blank tiles are PURPLE CIRCLES "
+                            "(round, not square) with NO subscript (lowercase). "
+                            "If SQUARE with subscript, ALWAYS return UPPERCASE. "
                             "Return ONLY a JSON array of single letters. "
                             "Example: [\\\"I\\\", \\\"H\\\"]";
 
@@ -2184,87 +2376,60 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                         crop_status += "]}\n";
                         sink.write(crop_status.data(), crop_status.size());
 
-                        char tmpv[] = "/tmp/gemini_v_XXXXXX";
-                        int fdv = mkstemp(tmpv);
-                        if (fdv >= 0) {
-                            ssize_t wv = 0;
-                            size_t tv = vfy_payload.size();
-                            while (wv < static_cast<ssize_t>(tv)) {
-                                ssize_t nn = write(fdv, vfy_payload.data() + wv, tv - wv);
-                                if (nn <= 0) break;
-                                wv += nn;
+                        auto gcrv = call_gemini(url, vfy_payload,
+                            "verify_board", vfy_prompt, 30, 1);
+                        if (!gcrv.text.empty()) {
+                            std::string sv = gcrv.text;
+                            auto f1 = sv.find("```");
+                            if (f1 != std::string::npos) {
+                                auto nl = sv.find('\n', f1);
+                                if (nl != std::string::npos) sv = sv.substr(nl+1);
+                                auto f2 = sv.rfind("```");
+                                if (f2 != std::string::npos) sv = sv.substr(0, f2);
                             }
-                            close(fdv);
-
-                            std::string cmdv = "curl -s --max-time 30 -X POST "
-                                "-H 'Content-Type: application/json' "
-                                "-d @" + std::string(tmpv) + " '" + url + "'";
-                            FILE* pipev = popen(cmdv.c_str(), "r");
-                            if (pipev) {
-                                std::string respv;
-                                char chv[8192];
-                                size_t nnv;
-                                while ((nnv = fread(chv, 1, sizeof(chv), pipev)) > 0)
-                                    respv.append(chv, nnv);
-                                pclose(pipev);
-
-                                std::string textv = extract_gemini_text(respv);
-                                gemini_log("verify_board", vfy_prompt, textv.empty() ? respv : textv);
-                                if (!textv.empty()) {
-                                    std::string sv = textv;
-                                    auto f1 = sv.find("```");
-                                    if (f1 != std::string::npos) {
-                                        auto nl = sv.find('\n', f1);
-                                        if (nl != std::string::npos) sv = sv.substr(nl+1);
-                                        auto f2 = sv.rfind("```");
-                                        if (f2 != std::string::npos) sv = sv.substr(0, f2);
+                            size_t vi = 0, si = 0;
+                            int corrections = 0;
+                            std::string corr_detail;
+                            while (vi < sv.size() && sv[vi] != '[') vi++;
+                            vi++;
+                            while (vi < sv.size() && si < suspects.size()) {
+                                while (vi < sv.size() && sv[vi] != '"'
+                                       && sv[vi] != ']') vi++;
+                                if (vi >= sv.size() || sv[vi] == ']') break;
+                                vi++;
+                                if (vi < sv.size()) {
+                                    char ltr = sv[vi];
+                                    auto& cell = dr.cells[suspects[si].r][suspects[si].c];
+                                    if (ltr != cell.letter) {
+                                        if (!corr_detail.empty()) corr_detail += ", ";
+                                        corr_detail +=
+                                            std::string(1, static_cast<char>('A' + suspects[si].c))
+                                            + std::to_string(suspects[si].r + 1) + ": "
+                                            + static_cast<char>(std::toupper(
+                                                static_cast<unsigned char>(cell.letter)))
+                                            + " -> "
+                                            + static_cast<char>(std::toupper(
+                                                static_cast<unsigned char>(ltr)));
+                                        cell.letter = ltr;
+                                        cell.confidence = 0.85f;
+                                        cell.is_blank = (ltr >= 'a' && ltr <= 'z');
+                                        corrections++;
                                     }
-                                    size_t vi = 0, si = 0;
-                                    int corrections = 0;
-                                    std::string corr_detail;
-                                    while (vi < sv.size() && sv[vi] != '[') vi++;
+                                    si++;
                                     vi++;
-                                    while (vi < sv.size() && si < suspects.size()) {
-                                        while (vi < sv.size() && sv[vi] != '"'
-                                               && sv[vi] != ']') vi++;
-                                        if (vi >= sv.size() || sv[vi] == ']') break;
-                                        vi++;
-                                        if (vi < sv.size()) {
-                                            char ltr = sv[vi];
-                                            auto& cell = dr.cells[suspects[si].r][suspects[si].c];
-                                            if (ltr != cell.letter) {
-                                                if (!corr_detail.empty()) corr_detail += ", ";
-                                                corr_detail +=
-                                                    std::string(1, static_cast<char>('A' + suspects[si].c))
-                                                    + std::to_string(suspects[si].r + 1) + ": "
-                                                    + static_cast<char>(std::toupper(
-                                                        static_cast<unsigned char>(cell.letter)))
-                                                    + " -> "
-                                                    + static_cast<char>(std::toupper(
-                                                        static_cast<unsigned char>(ltr)));
-                                                cell.letter = ltr;
-                                                cell.confidence = 0.85f;
-                                                cell.is_blank = (ltr >= 'a' && ltr <= 'z');
-                                                corrections++;
-                                            }
-                                            si++;
-                                            vi++;
-                                            if (vi < sv.size() && sv[vi] == '"') vi++;
-                                        }
-                                    }
-                                    // Report corrections
-                                    std::string vfy_result;
-                                    if (corrections > 0)
-                                        vfy_result = "{\"status\":\"Corrected "
-                                            + std::to_string(corrections) + " cell(s): "
-                                            + json_escape(corr_detail) + "\"}\n";
-                                    else
-                                        vfy_result = "{\"status\":\"Verification confirmed all "
-                                            + std::to_string(suspects.size()) + " cell(s)\"}\n";
-                                    sink.write(vfy_result.data(), vfy_result.size());
+                                    if (vi < sv.size() && sv[vi] == '"') vi++;
                                 }
                             }
-                            unlink(tmpv);
+                            // Report corrections
+                            std::string vfy_result;
+                            if (corrections > 0)
+                                vfy_result = "{\"status\":\"Corrected "
+                                    + std::to_string(corrections) + " cell(s): "
+                                    + json_escape(corr_detail) + "\"}\n";
+                            else
+                                vfy_result = "{\"status\":\"Verification confirmed all "
+                                    + std::to_string(suspects.size()) + " cell(s)\"}\n";
+                            sink.write(vfy_result.data(), vfy_result.size());
                         }
                     }
                 }
@@ -2272,92 +2437,15 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
-    // Step 7: Rack verification — send rack crops to Gemini if available
-    if (!rack_tiles.empty() && rack_tiles.size() <= 7 &&
-        (static_cast<int>(gemini_rack.size()) != static_cast<int>(rack_tiles.size())
-         || std::any_of(rack_tiles.begin(), rack_tiles.end(),
-                        [](const RackTile& rt) { return rt.is_blank; }))) {
-        std::string rack_msg = "{\"status\":\"Verifying rack ("
-            + std::to_string(rack_tiles.size()) + " tiles detected)...\",\"crops\":[";
-        std::string rack_prompt =
-            "These are cropped images of Scrabble rack tiles, in order left to right. "
-            "Identify each tile's letter. "
-            "Regular tiles are beige with a letter and a subscript number (return UPPERCASE). "
-            "BLANK tiles are beige with NO letter and NO subscript \\u2014 return '?' for these. "
-            "Return ONLY a JSON array of strings, one per image. "
-            "Example: [\\\"B\\\", \\\"I\\\", \\\"?\\\"]";
-        std::string rack_payload = "{\"contents\":[{\"parts\":["
-            "{\"text\":\"" + rack_prompt + "\"}";
-        for (size_t ri = 0; ri < rack_tiles.size(); ri++) {
-            std::string b64r = base64_encode(rack_tiles[ri].png);
-            rack_payload += ",{\"inlineData\":{\"mimeType\":\"image/png\","
-                "\"data\":\"" + b64r + "\"}}";
-            if (ri > 0) rack_msg += ",";
-            rack_msg += "{\"pos\":\"R" + std::to_string(ri + 1) +
-                "\",\"cur\":\"" +
-                (ri < gemini_rack.size()
-                    ? std::string(1, gemini_rack[ri])
-                    : std::string("?")) +
-                "\",\"img\":\"data:image/png;base64," + b64r + "\"}";
-        }
-        rack_payload += "]}]}";
-        rack_msg += "]}\n";
-        sink.write(rack_msg.data(), rack_msg.size());
-
-        // Send to Gemini
-        char tmpr[] = "/tmp/gemini_r_XXXXXX";
-        int fdr = mkstemp(tmpr);
-        if (fdr >= 0) {
-            ssize_t wr = 0;
-            size_t tr = rack_payload.size();
-            while (wr < static_cast<ssize_t>(tr)) {
-                ssize_t nn = write(fdr, rack_payload.data() + wr, tr - wr);
-                if (nn <= 0) break;
-                wr += nn;
-            }
-            close(fdr);
-
-            std::string cmdr = "curl -s --max-time 30 -X POST "
-                "-H 'Content-Type: application/json' "
-                "-d @" + std::string(tmpr) + " '" + url + "'";
-            FILE* piper = popen(cmdr.c_str(), "r");
-            if (piper) {
-                std::string respr;
-                char chr[8192];
-                size_t nnr;
-                while ((nnr = fread(chr, 1, sizeof(chr), piper)) > 0)
-                    respr.append(chr, nnr);
-                pclose(piper);
-
-                std::string textr = extract_gemini_text(respr);
-                gemini_log("verify_rack", rack_prompt, textr.empty() ? respr : textr);
-                if (!textr.empty()) {
-                    // Parse ["B", "I", "?", ...]
-                    std::string new_rack;
-                    size_t ri = 0;
-                    while (ri < textr.size() && textr[ri] != '[') ri++;
-                    ri++;
-                    while (ri < textr.size()) {
-                        while (ri < textr.size() && textr[ri] != '"'
-                               && textr[ri] != ']') ri++;
-                        if (ri >= textr.size() || textr[ri] == ']') break;
-                        ri++;
-                        if (ri < textr.size()) {
-                            new_rack += textr[ri];
-                            ri++;
-                            if (ri < textr.size() && textr[ri] == '"') ri++;
-                        }
-                    }
-                    if (!new_rack.empty() && new_rack != gemini_rack) {
-                        std::string rmsg = "{\"status\":\"Rack corrected: "
-                            + json_escape(gemini_rack) + " -> "
-                            + json_escape(new_rack) + "\"}\n";
-                        sink.write(rmsg.data(), rmsg.size());
-                        gemini_rack = new_rack;
-                    }
-                }
-            }
-            unlink(tmpr);
+    // Step 7: Join rack verification (launched asynchronously before Step 3.5)
+    if (rack_verify_launched) {
+        std::string new_rack = rack_verify_future.get();
+        if (!new_rack.empty() && new_rack != gemini_rack) {
+            std::string rmsg = "{\"status\":\"Rack corrected: "
+                + json_escape(gemini_rack) + " -> "
+                + json_escape(new_rack) + "\"}\n";
+            sink.write(rmsg.data(), rmsg.size());
+            gemini_rack = new_rack;
         }
     }
 
@@ -2375,9 +2463,468 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     if (have_opencv)
         dr.debug_png = std::move(opencv_dr.debug_png);
 
-    // --- Rack validation & auto-correction ---
-    // full bag - board tiles - bag tiles = expected rack
+    // Rack validation runs after word corrections (see below).
     std::string rack_warning;
+
+    // Step 7.5: Lexicon inference — if Gemini didn't detect a valid lexicon,
+    // check board words to distinguish NWL23 vs CSW24.
+    {
+        bool need_inference = gemini_lexicon.empty();
+        if (!need_inference) {
+            // Check if the lexicon Gemini returned actually has a KWG file
+            std::string lpath = "magpie/data/lexica/" + gemini_lexicon + ".kwg";
+            if (!fs::exists(lpath)) need_inference = true;
+        }
+        if (need_inference) {
+        std::vector<std::string> csw_only;
+        std::string inferred = infer_lexicon(dr.cells, &csw_only);
+        gemini_lexicon = inferred;
+        if (!csw_only.empty()) {
+            std::string wlist;
+            for (const auto& w : csw_only) {
+                if (!wlist.empty()) wlist += ", ";
+                wlist += w;
+            }
+            std::string msg = "{\"status\":\"Inferred lexicon CSW24 (CSW-only words: "
+                + json_escape(wlist) + ")\"}\n";
+            sink.write(msg.data(), msg.size());
+        } else {
+            std::string msg = "{\"status\":\"Inferred lexicon NWL23 (no CSW-only words found)\"}\n";
+            sink.write(msg.data(), msg.size());
+        }
+        // Update CGP with inferred lexicon
+        dr.cgp = cells_to_cgp(dr.cells) + " "
+               + (gemini_rack.empty() ? "" : gemini_rack) + "/ "
+               + std::to_string(gemini_score1) + " " + std::to_string(gemini_score2)
+               + " lex " + gemini_lexicon + ";";
+        }
+    }
+
+    // Step 8: Dictionary validation — check all words against KWG
+    std::string invalid_words_json;  // JSON array string for UI
+    {
+        std::string lex = gemini_lexicon;
+        if (lex.empty()) lex = "NWL23";  // default
+        bool dict_ok = ensure_kwg_loaded(lex);
+        if (!dict_ok && lex != "NWL23") dict_ok = ensure_kwg_loaded("NWL23");
+        if (!dict_ok && lex != "CSW21") dict_ok = ensure_kwg_loaded("CSW21");
+
+        if (dict_ok) {
+            auto all_words = extract_words(dr.cells);
+            struct InvalidWord {
+                std::string word;
+                std::string position;  // e.g. "row 1" or "col G"
+                std::vector<std::pair<int,int>> cells;
+                bool horizontal;
+            };
+            std::vector<InvalidWord> invalid;
+            for (const auto& bw : all_words) {
+                if (!g_kwg.is_valid(bw.word)) {
+                    InvalidWord iw;
+                    iw.word = bw.word;
+                    iw.cells = bw.cells;
+                    iw.horizontal = bw.horizontal;
+                    if (bw.horizontal)
+                        iw.position = "row " + std::to_string(bw.cells[0].first + 1);
+                    else
+                        iw.position = "col " + std::string(1, static_cast<char>('A' + bw.cells[0].second));
+                    invalid.push_back(std::move(iw));
+                }
+            }
+
+            if (!invalid.empty()) {
+                // Identify suspect cells — cells in invalid words but not in
+                // any valid word
+                std::set<std::pair<int,int>> valid_cells, invalid_cells;
+                for (const auto& bw : all_words) {
+                    bool is_valid = g_kwg.is_valid(bw.word);
+                    for (const auto& p : bw.cells) {
+                        if (is_valid) valid_cells.insert(p);
+                        else invalid_cells.insert(p);
+                    }
+                }
+                std::vector<std::pair<int,int>> suspects;
+                for (const auto& p : invalid_cells) {
+                    if (valid_cells.find(p) == valid_cells.end())
+                        suspects.push_back(p);
+                }
+
+                // Build status message listing invalid words
+                std::string iw_list;
+                for (const auto& iw : invalid) {
+                    if (!iw_list.empty()) iw_list += ", ";
+                    iw_list += iw.word + " (" + iw.position + ")";
+                }
+                {
+                    std::string msg = "{\"status\":\"Invalid words ["
+                        + json_escape(g_kwg_lexicon) + "]: "
+                        + json_escape(iw_list) + "\"}\n";
+                    sink.write(msg.data(), msg.size());
+                }
+
+                // Gap filling: check empty cells at endpoints of invalid words
+                // Only look at the cell immediately before/after each invalid
+                // word — if it's empty and has letters on the other side, it
+                // may be a missing tile that would extend the word.
+                if (have_opencv) {
+                    std::set<std::pair<int,int>> gap_set;
+                    for (const auto& iw : invalid) {
+                        if (iw.cells.size() < 2) continue;
+                        if (iw.horizontal) {
+                            int r = iw.cells.front().first;
+                            int c0 = iw.cells.front().second;
+                            int c1 = iw.cells.back().second;
+                            // Check left of word
+                            if (c0 > 0 && dr.cells[r][c0-1].letter == 0
+                                && c0 >= 2 && dr.cells[r][c0-2].letter != 0)
+                                gap_set.insert({r, c0-1});
+                            // Check right of word
+                            if (c1 < 14 && dr.cells[r][c1+1].letter == 0
+                                && c1 <= 12 && dr.cells[r][c1+2].letter != 0)
+                                gap_set.insert({r, c1+1});
+                        } else {
+                            int c = iw.cells.front().second;
+                            int r0 = iw.cells.front().first;
+                            int r1 = iw.cells.back().first;
+                            // Check above word
+                            if (r0 > 0 && dr.cells[r0-1][c].letter == 0
+                                && r0 >= 2 && dr.cells[r0-2][c].letter != 0)
+                                gap_set.insert({r0-1, c});
+                            // Check below word
+                            if (r1 < 14 && dr.cells[r1+1][c].letter == 0
+                                && r1 <= 12 && dr.cells[r1+2][c].letter != 0)
+                                gap_set.insert({r1+1, c});
+                        }
+                    }
+
+                    if (!gap_set.empty()) {
+                        std::string gmsg = "{\"status\":\"Found "
+                            + std::to_string(gap_set.size())
+                            + " gap(s) at invalid word endpoints, re-querying...\"}\n";
+                        sink.write(gmsg.data(), gmsg.size());
+
+                        std::vector<RetryCell> gap_retry;
+                        for (const auto& [gr, gc] : gap_set)
+                            gap_retry.push_back({gr, gc, false});
+
+                        int bx, by, cell_sz;
+                        if (parse_board_rect_from_log(opencv_dr.log, bx, by, cell_sz)) {
+                            cv::Mat raw_g(1, static_cast<int>(buf.size()), CV_8UC1,
+                                        const_cast<uint8_t*>(buf.data()));
+                            cv::Mat img_g = cv::imdecode(raw_g, cv::IMREAD_COLOR);
+
+                            if (!img_g.empty()) {
+                                std::string gap_prompt =
+                                    "Here are cropped images of individual Scrabble board cells. "
+                                    "Some cells have tiles, some may be EMPTY (no tile). "
+                                    "For each image: "
+                                    "- If there IS a tile: return the letter. "
+                                    "Regular tiles are beige SQUARES with a small subscript "
+                                    "number in the bottom-right (return UPPERCASE). "
+                                    "Blank tiles are PURPLE CIRCLES (round, not square) with "
+                                    "italic letters and NO subscript (return lowercase). "
+                                    "If the tile is SQUARE with a subscript, it is ALWAYS "
+                                    "regular — return UPPERCASE. "
+                                    "- If the cell is EMPTY (board background, no tile): "
+                                    "return null. "
+                                    "Return ONLY a JSON array. "
+                                    "Example: [\\\"F\\\", null, \\\"s\\\", \\\"A\\\"]";
+
+                                std::string gap_payload = "{\"contents\":[{\"parts\":["
+                                    "{\"text\":\"" + gap_prompt + "\"}";
+
+                                int pad = cell_sz / 8;
+                                for (const auto& rc : gap_retry) {
+                                    int cx = std::max(0, bx + rc.c * cell_sz - pad);
+                                    int cy = std::max(0, by + rc.r * cell_sz - pad);
+                                    int cw = std::min(cell_sz + 2 * pad, img_g.cols - cx);
+                                    int ch = std::min(cell_sz + 2 * pad, img_g.rows - cy);
+                                    cv::Mat cell_img = img_g(cv::Rect(cx, cy, cw, ch));
+                                    std::vector<uint8_t> png_buf;
+                                    cv::imencode(".png", cell_img, png_buf);
+                                    gap_payload += ",{\"inlineData\":{\"mimeType\":\"image/png\","
+                                        "\"data\":\"" + base64_encode(png_buf) + "\"}}";
+                                }
+                                gap_payload += "]}]}";
+
+                                auto gcrg = call_gemini(url, gap_payload,
+                                    "gap_fill", gap_prompt, 30, 1);
+                                if (!gcrg.text.empty()) {
+                                    auto gap_results = parse_retry_response(gcrg.text, gap_retry);
+                                    int gap_filled = 0;
+                                    std::string gap_detail;
+                                    for (size_t gi = 0; gi < gap_results.size(); gi++) {
+                                        if (gap_results[gi].letter != 0) {
+                                            // Tentatively fill the gap
+                                            int gr = gap_retry[gi].r, gc = gap_retry[gi].c;
+                                            dr.cells[gr][gc] = gap_results[gi];
+
+                                            // Check if the resulting word(s) are valid
+                                            auto test_words = extract_words(dr.cells);
+                                            bool all_valid = true;
+                                            for (const auto& tw : test_words) {
+                                                bool touches_gap = false;
+                                                for (const auto& [wr, wc] : tw.cells)
+                                                    if (wr == gr && wc == gc) { touches_gap = true; break; }
+                                                if (touches_gap && !g_kwg.is_valid(tw.word)) {
+                                                    all_valid = false;
+                                                    break;
+                                                }
+                                            }
+
+                                            if (all_valid) {
+                                                gap_filled++;
+                                                if (!gap_detail.empty()) gap_detail += ", ";
+                                                gap_detail += std::string(1, static_cast<char>('A' + gc))
+                                                    + std::to_string(gr + 1) + "="
+                                                    + static_cast<char>(std::toupper(
+                                                        static_cast<unsigned char>(gap_results[gi].letter)));
+                                            } else {
+                                                // Reject — leave empty
+                                                dr.cells[gr][gc] = {};
+                                            }
+                                        }
+                                    }
+                                    if (gap_filled > 0) {
+                                        std::string gfmsg = "{\"status\":\"Gap fill: "
+                                            + json_escape(gap_detail) + "\"}\n";
+                                        sink.write(gfmsg.data(), gfmsg.size());
+
+                                        // Re-extract words and rebuild invalid list
+                                        all_words = extract_words(dr.cells);
+                                        invalid.clear();
+                                        for (const auto& bw : all_words) {
+                                            if (!g_kwg.is_valid(bw.word)) {
+                                                InvalidWord iw;
+                                                iw.word = bw.word;
+                                                iw.cells = bw.cells;
+                                                iw.horizontal = bw.horizontal;
+                                                if (bw.horizontal)
+                                                    iw.position = "row " + std::to_string(bw.cells[0].first + 1);
+                                                else
+                                                    iw.position = "col " + std::string(1, static_cast<char>('A' + bw.cells[0].second));
+                                                invalid.push_back(std::move(iw));
+                                            }
+                                        }
+                                        // Rebuild suspects
+                                        valid_cells.clear();
+                                        invalid_cells.clear();
+                                        for (const auto& bw : all_words) {
+                                            bool is_valid = g_kwg.is_valid(bw.word);
+                                            for (const auto& p : bw.cells) {
+                                                if (is_valid) valid_cells.insert(p);
+                                                else invalid_cells.insert(p);
+                                            }
+                                        }
+                                        suspects.clear();
+                                        for (const auto& p : invalid_cells) {
+                                            if (valid_cells.find(p) == valid_cells.end())
+                                                suspects.push_back(p);
+                                        }
+
+                                        // Update status
+                                        iw_list.clear();
+                                        for (const auto& iw : invalid) {
+                                            if (!iw_list.empty()) iw_list += ", ";
+                                            iw_list += iw.word + " (" + iw.position + ")";
+                                        }
+                                        if (!invalid.empty()) {
+                                            std::string umsg = "{\"status\":\"After gap fill, invalid: "
+                                                + json_escape(iw_list) + "\"}\n";
+                                            sink.write(umsg.data(), umsg.size());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Re-query suspect cells via Gemini
+                if (!suspects.empty() && have_opencv) {
+                    int bx, by, cell_sz;
+                    if (parse_board_rect_from_log(opencv_dr.log, bx, by, cell_sz)) {
+                        cv::Mat raw_d(1, static_cast<int>(buf.size()), CV_8UC1,
+                                    const_cast<uint8_t*>(buf.data()));
+                        cv::Mat img_d = cv::imdecode(raw_d, cv::IMREAD_COLOR);
+
+                        if (!img_d.empty()) {
+                            // Build crop status for UI debug
+                            std::string crop_status =
+                                "{\"status\":\"Re-querying "
+                                + std::to_string(suspects.size())
+                                + " suspect cell(s) from invalid words...\""
+                                + ",\"crops\":[";
+
+                            // Build prompt listing current letters and the
+                            // invalid words they participate in
+                            std::string dict_prompt =
+                                "These are cropped Scrabble tile images. "
+                                "The current OCR reads formed words that are "
+                                "NOT in the " + g_kwg_lexicon + " dictionary. "
+                                "Invalid words: " + iw_list + ". "
+                                "For each cropped tile, carefully re-identify "
+                                "the letter. Pay close attention to similar "
+                                "letters (H/N/I, O/Q/D, E/F, S/Z, etc). "
+                                "Regular tiles are beige SQUARES with a small "
+                                "subscript number (return UPPERCASE). Blank tiles "
+                                "are PURPLE CIRCLES (round, not square) with NO "
+                                "subscript (return lowercase). If SQUARE with "
+                                "subscript, ALWAYS return UPPERCASE. "
+                                "Return ONLY a JSON array of single letters. "
+                                "Example: [\\\"I\\\", \\\"H\\\"]";
+
+                            std::string dict_payload =
+                                "{\"contents\":[{\"parts\":["
+                                "{\"text\":\"" + dict_prompt + "\"}";
+
+                            int pad = cell_sz / 8;
+                            for (size_t si = 0; si < suspects.size(); si++) {
+                                const auto& sp = suspects[si];
+                                int cx = std::max(0, bx + sp.second * cell_sz - pad);
+                                int cy = std::max(0, by + sp.first * cell_sz - pad);
+                                int cw = std::min(cell_sz + 2*pad, img_d.cols - cx);
+                                int ch_ = std::min(cell_sz + 2*pad, img_d.rows - cy);
+                                cv::Mat cell_img = img_d(cv::Rect(cx, cy, cw, ch_));
+                                std::vector<uint8_t> png_buf;
+                                cv::imencode(".png", cell_img, png_buf);
+                                std::string b64_crop = base64_encode(png_buf);
+                                dict_payload +=
+                                    ",{\"inlineData\":{\"mimeType\":\"image/png\","
+                                    "\"data\":\"" + b64_crop + "\"}}";
+                                if (si > 0) crop_status += ",";
+                                char cur_ltr = static_cast<char>(std::toupper(
+                                    static_cast<unsigned char>(
+                                        dr.cells[sp.first][sp.second].letter)));
+                                crop_status += "{\"pos\":\""
+                                    + std::string(1, static_cast<char>('A' + sp.second))
+                                    + std::to_string(sp.first + 1)
+                                    + "\",\"cur\":\""
+                                    + std::string(1, cur_ltr)
+                                    + "\",\"img\":\"data:image/png;base64,"
+                                    + b64_crop + "\"}";
+                            }
+                            dict_payload += "]}]}";
+                            crop_status += "]}\n";
+                            sink.write(crop_status.data(), crop_status.size());
+
+                            // Call Gemini
+                            auto gcrd = call_gemini(url, dict_payload,
+                                "dict_requery", dict_prompt, 30, 1);
+                            if (!gcrd.text.empty()) {
+                                std::string sd = gcrd.text;
+                                auto f1 = sd.find("```");
+                                if (f1 != std::string::npos) {
+                                    auto nl = sd.find('\n', f1);
+                                    if (nl != std::string::npos)
+                                        sd = sd.substr(nl + 1);
+                                    auto f2 = sd.rfind("```");
+                                    if (f2 != std::string::npos)
+                                        sd = sd.substr(0, f2);
+                                }
+                                size_t di = 0, si2 = 0;
+                                int corrections = 0;
+                                std::string corr_detail;
+                                while (di < sd.size() && sd[di] != '[')
+                                    di++;
+                                di++;
+                                while (di < sd.size()
+                                       && si2 < suspects.size()) {
+                                    while (di < sd.size()
+                                           && sd[di] != '"'
+                                           && sd[di] != ']')
+                                        di++;
+                                    if (di >= sd.size()
+                                        || sd[di] == ']')
+                                        break;
+                                    di++;
+                                    if (di < sd.size()) {
+                                        char ltr = sd[di];
+                                        auto& cell = dr.cells
+                                            [suspects[si2].first]
+                                            [suspects[si2].second];
+                                        if (ltr != cell.letter) {
+                                            if (!corr_detail.empty())
+                                                corr_detail += ", ";
+                                            corr_detail += std::string(1,
+                                                static_cast<char>('A' + suspects[si2].second))
+                                                + std::to_string(suspects[si2].first + 1)
+                                                + ": "
+                                                + static_cast<char>(std::toupper(
+                                                    static_cast<unsigned char>(cell.letter)))
+                                                + " -> "
+                                                + static_cast<char>(std::toupper(
+                                                    static_cast<unsigned char>(ltr)));
+                                            cell.letter = ltr;
+                                            cell.confidence = 0.85f;
+                                            cell.is_blank =
+                                                (ltr >= 'a' && ltr <= 'z');
+                                            corrections++;
+                                        }
+                                        si2++;
+                                        di++;
+                                        if (di < sd.size()
+                                            && sd[di] == '"')
+                                            di++;
+                                    }
+                                }
+                                if (corrections > 0) {
+                                    std::string vmsg =
+                                        "{\"status\":\"Dict corrections: "
+                                        + json_escape(corr_detail)
+                                        + "\"}\n";
+                                    sink.write(vmsg.data(),
+                                               vmsg.size());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Rebuild CGP after any corrections
+                dr.cgp = cells_to_cgp(dr.cells) + " "
+                       + (gemini_rack.empty() ? "" : gemini_rack) + "/ "
+                       + std::to_string(gemini_score1) + " "
+                       + std::to_string(gemini_score2);
+                if (!lex_str.empty())
+                    dr.cgp += " lex " + lex_str + ";";
+
+                // Re-validate after corrections for final report
+                auto final_words = extract_words(dr.cells);
+                invalid.clear();
+                for (const auto& bw : final_words) {
+                    if (!g_kwg.is_valid(bw.word)) {
+                        InvalidWord iw;
+                        iw.word = bw.word;
+                        iw.cells = bw.cells;
+                        iw.horizontal = bw.horizontal;
+                        if (bw.horizontal)
+                            iw.position = "row " + std::to_string(bw.cells[0].first + 1);
+                        else
+                            iw.position = "col " + std::string(1, static_cast<char>('A' + bw.cells[0].second));
+                        invalid.push_back(std::move(iw));
+                    }
+                }
+            }
+
+            // Build JSON for UI display
+            if (!invalid.empty()) {
+                invalid_words_json = "[";
+                for (size_t i = 0; i < invalid.size(); i++) {
+                    if (i > 0) invalid_words_json += ",";
+                    invalid_words_json += "{\"word\":\""
+                        + json_escape(invalid[i].word)
+                        + "\",\"pos\":\""
+                        + json_escape(invalid[i].position) + "\"}";
+                }
+                invalid_words_json += "]";
+            }
+        }
+    }
+
+    // --- Rack validation & auto-correction ---
+    // Runs after word corrections so the warning reflects the final board state.
+    // full bag - board tiles - bag tiles = expected rack
     {
         // Standard Scrabble tile distribution (100 tiles)
         int full_bag[27] = {}; // A-Z = 0-25, blank = 26
@@ -2505,281 +3052,6 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             }
             if (!mismatches.empty())
                 rack_warning = "Rack mismatch: " + mismatches;
-        }
-    }
-
-    // Step 8: Dictionary validation — check all words against KWG
-    std::string invalid_words_json;  // JSON array string for UI
-    {
-        std::string lex = gemini_lexicon;
-        if (lex.empty()) lex = "NWL23";  // default
-        bool dict_ok = ensure_kwg_loaded(lex);
-        if (!dict_ok && lex != "NWL23") dict_ok = ensure_kwg_loaded("NWL23");
-        if (!dict_ok && lex != "CSW21") dict_ok = ensure_kwg_loaded("CSW21");
-
-        if (dict_ok) {
-            auto all_words = extract_words(dr.cells);
-            struct InvalidWord {
-                std::string word;
-                std::string position;  // e.g. "row 1" or "col G"
-                std::vector<std::pair<int,int>> cells;
-                bool horizontal;
-            };
-            std::vector<InvalidWord> invalid;
-            for (const auto& bw : all_words) {
-                if (!g_kwg.is_valid(bw.word)) {
-                    InvalidWord iw;
-                    iw.word = bw.word;
-                    iw.cells = bw.cells;
-                    iw.horizontal = bw.horizontal;
-                    if (bw.horizontal)
-                        iw.position = "row " + std::to_string(bw.cells[0].first + 1);
-                    else
-                        iw.position = "col " + std::string(1, static_cast<char>('A' + bw.cells[0].second));
-                    invalid.push_back(std::move(iw));
-                }
-            }
-
-            if (!invalid.empty()) {
-                // Identify suspect cells — cells in invalid words but not in
-                // any valid word
-                std::set<std::pair<int,int>> valid_cells, invalid_cells;
-                for (const auto& bw : all_words) {
-                    bool is_valid = g_kwg.is_valid(bw.word);
-                    for (const auto& p : bw.cells) {
-                        if (is_valid) valid_cells.insert(p);
-                        else invalid_cells.insert(p);
-                    }
-                }
-                std::vector<std::pair<int,int>> suspects;
-                for (const auto& p : invalid_cells) {
-                    if (valid_cells.find(p) == valid_cells.end())
-                        suspects.push_back(p);
-                }
-
-                // Build status message listing invalid words
-                std::string iw_list;
-                for (const auto& iw : invalid) {
-                    if (!iw_list.empty()) iw_list += ", ";
-                    iw_list += iw.word + " (" + iw.position + ")";
-                }
-                {
-                    std::string msg = "{\"status\":\"Invalid words ["
-                        + json_escape(g_kwg_lexicon) + "]: "
-                        + json_escape(iw_list) + "\"}\n";
-                    sink.write(msg.data(), msg.size());
-                }
-
-                // Re-query suspect cells via Gemini
-                if (!suspects.empty() && have_opencv) {
-                    int bx, by, cell_sz;
-                    if (parse_board_rect_from_log(opencv_dr.log, bx, by, cell_sz)) {
-                        cv::Mat raw_d(1, static_cast<int>(buf.size()), CV_8UC1,
-                                    const_cast<uint8_t*>(buf.data()));
-                        cv::Mat img_d = cv::imdecode(raw_d, cv::IMREAD_COLOR);
-
-                        if (!img_d.empty()) {
-                            // Build crop status for UI debug
-                            std::string crop_status =
-                                "{\"status\":\"Re-querying "
-                                + std::to_string(suspects.size())
-                                + " suspect cell(s) from invalid words...\""
-                                + ",\"crops\":[";
-
-                            // Build prompt listing current letters and the
-                            // invalid words they participate in
-                            std::string dict_prompt =
-                                "These are cropped Scrabble tile images. "
-                                "The current OCR reads formed words that are "
-                                "NOT in the " + g_kwg_lexicon + " dictionary. "
-                                "Invalid words: " + iw_list + ". "
-                                "For each cropped tile, carefully re-identify "
-                                "the letter. Pay close attention to similar "
-                                "letters (H/N/I, O/Q/D, E/F, S/Z, etc). "
-                                "Regular tiles are beige with a subscript "
-                                "(return UPPERCASE). Blank tiles are purple "
-                                "circles (return lowercase). "
-                                "Return ONLY a JSON array of single letters. "
-                                "Example: [\\\"I\\\", \\\"H\\\"]";
-
-                            std::string dict_payload =
-                                "{\"contents\":[{\"parts\":["
-                                "{\"text\":\"" + dict_prompt + "\"}";
-
-                            int pad = cell_sz / 8;
-                            for (size_t si = 0; si < suspects.size(); si++) {
-                                const auto& sp = suspects[si];
-                                int cx = std::max(0, bx + sp.second * cell_sz - pad);
-                                int cy = std::max(0, by + sp.first * cell_sz - pad);
-                                int cw = std::min(cell_sz + 2*pad, img_d.cols - cx);
-                                int ch_ = std::min(cell_sz + 2*pad, img_d.rows - cy);
-                                cv::Mat cell_img = img_d(cv::Rect(cx, cy, cw, ch_));
-                                std::vector<uint8_t> png_buf;
-                                cv::imencode(".png", cell_img, png_buf);
-                                std::string b64_crop = base64_encode(png_buf);
-                                dict_payload +=
-                                    ",{\"inlineData\":{\"mimeType\":\"image/png\","
-                                    "\"data\":\"" + b64_crop + "\"}}";
-                                if (si > 0) crop_status += ",";
-                                char cur_ltr = static_cast<char>(std::toupper(
-                                    static_cast<unsigned char>(
-                                        dr.cells[sp.first][sp.second].letter)));
-                                crop_status += "{\"pos\":\""
-                                    + std::string(1, static_cast<char>('A' + sp.second))
-                                    + std::to_string(sp.first + 1)
-                                    + "\",\"cur\":\""
-                                    + std::string(1, cur_ltr)
-                                    + "\",\"img\":\"data:image/png;base64,"
-                                    + b64_crop + "\"}";
-                            }
-                            dict_payload += "]}]}";
-                            crop_status += "]}\n";
-                            sink.write(crop_status.data(), crop_status.size());
-
-                            // Call Gemini
-                            char tmpd[] = "/tmp/gemini_d_XXXXXX";
-                            int fdd = mkstemp(tmpd);
-                            if (fdd >= 0) {
-                                ssize_t wd = 0;
-                                size_t td = dict_payload.size();
-                                while (wd < static_cast<ssize_t>(td)) {
-                                    ssize_t nn = write(fdd,
-                                        dict_payload.data() + wd, td - wd);
-                                    if (nn <= 0) break;
-                                    wd += nn;
-                                }
-                                close(fdd);
-
-                                std::string cmdd =
-                                    "curl -s --max-time 30 -X POST "
-                                    "-H 'Content-Type: application/json' "
-                                    "-d @" + std::string(tmpd)
-                                    + " '" + url + "'";
-                                FILE* piped = popen(cmdd.c_str(), "r");
-                                if (piped) {
-                                    std::string respd;
-                                    char chd[8192];
-                                    size_t nnd;
-                                    while ((nnd = fread(chd, 1, sizeof(chd),
-                                                        piped)) > 0)
-                                        respd.append(chd, nnd);
-                                    pclose(piped);
-
-                                    std::string textd =
-                                        extract_gemini_text(respd);
-                                    gemini_log("dict_requery", dict_prompt,
-                                        textd.empty() ? respd : textd);
-                                    if (!textd.empty()) {
-                                        std::string sd = textd;
-                                        auto f1 = sd.find("```");
-                                        if (f1 != std::string::npos) {
-                                            auto nl = sd.find('\n', f1);
-                                            if (nl != std::string::npos)
-                                                sd = sd.substr(nl + 1);
-                                            auto f2 = sd.rfind("```");
-                                            if (f2 != std::string::npos)
-                                                sd = sd.substr(0, f2);
-                                        }
-                                        size_t di = 0, si2 = 0;
-                                        int corrections = 0;
-                                        std::string corr_detail;
-                                        while (di < sd.size() && sd[di] != '[')
-                                            di++;
-                                        di++;
-                                        while (di < sd.size()
-                                               && si2 < suspects.size()) {
-                                            while (di < sd.size()
-                                                   && sd[di] != '"'
-                                                   && sd[di] != ']')
-                                                di++;
-                                            if (di >= sd.size()
-                                                || sd[di] == ']')
-                                                break;
-                                            di++;
-                                            if (di < sd.size()) {
-                                                char ltr = sd[di];
-                                                auto& cell = dr.cells
-                                                    [suspects[si2].first]
-                                                    [suspects[si2].second];
-                                                if (ltr != cell.letter) {
-                                                    if (!corr_detail.empty())
-                                                        corr_detail += ", ";
-                                                    corr_detail += std::string(1,
-                                                        static_cast<char>('A' + suspects[si2].second))
-                                                        + std::to_string(suspects[si2].first + 1)
-                                                        + ": "
-                                                        + static_cast<char>(std::toupper(
-                                                            static_cast<unsigned char>(cell.letter)))
-                                                        + " -> "
-                                                        + static_cast<char>(std::toupper(
-                                                            static_cast<unsigned char>(ltr)));
-                                                    cell.letter = ltr;
-                                                    cell.confidence = 0.85f;
-                                                    cell.is_blank =
-                                                        (ltr >= 'a' && ltr <= 'z');
-                                                    corrections++;
-                                                }
-                                                si2++;
-                                                di++;
-                                                if (di < sd.size()
-                                                    && sd[di] == '"')
-                                                    di++;
-                                            }
-                                        }
-                                        if (corrections > 0) {
-                                            std::string vmsg =
-                                                "{\"status\":\"Dict corrections: "
-                                                + json_escape(corr_detail)
-                                                + "\"}\n";
-                                            sink.write(vmsg.data(),
-                                                       vmsg.size());
-                                        }
-                                    }
-                                }
-                                unlink(tmpd);
-                            }
-                        }
-                    }
-                }
-
-                // Rebuild CGP after any corrections
-                dr.cgp = cells_to_cgp(dr.cells) + " "
-                       + (gemini_rack.empty() ? "" : gemini_rack) + "/ "
-                       + std::to_string(gemini_score1) + " "
-                       + std::to_string(gemini_score2);
-                if (!lex_str.empty())
-                    dr.cgp += " lex " + lex_str + ";";
-
-                // Re-validate after corrections for final report
-                auto final_words = extract_words(dr.cells);
-                invalid.clear();
-                for (const auto& bw : final_words) {
-                    if (!g_kwg.is_valid(bw.word)) {
-                        InvalidWord iw;
-                        iw.word = bw.word;
-                        iw.cells = bw.cells;
-                        iw.horizontal = bw.horizontal;
-                        if (bw.horizontal)
-                            iw.position = "row " + std::to_string(bw.cells[0].first + 1);
-                        else
-                            iw.position = "col " + std::string(1, static_cast<char>('A' + bw.cells[0].second));
-                        invalid.push_back(std::move(iw));
-                    }
-                }
-            }
-
-            // Build JSON for UI display
-            if (!invalid.empty()) {
-                invalid_words_json = "[";
-                for (size_t i = 0; i < invalid.size(); i++) {
-                    if (i > 0) invalid_words_json += ",";
-                    invalid_words_json += "{\"word\":\""
-                        + json_escape(invalid[i].word)
-                        + "\",\"pos\":\""
-                        + json_escape(invalid[i].position) + "\"}";
-                }
-                invalid_words_json += "]";
-            }
         }
     }
 

@@ -1,0 +1,34 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "```json\n{\n  \"board\": [\n    [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],\n    [null, null, null, null, null, \"C\", null, null, null, null, null, null, null, null, null],\n    [null, null, \"F\", \"A\", \"B\", \"L\", \"E\", null, null, null, null, null, null, null, null],\n    [null, null, null, null, \"O\", \"U\", \"T\", \"W\", \"E\", \"I\", \"G\", \"H\", null, null, null],\n    [null, null, null, \"E\", \"Y\", \"E\", null, \"O\", null, \"N\", \"O\", \"E\", \"L\", null, \"P\"],\n    [null, null, null, null, null, \"Y\", \"A\", \"M\", null, null, null, null, null, null, \"R\"],\n    [null, null, null, null, null, null, \"Z\", \"A\", \"P\", \"S\", null, null, null, null, \"I\"],\n    [null, null, null, null, null, \"Q\", \"I\", \"N\", null, \"A\", null, null, null, null, \"S\"],\n    [null, null, null, null, null, null, \"D\", null, null, \"T\", null, null, null, null, \"O\"],\n    [null, null, null, null, null, \"J\", \"O\", null, null, \"A\", null, null, null, null, \"N\"],\n    [null, null, null, null, \"T\", \"O\", null, null, \"R\", \"U\", \"R\", \"U\", null, null, \"E\"],\n    [null, null, null, \"L\", \"A\", \"G\", null, \"c\", \"R\", \"A\", \"T\", \"E\", \"R\", \"E\", \"D\"],\n    [null, null, \"V\", \"O\", \"X\", null, null, \"H\", null, \"S\", \"A\", \"I\", \"D\", null, null],\n    [null, null, null, \"G\", \"I\", null, null, \"I\", null, null, null, null, null, null, null],\n    [\"F\", \"L\", \"I\", \"E\", \"S\", null, null, \"V\", null, null, null, null, null, null, null]\n  ],\n  \"rack\": \"ADINNU?\",\n  \"lexicon\": \"NWL23\",\n  \"bag\": \"B EEE I K M N O RR TT W\",\n  \"scores\": [412, 340]\n}\n```"
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 1055,
+    "candidatesTokenCount": 645,
+    "totalTokenCount": 7983,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 797
+      },
+      {
+        "modality": "IMAGE",
+        "tokenCount": 258
+      }
+    ],
+    "thoughtsTokenCount": 6283
+  },
+  "modelVersion": "gemini-2.5-flash",
+  "responseId": "AeWbae6PHpiV_uMPuqOd-QQ"
+}
