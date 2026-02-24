@@ -867,7 +867,7 @@ let currentTestCase=null;   // name of currently loaded test case, or null
 let expectedBoard=null;     // 15x15 array of expected letters (from testdata CGP), or null
 
 // Braille spinner for eval progress
-const BRAILLE='\u28cb\u28d7\u28f7\u28ff\u28fb\u28ef\u28cf\u28c7';
+const BRAILLE='\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f';
 let _spinInterval=null,_spinFrame=0;
 function startSpinner(name){
   stopSpinner();
