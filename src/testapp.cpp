@@ -2367,169 +2367,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         sink.write(rmsg.data(), rmsg.size());
     }
 
-    // Use transposed OCR to improve the initial board reading before corrections.
-    if (have_transposed_ocr) {
-        // Helper: transposed letter for original cell (r, c)
-        auto trans_letter = [&](int r, int c) -> char {
-            return transposed_cells[c][r].letter;
-        };
+    // Transposed OCR corrections (Cases 1 and 3) are applied AFTER realignment
+    // and occupancy enforcement below — see comment there.
 
-        // --- Case 1: Fill occupied cells that main OCR missed ---
-        std::string trans_fill_detail;
-        for (int r = 0; r < 15; r++) {
-            for (int c = 0; c < 15; c++) {
-                if (!get_occupied(r, c) || dr.cells[r][c].letter != 0) continue;
-                char t_ch = trans_letter(r, c);
-                if (t_ch == 0) continue;
-                dr.cells[r][c].letter = t_ch;
-                dr.cells[r][c].confidence = 0.7f;
-                dr.cells[r][c].is_blank = (t_ch >= 'a' && t_ch <= 'z');
-                if (!trans_fill_detail.empty()) trans_fill_detail += ", ";
-                trans_fill_detail += std::string(1, static_cast<char>('A' + c))
-                    + std::to_string(r + 1) + "="
-                    + static_cast<char>(std::toupper(static_cast<unsigned char>(t_ch)));
-            }
-        }
-        if (!trans_fill_detail.empty()) {
-            std::string msg = "{\"status\":\"Transposed OCR filled missed cells: "
-                + json_escape(trans_fill_detail) + "\"}\n";
-            sink.write(msg.data(), msg.size());
-        }
-
-        // --- Case 3: Detect shifts corroborated by transposed OCR ---
-        // If main[pos] == trans[pos+shift] for >= 75% of a block, main is shifted
-        // by -shift. Apply transposed letters (correctly positioned) for the block.
-        std::string shift_detail;
-
-        auto check_and_apply_shift = [&](int line, int p_start, int p_end, bool is_row) {
-            int len = p_end - p_start;
-            // Require at least 4 tiles: a 3-tile block yields only 2 comparisons
-            // with shift ±1, which is too small a sample to be reliable.
-            if (len < 4) return;
-            auto get_main = [&](int p) -> char {
-                return is_row ? dr.cells[line][p].letter : dr.cells[p][line].letter;
-            };
-            auto get_trans = [&](int p) -> char {
-                return is_row ? trans_letter(line, p) : trans_letter(p, line);
-            };
-            auto get_cell = [&](int p) -> CellResult& {
-                return is_row ? dr.cells[line][p] : dr.cells[p][line];
-            };
-
-            for (int shift : {-1, +1, -2, +2}) {
-                int matches = 0, total = 0;
-                for (int pi = p_start; pi < p_end; pi++) {
-                    char m_ch = get_main(pi);
-                    if (m_ch == 0) continue;
-                    int pi_t = pi + shift;
-                    if (pi_t < p_start || pi_t >= p_end) continue;
-                    char t_ch = get_trans(pi_t);
-                    if (t_ch == 0) continue;
-                    total++;
-                    if (std::toupper(static_cast<unsigned char>(m_ch))
-                        == std::toupper(static_cast<unsigned char>(t_ch)))
-                        matches++;
-                }
-                if (total < len / 2 || matches * 4 < total * 3) continue;
-
-                // Corroborated shift. Save originals, apply tentatively,
-                // then validate with KWG (if loaded). Revert if invalid.
-                std::vector<CellResult> saved(len);
-                for (int pi = p_start; pi < p_end; pi++)
-                    saved[pi - p_start] = get_cell(pi);
-
-                std::vector<std::pair<int,char>> changed; // (position, new_upper)
-                for (int pi = p_start; pi < p_end; pi++) {
-                    char t_ch = get_trans(pi);
-                    if (t_ch == 0) continue;
-                    char old_u = saved[pi - p_start].letter
-                        ? static_cast<char>(std::toupper(static_cast<unsigned char>(
-                              saved[pi - p_start].letter))) : 0;
-                    char t_u = static_cast<char>(
-                        std::toupper(static_cast<unsigned char>(t_ch)));
-                    if (old_u != t_u) {
-                        auto& cell = get_cell(pi);
-                        cell.letter = t_ch;
-                        cell.confidence = 0.75f;
-                        cell.is_blank = (t_ch >= 'a' && t_ch <= 'z');
-                        changed.push_back({pi, t_u});
-                    }
-                }
-
-                // Validate: if KWG loaded, reject shift if it introduces
-                // an invalid word touching any changed cell.
-                bool valid = true;
-                if (!changed.empty() && !g_kwg_lexicon.empty()) {
-                    auto wl = extract_words(dr.cells);
-                    for (const auto& bw : wl) {
-                        bool touches = false;
-                        for (const auto& [cp, _] : changed)
-                            for (const auto& [wr, wc] : bw.cells) {
-                                bool hit = is_row ? (wr == line && wc == cp)
-                                                  : (wc == line && wr == cp);
-                                if (hit) { touches = true; break; }
-                            }
-                        if (touches && !g_kwg.is_valid(bw.word)) {
-                            valid = false; break;
-                        }
-                    }
-                }
-
-                if (!valid) {
-                    // Revert
-                    for (int pi = p_start; pi < p_end; pi++)
-                        get_cell(pi) = saved[pi - p_start];
-                    continue; // try next shift value
-                }
-
-                // Report accepted changes
-                if (!changed.empty()) {
-                    std::string block_changes;
-                    for (const auto& [pi, t_u] : changed) {
-                        char old_u = saved[pi - p_start].letter
-                            ? static_cast<char>(std::toupper(static_cast<unsigned char>(
-                                  saved[pi - p_start].letter))) : 0;
-                        if (!block_changes.empty()) block_changes += ", ";
-                        std::string pos_str = is_row
-                            ? std::string(1, static_cast<char>('A' + pi))
-                              + std::to_string(line + 1)
-                            : std::string(1, static_cast<char>('A' + line))
-                              + std::to_string(pi + 1);
-                        block_changes += pos_str + ":"
-                            + (old_u ? std::string(1, old_u) : std::string("?"))
-                            + "->" + t_u;
-                    }
-                    if (!shift_detail.empty()) shift_detail += "; ";
-                    shift_detail += (is_row ? "row " : "col ")
-                        + (is_row ? std::to_string(line + 1)
-                                  : std::string(1, static_cast<char>('A' + line)))
-                        + " shift " + (shift > 0 ? "+" : "")
-                        + std::to_string(shift) + " [" + block_changes + "]";
-                }
-                break; // applied a valid shift
-            }
-        };
-
-        for (int r = 0; r < 15; r++) {
-            int s = -1;
-            for (int c = 0; c <= 15; c++) {
-                if (c < 15 && get_occupied(r, c)) { if (s < 0) s = c; }
-                else if (s >= 0) { check_and_apply_shift(r, s, c, true); s = -1; }
-            }
-        }
-        for (int c = 0; c < 15; c++) {
-            int s = -1;
-            for (int r = 0; r <= 15; r++) {
-                if (r < 15 && get_occupied(r, c)) { if (s < 0) s = r; }
-                else if (s >= 0) { check_and_apply_shift(c, s, r, false); s = -1; }
-            }
-        }
-        if (!shift_detail.empty()) {
-            std::string msg = "{\"status\":\"Transposed OCR corroborated shift: "
-                + json_escape(shift_detail) + "\"}\n";
-            sink.write(msg.data(), msg.size());
-        }
-    }
 
     // Launch rack verification asynchronously — runs concurrently with
     // board post-processing (realignment, retry-missing, bag-math).
@@ -2732,6 +2572,151 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                     disputed.push_back({r, c, dr.cells[r][c]});
                     dr.cells[r][c] = {};
                 }
+    }
+
+    // Use transposed OCR to improve the board AFTER realignment + occupancy.
+    // Running here ensures realignment sees clean raw OCR block counts and can
+    // correctly shift mis-placed words before we fill/adjust individual cells.
+    if (have_transposed_ocr) {
+        auto trans_letter = [&](int r, int c) -> char {
+            return transposed_cells[c][r].letter;
+        };
+
+        // Case 1: Fill occupied cells that main OCR missed
+        std::string trans_fill_detail;
+        for (int r = 0; r < 15; r++) {
+            for (int c = 0; c < 15; c++) {
+                if (!get_occupied(r, c) || dr.cells[r][c].letter != 0) continue;
+                char t_ch = trans_letter(r, c);
+                if (t_ch == 0) continue;
+                dr.cells[r][c].letter = t_ch;
+                dr.cells[r][c].confidence = 0.7f;
+                dr.cells[r][c].is_blank = (t_ch >= 'a' && t_ch <= 'z');
+                if (!trans_fill_detail.empty()) trans_fill_detail += ", ";
+                trans_fill_detail += std::string(1, static_cast<char>('A' + c))
+                    + std::to_string(r + 1) + "="
+                    + static_cast<char>(std::toupper(static_cast<unsigned char>(t_ch)));
+            }
+        }
+        if (!trans_fill_detail.empty()) {
+            std::string msg = "{\"status\":\"Transposed OCR filled missed cells: "
+                + json_escape(trans_fill_detail) + "\"}\n";
+            sink.write(msg.data(), msg.size());
+        }
+
+        // Case 3: Detect shifts corroborated by transposed OCR
+        std::string shift_detail;
+        auto check_and_apply_shift = [&](int line, int p_start, int p_end, bool is_row) {
+            int len = p_end - p_start;
+            if (len < 4) return;
+            auto get_main = [&](int p) -> char {
+                return is_row ? dr.cells[line][p].letter : dr.cells[p][line].letter;
+            };
+            auto get_trans = [&](int p) -> char {
+                return is_row ? trans_letter(line, p) : trans_letter(p, line);
+            };
+            auto get_cell = [&](int p) -> CellResult& {
+                return is_row ? dr.cells[line][p] : dr.cells[p][line];
+            };
+            for (int shift : {-1, +1, -2, +2}) {
+                int matches = 0, total = 0;
+                for (int pi = p_start; pi < p_end; pi++) {
+                    char m_ch = get_main(pi);
+                    if (m_ch == 0) continue;
+                    int pi_t = pi + shift;
+                    if (pi_t < p_start || pi_t >= p_end) continue;
+                    char t_ch = get_trans(pi_t);
+                    if (t_ch == 0) continue;
+                    total++;
+                    if (std::toupper(static_cast<unsigned char>(m_ch))
+                        == std::toupper(static_cast<unsigned char>(t_ch)))
+                        matches++;
+                }
+                if (total < len / 2 || matches * 4 < total * 3) continue;
+                std::vector<CellResult> saved(len);
+                for (int pi = p_start; pi < p_end; pi++)
+                    saved[pi - p_start] = get_cell(pi);
+                std::vector<std::pair<int,char>> changed;
+                for (int pi = p_start; pi < p_end; pi++) {
+                    char t_ch = get_trans(pi);
+                    if (t_ch == 0) continue;
+                    char old_u = saved[pi - p_start].letter
+                        ? static_cast<char>(std::toupper(static_cast<unsigned char>(
+                              saved[pi - p_start].letter))) : 0;
+                    char t_u = static_cast<char>(
+                        std::toupper(static_cast<unsigned char>(t_ch)));
+                    if (old_u != t_u) {
+                        auto& cell = get_cell(pi);
+                        cell.letter = t_ch;
+                        cell.confidence = 0.75f;
+                        cell.is_blank = (t_ch >= 'a' && t_ch <= 'z');
+                        changed.push_back({pi, t_u});
+                    }
+                }
+                bool valid = true;
+                if (!changed.empty() && !g_kwg_lexicon.empty()) {
+                    auto wl = extract_words(dr.cells);
+                    for (const auto& bw : wl) {
+                        bool touches = false;
+                        for (const auto& [cp, _] : changed)
+                            for (const auto& [wr, wc] : bw.cells) {
+                                bool hit = is_row ? (wr == line && wc == cp)
+                                                  : (wc == line && wr == cp);
+                                if (hit) { touches = true; break; }
+                            }
+                        if (touches && !g_kwg.is_valid(bw.word)) { valid = false; break; }
+                    }
+                }
+                if (!valid) {
+                    for (int pi = p_start; pi < p_end; pi++)
+                        get_cell(pi) = saved[pi - p_start];
+                    continue;
+                }
+                if (!changed.empty()) {
+                    std::string block_changes;
+                    for (const auto& [pi, t_u] : changed) {
+                        char old_u = saved[pi - p_start].letter
+                            ? static_cast<char>(std::toupper(static_cast<unsigned char>(
+                                  saved[pi - p_start].letter))) : 0;
+                        if (!block_changes.empty()) block_changes += ", ";
+                        std::string pos_str = is_row
+                            ? std::string(1, static_cast<char>('A' + pi))
+                              + std::to_string(line + 1)
+                            : std::string(1, static_cast<char>('A' + line))
+                              + std::to_string(pi + 1);
+                        block_changes += pos_str + ":"
+                            + (old_u ? std::string(1, old_u) : std::string("?"))
+                            + "->" + t_u;
+                    }
+                    if (!shift_detail.empty()) shift_detail += "; ";
+                    shift_detail += (is_row ? "row " : "col ")
+                        + (is_row ? std::to_string(line + 1)
+                                  : std::string(1, static_cast<char>('A' + line)))
+                        + " shift " + (shift > 0 ? "+" : "")
+                        + std::to_string(shift) + " [" + block_changes + "]";
+                }
+                break;
+            }
+        };
+        for (int r = 0; r < 15; r++) {
+            int s = -1;
+            for (int c = 0; c <= 15; c++) {
+                if (c < 15 && get_occupied(r, c)) { if (s < 0) s = c; }
+                else if (s >= 0) { check_and_apply_shift(r, s, c, true); s = -1; }
+            }
+        }
+        for (int c = 0; c < 15; c++) {
+            int s = -1;
+            for (int r = 0; r <= 15; r++) {
+                if (r < 15 && get_occupied(r, c)) { if (s < 0) s = r; }
+                else if (s >= 0) { check_and_apply_shift(c, s, r, false); s = -1; }
+            }
+        }
+        if (!shift_detail.empty()) {
+            std::string msg = "{\"status\":\"Transposed OCR corroborated shift: "
+                + json_escape(shift_detail) + "\"}\n";
+            sink.write(msg.data(), msg.size());
+        }
     }
 
     // Step 5: Re-query Gemini for cells needing verification (crop + retry)
