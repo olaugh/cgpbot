@@ -1530,7 +1530,9 @@ async function evalAllGemini(){
     h+=`<tr><td>${tc.name}</td><td>${caseCells||'—'}</td><td>${caseCorrect||'—'}</td><td style="${wrongCol}">${caseWrong||'0'}</td><td>${pct}</td><td style="font-family:monospace">${expSc}</td><td style="font-family:monospace">${gotSc}</td><td>${scOk}</td></tr>`;
     if(diffs.length)h+=`<tr><td colspan="8" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`;
     totalCells+=caseCells;totalCorrect+=caseCorrect;totalWrong+=caseWrong;
-    caseResults.push({name:tc.name,cells:caseCells,correct:caseCorrect,wrong:caseWrong,diffs});
+    caseResults.push({name:tc.name,cells:caseCells,correct:caseCorrect,wrong:caseWrong,diffs,
+      exp_cgp:caseWrong>0?expCGP.split(' ')[0]:'',
+      got_cgp:caseWrong>0?gotCGP.split(' ')[0]:''});
     // update pass/fail dot in sidebar
     for(const li of document.querySelectorAll('#test-list li')){
       if(li.dataset.name===tc.name){li.classList.toggle('pass',caseWrong===0);li.classList.toggle('fail',caseWrong>0);}
@@ -2367,18 +2369,17 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
 
         auto check_and_apply_shift = [&](int line, int p_start, int p_end, bool is_row) {
             int len = p_end - p_start;
-            if (len < 3) return;
+            // Require at least 4 tiles: a 3-tile block yields only 2 comparisons
+            // with shift ±1, which is too small a sample to be reliable.
+            if (len < 4) return;
             auto get_main = [&](int p) -> char {
                 return is_row ? dr.cells[line][p].letter : dr.cells[p][line].letter;
             };
             auto get_trans = [&](int p) -> char {
                 return is_row ? trans_letter(line, p) : trans_letter(p, line);
             };
-            auto set_cell = [&](int p, char ch, float conf) {
-                auto& cell = is_row ? dr.cells[line][p] : dr.cells[p][line];
-                cell.letter = ch;
-                cell.confidence = conf;
-                cell.is_blank = (ch >= 'a' && ch <= 'z');
+            auto get_cell = [&](int p) -> CellResult& {
+                return is_row ? dr.cells[line][p] : dr.cells[p][line];
             };
 
             for (int shift : {-1, +1, -2, +2}) {
@@ -2397,17 +2398,63 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                 }
                 if (total < len / 2 || matches * 4 < total * 3) continue;
 
-                // Corroborated shift: apply transposed letters for this block.
-                std::string block_changes;
+                // Corroborated shift. Save originals, apply tentatively,
+                // then validate with KWG (if loaded). Revert if invalid.
+                std::vector<CellResult> saved(len);
+                for (int pi = p_start; pi < p_end; pi++)
+                    saved[pi - p_start] = get_cell(pi);
+
+                std::vector<std::pair<int,char>> changed; // (position, new_upper)
                 for (int pi = p_start; pi < p_end; pi++) {
                     char t_ch = get_trans(pi);
                     if (t_ch == 0) continue;
-                    char old_ch = get_main(pi);
-                    char old_u = old_ch ? static_cast<char>(
-                        std::toupper(static_cast<unsigned char>(old_ch))) : 0;
+                    char old_u = saved[pi - p_start].letter
+                        ? static_cast<char>(std::toupper(static_cast<unsigned char>(
+                              saved[pi - p_start].letter))) : 0;
                     char t_u = static_cast<char>(
                         std::toupper(static_cast<unsigned char>(t_ch)));
                     if (old_u != t_u) {
+                        auto& cell = get_cell(pi);
+                        cell.letter = t_ch;
+                        cell.confidence = 0.75f;
+                        cell.is_blank = (t_ch >= 'a' && t_ch <= 'z');
+                        changed.push_back({pi, t_u});
+                    }
+                }
+
+                // Validate: if KWG loaded, reject shift if it introduces
+                // an invalid word touching any changed cell.
+                bool valid = true;
+                if (!changed.empty() && !g_kwg_lexicon.empty()) {
+                    auto wl = extract_words(dr.cells);
+                    for (const auto& bw : wl) {
+                        bool touches = false;
+                        for (const auto& [cp, _] : changed)
+                            for (const auto& [wr, wc] : bw.cells) {
+                                bool hit = is_row ? (wr == line && wc == cp)
+                                                  : (wc == line && wr == cp);
+                                if (hit) { touches = true; break; }
+                            }
+                        if (touches && !g_kwg.is_valid(bw.word)) {
+                            valid = false; break;
+                        }
+                    }
+                }
+
+                if (!valid) {
+                    // Revert
+                    for (int pi = p_start; pi < p_end; pi++)
+                        get_cell(pi) = saved[pi - p_start];
+                    continue; // try next shift value
+                }
+
+                // Report accepted changes
+                if (!changed.empty()) {
+                    std::string block_changes;
+                    for (const auto& [pi, t_u] : changed) {
+                        char old_u = saved[pi - p_start].letter
+                            ? static_cast<char>(std::toupper(static_cast<unsigned char>(
+                                  saved[pi - p_start].letter))) : 0;
                         if (!block_changes.empty()) block_changes += ", ";
                         std::string pos_str = is_row
                             ? std::string(1, static_cast<char>('A' + pi))
@@ -2417,10 +2464,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                         block_changes += pos_str + ":"
                             + (old_u ? std::string(1, old_u) : std::string("?"))
                             + "->" + t_u;
-                        set_cell(pi, t_ch, 0.75f);
                     }
-                }
-                if (!block_changes.empty()) {
                     if (!shift_detail.empty()) shift_detail += "; ";
                     shift_detail += (is_row ? "row " : "col ")
                         + (is_row ? std::to_string(line + 1)
@@ -2428,7 +2472,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                         + " shift " + (shift > 0 ? "+" : "")
                         + std::to_string(shift) + " [" + block_changes + "]";
                 }
-                break; // apply only best shift
+                break; // applied a valid shift
             }
         };
 
@@ -4299,24 +4343,70 @@ h1{font-size:1.2rem;margin-bottom:6px;color:#fff}
 .summary{background:#16213e;border-radius:8px;padding:14px 20px;margin-bottom:20px;border:1px solid #2a2a4a;display:flex;gap:32px;align-items:center;flex-wrap:wrap}
 .stat-val{font-size:1.4rem;font-weight:700;color:#4c4}
 .stat-lbl{font-size:.7rem;color:#888;text-transform:uppercase;letter-spacing:.05em}
-table{width:100%;border-collapse:collapse;font-size:.82rem}
+table{width:100%;border-collapse:collapse;font-size:.82rem;margin-bottom:20px}
 th,td{padding:6px 10px;border:1px solid #2a2a4a;text-align:left}
 th{background:#16213e;color:#888;font-size:.72rem;text-transform:uppercase}
 tr:hover td{background:#1a2540}
-.pass{color:#4c4}.fail{color:#f44}.mono{font-family:'SF Mono','Fira Code',monospace}
-.diff-row td{color:#f88;font-family:'SF Mono','Fira Code',monospace;font-size:.72rem;background:#1a1015;padding:3px 10px}
+.pass{color:#4c4}.fail{color:#f44}
 .ts{font-size:.72rem;color:#666}
+.case-boards{display:flex;gap:24px;flex-wrap:wrap;margin:16px 0 8px}
+.board-box{text-align:center}
+.board-lbl{font-size:.7rem;color:#888;margin-bottom:4px}
+.mini-board{display:grid;grid-template-columns:repeat(15,13px);grid-template-rows:repeat(15,13px);gap:1px;background:#222;border:1px solid #333;border-radius:3px}
+.mb{display:flex;align-items:center;justify-content:center;font-size:6px;font-weight:700;color:#111}
+.mb.tile{background:#f5deb3;color:#111}
+.mb.blank-tile{background:#c8b888;color:#555}
+.mb.tw{background:#c0392b}.mb.dw{background:#e88b8b}.mb.tl{background:#2980b9}.mb.dl{background:#7ec8e3}
+.mb.center{background:#e88b8b}.mb.normal{background:#1b7a3d}
+.mb.wrong-exp{outline:2px solid #f44;outline-offset:-1px;z-index:1}
+.mb.wrong-got{outline:2px solid #f88;outline-offset:-1px;z-index:1}
+.case-section{background:#16213e;border-radius:8px;padding:16px;margin-bottom:16px;border:1px solid #2a2a4a}
+.case-title{font-size:.85rem;font-weight:600;margin-bottom:4px}
+.diff-text{font-size:.72rem;color:#f88;font-family:'SF Mono','Fira Code',monospace;margin-bottom:8px}
 </style></head><body>
 <a href="/" class="back">&larr; Back to test bench</a>
 <h1>Gemini Eval Results</h1>
 <div id="root"><p style="color:#666">No eval data found.</p></div>
 <script>
+const PREMIUM=[
+  [4,0,0,1,0,0,0,4,0,0,0,1,0,0,4],[0,3,0,0,0,2,0,0,0,2,0,0,0,3,0],
+  [0,0,3,0,0,0,1,0,1,0,0,0,3,0,0],[1,0,0,3,0,0,0,1,0,0,0,3,0,0,1],
+  [0,0,0,0,3,0,0,0,0,0,3,0,0,0,0],[0,2,0,0,0,2,0,0,0,2,0,0,0,2,0],
+  [0,0,1,0,0,0,1,0,1,0,0,0,1,0,0],[4,0,0,1,0,0,0,5,0,0,0,1,0,0,4],
+  [0,0,1,0,0,0,1,0,1,0,0,0,1,0,0],[0,2,0,0,0,2,0,0,0,2,0,0,0,2,0],
+  [0,0,0,0,3,0,0,0,0,0,3,0,0,0,0],[1,0,0,3,0,0,0,1,0,0,0,3,0,0,1],
+  [0,0,3,0,0,0,1,0,1,0,0,0,3,0,0],[0,3,0,0,0,2,0,0,0,2,0,0,0,3,0],
+  [4,0,0,1,0,0,0,4,0,0,0,1,0,0,4]];
+const PCLS=['normal','dl','tl','dw','tw','center'];
+function parseCGPBoard(cgp){
+  const b=Array.from({length:15},()=>Array(15).fill(''));
+  const rows=(cgp.split(' ')[0]).split('/');
+  for(let r=0;r<Math.min(rows.length,15);r++){
+    let c=0,i=0;
+    while(i<rows[r].length&&c<15){
+      const ch=rows[r][i];
+      if(ch>='0'&&ch<='9'){let n=0;while(i<rows[r].length&&rows[r][i]>='0'&&rows[r][i]<='9')n=n*10+parseInt(rows[r][i++]);c+=n;}
+      else{b[r][c++]=ch;i++;}
+    }
+  }
+  return b;
+}
+function renderMiniBoard(board,wrongSet,cls){
+  let h=`<div class="mini-board">`;
+  for(let r=0;r<15;r++)for(let c=0;c<15;c++){
+    const ch=board[r][c];
+    const key=String.fromCharCode(65+c)+(r+1);
+    const wrong=wrongSet&&wrongSet.has(key);
+    if(!ch){const p=PREMIUM[r][c];h+=`<div class="mb ${PCLS[p]}${wrong?' '+cls:''}"></div>`;}
+    else{const bl=ch===ch.toLowerCase();h+=`<div class="mb ${bl?'blank-tile':'tile'}${wrong?' '+cls:''}">${ch.toUpperCase()}</div>`;}
+  }
+  h+=`</div>`;
+  return h;
+}
 function relTime(ts){
   const d=Math.floor(Date.now()/1000-ts);
-  if(d<60)return 'just now';
-  if(d<3600)return Math.round(d/60)+'m ago';
-  if(d<86400)return Math.round(d/3600)+'h ago';
-  return Math.round(d/86400)+'d ago';
+  if(d<60)return 'just now';if(d<3600)return Math.round(d/60)+'m ago';
+  if(d<86400)return Math.round(d/3600)+'h ago';return Math.round(d/86400)+'d ago';
 }
 const DATA=)html" + (json.empty() ? "null" : json_esc) + R"html(;
 if(DATA){
@@ -4329,18 +4419,34 @@ if(DATA){
     <div><div class="stat-val">${DATA.scores_correct}/${DATA.scores_total}</div><div class="stat-lbl">Scores correct</div></div>
     <div style="margin-left:auto"><div class="ts">${ts}</div><div class="ts">${relTime(DATA.timestamp)}</div></div>
   </div>`;
+  // Summary table
   h+=`<table><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th></tr>`;
   for(const c of DATA.cases||[]){
     const cp=c.cells?((c.correct/c.cells)*100).toFixed(1)+'%':'—';
-    const wc=c.wrong>0?'fail':'pass';
-    h+=`<tr><td>${c.name}</td><td>${c.cells||'—'}</td><td>${c.correct||'—'}</td><td class="${wc}">${c.wrong||'0'}</td><td>${cp}</td></tr>`;
-    if(c.diffs&&c.diffs.length)
-      h+=`<tr class="diff-row"><td colspan="5">&nbsp;&nbsp;${c.diffs.join('&nbsp;&nbsp;')}</td></tr>`;
+    h+=`<tr><td>${c.name}</td><td>${c.cells||'—'}</td><td>${c.correct||'—'}</td><td class="${c.wrong>0?'fail':'pass'}">${c.wrong||'0'}</td><td>${cp}</td></tr>`;
   }
   h+=`<tr style="font-weight:bold;border-top:2px solid #444">
     <td>TOTAL</td><td>${DATA.total_cells}</td><td>${DATA.correct}</td>
-    <td class="${wrong?'fail':'pass'}">${wrong}</td><td>${pct}%</td></tr>`;
-  h+='</table>';
+    <td class="${wrong?'fail':'pass'}">${wrong}</td><td>${pct}%</td></tr></table>`;
+  // Failing case boards
+  for(const c of DATA.cases||[]){
+    if(!c.wrong||!c.exp_cgp||!c.got_cgp)continue;
+    const expBoard=parseCGPBoard(c.exp_cgp);
+    const gotBoard=parseCGPBoard(c.got_cgp);
+    // build sets of wrong positions for each board
+    const expWrong=new Set(),gotWrong=new Set();
+    for(const d of c.diffs||[]){
+      const pos=d.split(':')[0];expWrong.add(pos);gotWrong.add(pos);
+    }
+    h+=`<div class="case-section">
+      <div class="case-title">${c.name} &mdash; ${c.wrong} wrong cell${c.wrong>1?'s':''}</div>
+      <div class="diff-text">${(c.diffs||[]).join('&nbsp;&nbsp;')}</div>
+      <div class="case-boards">
+        <div class="board-box"><div class="board-lbl">Expected</div>${renderMiniBoard(expBoard,expWrong,'wrong-exp')}</div>
+        <div class="board-box"><div class="board-lbl">Got</div>${renderMiniBoard(gotBoard,gotWrong,'wrong-got')}</div>
+      </div>
+    </div>`;
+  }
   document.getElementById('root').innerHTML=h;
 }
 </script></body></html>)html";
