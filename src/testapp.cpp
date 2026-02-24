@@ -1530,9 +1530,12 @@ async function evalAllGemini(){
     h+=`<tr><td>${tc.name}</td><td>${caseCells||'—'}</td><td>${caseCorrect||'—'}</td><td style="${wrongCol}">${caseWrong||'0'}</td><td>${pct}</td><td style="font-family:monospace">${expSc}</td><td style="font-family:monospace">${gotSc}</td><td>${scOk}</td></tr>`;
     if(diffs.length)h+=`<tr><td colspan="8" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`;
     totalCells+=caseCells;totalCorrect+=caseCorrect;totalWrong+=caseWrong;
+    const gotScMatch=gotCGP?gotCGP.match(/\/\s*(\d+)\s+(\d+)/):null;
     caseResults.push({name:tc.name,cells:caseCells,correct:caseCorrect,wrong:caseWrong,diffs,
       exp_cgp:caseWrong>0?expCGP.split(' ')[0]:'',
-      got_cgp:caseWrong>0?gotCGP.split(' ')[0]:''});
+      got_cgp:caseWrong>0?gotCGP.split(' ')[0]:'',
+      exp_scores:expScores?expScores[0]+' '+expScores[1]:null,
+      got_scores:gotScMatch?gotScMatch[1]+' '+gotScMatch[2]:null});
     // update pass/fail dot in sidebar
     for(const li of document.querySelectorAll('#test-list li')){
       if(li.dataset.name===tc.name){li.classList.toggle('pass',caseWrong===0);li.classList.toggle('fail',caseWrong>0);}
@@ -4420,14 +4423,18 @@ if(DATA){
     <div style="margin-left:auto"><div class="ts">${ts}</div><div class="ts">${relTime(DATA.timestamp)}</div></div>
   </div>`;
   // Summary table
-  h+=`<table><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th></tr>`;
+  h+=`<table><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>`;
   for(const c of DATA.cases||[]){
     const cp=c.cells?((c.correct/c.cells)*100).toFixed(1)+'%':'—';
-    h+=`<tr><td>${c.name}</td><td>${c.cells||'—'}</td><td>${c.correct||'—'}</td><td class="${c.wrong>0?'fail':'pass'}">${c.wrong||'0'}</td><td>${cp}</td></tr>`;
+    const scOk=c.exp_scores&&c.got_scores?(c.exp_scores===c.got_scores?'<span class="pass">&#10003;</span>':'<span class="fail">&#10007;</span>'):'—';
+    const expSc=c.exp_scores||'—';const gotSc=c.got_scores||'—';
+    const scMismatch=c.exp_scores&&c.got_scores&&c.exp_scores!==c.got_scores;
+    h+=`<tr><td>${c.name}</td><td>${c.cells||'—'}</td><td>${c.correct||'—'}</td><td class="${c.wrong>0?'fail':'pass'}">${c.wrong||'0'}</td><td>${cp}</td><td style="font-family:monospace;${scMismatch?'color:#f88':''}">${expSc}</td><td style="font-family:monospace;${scMismatch?'color:#f88':''}">${gotSc}</td><td>${scOk}</td></tr>`;
   }
   h+=`<tr style="font-weight:bold;border-top:2px solid #444">
     <td>TOTAL</td><td>${DATA.total_cells}</td><td>${DATA.correct}</td>
-    <td class="${wrong?'fail':'pass'}">${wrong}</td><td>${pct}%</td></tr></table>`;
+    <td class="${wrong?'fail':'pass'}">${wrong}</td><td>${pct}%</td>
+    <td colspan="3" style="color:#ccc">${DATA.scores_correct}/${DATA.scores_total} scores &#10003;</td></tr></table>`;
   // Failing case boards
   for(const c of DATA.cases||[]){
     if(!c.wrong||!c.exp_cgp||!c.got_cgp)continue;
