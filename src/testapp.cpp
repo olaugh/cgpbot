@@ -1494,7 +1494,7 @@ async function evalAllGemini(){
 
   let totalCells=0,totalCorrect=0,totalWrong=0,scoresCorrect=0,scoresTotal=0;
   const caseResults=[];
-  let h='<table class="test-results"><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>';
+  let h='<table class="test-results"><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th style="color:#68a">Occ%</th><th style="color:#68a">Raw%</th><th style="color:#68a">Align%</th><th style="color:#68a">Trans%</th><th style="color:#68a">Retry%</th><th style="color:#68a">WC%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>';
   results.innerHTML=h+'</table><div id="eval-running" style="color:#888;margin-top:8px">Starting...</div>';
 
   for(const tc of cases){
@@ -1510,7 +1510,7 @@ async function evalAllGemini(){
       }
     }
     // Fetch image and submit to Gemini
-    let gotCGP='';
+    let gotCGP='',stageCGPs={};
     try{
       const ir=await fetch('/testdata-image/'+encodeURIComponent(tc.name));
       if(ir.ok){
@@ -1519,8 +1519,13 @@ async function evalAllGemini(){
         form.append('image',new File([blob],tc.name+'.png',{type:'image/png'}));
         const resp=await fetch('/analyze-gemini',{method:'POST',body:form});
         const text=await resp.text();
-        for(const line of text.trim().split('\n').reverse()){
-          try{const d=JSON.parse(line);if(d.cgp){gotCGP=d.cgp;break;}}catch(e){}
+        for(const line of text.trim().split('\n')){
+          try{const d=JSON.parse(line);
+            if(d.cgp) gotCGP=d.cgp;
+            if(d.raw_main_cgp) stageCGPs.raw=d.raw_main_cgp;
+            if(d.stage&&d.stage_cgp) stageCGPs[d.stage]=d.stage_cgp;
+            if(d.stage==='occupancy'&&d.occupancy_cgp) stageCGPs.occupancy=d.occupancy_cgp;
+          }catch(e){}
         }
       }
     }catch(e){}
@@ -1542,6 +1547,33 @@ async function evalAllGemini(){
     }
     const pct=caseCells?((caseCorrect/caseCells)*100).toFixed(1)+'%':'—';
 
+    // Per-stage accuracy
+    const stageAccs={};
+    function stageCorrect(cgpStr){
+      if(!cgpStr||!expBoard)return null;
+      const got=parseCGPBoard(cgpStr);
+      let sc=0,st=0;
+      for(let r=0;r<15;r++)for(let c=0;c<15;c++){
+        const e=expBoard[r][c]||'',g=got[r][c]||'';
+        if(e||g){st++;if(e===g)sc++;}
+      }
+      return st?((sc/st)*100).toFixed(1):null;
+    }
+    // Occupancy: compare '?' present/absent vs expected occupied/empty
+    if(stageCGPs.occupancy&&expBoard){
+      const occ=parseCGPBoard(stageCGPs.occupancy);
+      let os=0,ot=225;
+      for(let r=0;r<15;r++)for(let c=0;c<15;c++){
+        const expOcc=!!(expBoard[r][c]),gotOcc=!!(occ[r][c]);
+        if(expOcc===gotOcc)os++;
+      }
+      stageAccs.occ=((os/ot)*100).toFixed(1);
+    }
+    ['raw','realigned','trans','retry','wc'].forEach(sn=>{
+      const v=stageCorrect(sn==='raw'?stageCGPs.raw:stageCGPs[sn]);
+      if(v!=null)stageAccs[sn]=v;
+    });
+
     // Scores
     let expSc='—',gotSc='—',scOk='—';
     if(expScores){
@@ -1554,15 +1586,18 @@ async function evalAllGemini(){
       else scOk='<span style="color:#f88">✗</span>';
     }
     const wrongCol=caseWrong>0?'color:#f88':'color:#4c4';
-    h+=`<tr><td>${tc.name}</td><td>${caseCells||'—'}</td><td>${caseCorrect||'—'}</td><td style="${wrongCol}">${caseWrong||'0'}</td><td>${pct}</td><td style="font-family:monospace">${expSc}</td><td style="font-family:monospace">${gotSc}</td><td>${scOk}</td></tr>`;
-    if(diffs.length)h+=`<tr><td colspan="8" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`;
+    function sa(k){return stageAccs[k]!=null?stageAccs[k]+'%':'—';}
+    const stageCols=`<td>${sa('occ')}</td><td>${sa('raw')}</td><td>${sa('realigned')}</td><td>${sa('trans')}</td><td>${sa('retry')}</td><td>${sa('wc')}</td>`;
+    h+=`<tr><td>${tc.name}</td><td>${caseCells||'—'}</td><td>${caseCorrect||'—'}</td><td style="${wrongCol}">${caseWrong||'0'}</td><td>${pct}</td>${stageCols}<td style="font-family:monospace">${expSc}</td><td style="font-family:monospace">${gotSc}</td><td>${scOk}</td></tr>`;
+    if(diffs.length)h+=`<tr><td colspan="14" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`;
     totalCells+=caseCells;totalCorrect+=caseCorrect;totalWrong+=caseWrong;
     const gotScMatch=gotCGP?gotCGP.match(/\/\s*(\d+)\s+(\d+)/):null;
     caseResults.push({name:tc.name,cells:caseCells,correct:caseCorrect,wrong:caseWrong,diffs,
       exp_cgp:caseWrong>0?expCGP.split(' ')[0]:'',
       got_cgp:caseWrong>0?gotCGP.split(' ')[0]:'',
       exp_scores:expScores?expScores[0]+' '+expScores[1]:null,
-      got_scores:gotScMatch?gotScMatch[1]+' '+gotScMatch[2]:null});
+      got_scores:gotScMatch?gotScMatch[1]+' '+gotScMatch[2]:null,
+      stage_accs:stageAccs});
     // update sidebar: stop spinner, set pass/fail
     stopSpinner();
     for(const li of document.querySelectorAll('#test-list li')){
@@ -1575,7 +1610,7 @@ async function evalAllGemini(){
   }
 
   const totPct=totalCells?((totalCorrect/totalCells)*100).toFixed(1)+'%':'—';
-  h+=`<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td></tr>`;
+  h+=`<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="6"></td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td></tr>`;
   results.innerHTML=h+'</table>';
 
   // Save eval results to server and refresh summary
@@ -2086,6 +2121,18 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
+    // Stage snapshot: occupancy mask (which cells are detected as occupied)
+    if (have_color || have_opencv) {
+        CellResult occ_cells[15][15] = {};
+        for (int r = 0; r < 15; r++)
+            for (int c = 0; c < 15; c++)
+                if (get_occupied(r, c)) occ_cells[r][c].letter = '?';
+        std::string occ_cgp = cells_to_cgp(occ_cells);
+        std::string smsg = "{\"stage\":\"occupancy\",\"occupancy_cgp\":\""
+            + json_escape(occ_cgp) + "\"}\n";
+        sink.write(smsg.data(), smsg.size());
+    }
+
     // Step 3: Call Gemini Flash
     {
         size_t img_kb = buf.size() / 1024;
@@ -2170,17 +2217,20 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         "\\n- The TILE TRACKING section (\\\"tiles in bag\\\" area) — read the letters "
         "listed there. They show remaining unseen tiles. Transcribe exactly, e.g. "
         "\\\"A E II O U B C D L N S TT X\\\"."
-        "\\n- The SCORES for both players. Find the two player panels in the UI. "
-        "The ON-TURN player's score number is shown on a GREEN background. "
-        "The waiting player's score is on a gray or inactive background. "
-        "Put the GREEN-background (on-turn) player's score FIRST."
+        "\\n- The SCORES for both players. Determine who is ON TURN using these cues "
+        "(in order of reliability):"
+        "\\n  1. The rack shown below the board belongs to the ON-TURN player. "
+        "Find which player panel is associated with that rack."
+        "\\n  2. The ON-TURN player's score number has a GREEN background box."
+        "\\n  3. Look at the turn history: the player who made the LAST move is NOT on turn."
+        "\\nList the ON-TURN player's score FIRST, waiting player SECOND."
         "\\n\\nReturn ONLY a JSON object with these fields:"
         "\\n{"
         "\\n  \\\"board\\\": [[...], ...],  // 15x15 array"
         "\\n  \\\"rack\\\": \\\"ABCDE?F\\\",  // current player rack (? = blank)"
         "\\n  \\\"lexicon\\\": \\\"NWL23\\\",  // lexicon name"
         "\\n  \\\"bag\\\": \\\"A E II O U B C D L N S TT X\\\",  // tile tracking text"
-        "\\n  \\\"scores\\\": [351, 329]  // [ON-TURN player score (green bg), waiting player score]"
+        "\\n  \\\"scores\\\": [241, 198]  // [ON-TURN player score, waiting player score]"
         "\\n}";
     prompt += "\\n\\nBoard array elements:";
     if (is_light_mode) {
@@ -2559,6 +2609,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
+    // Stage snapshot: after realignment (before occupancy enforcement)
+    { std::string s="{\"stage\":\"realigned\",\"stage_cgp\":\""+json_escape(cells_to_cgp(dr.cells))+"\"}\n"; sink.write(s.data(),s.size()); }
+
     // Step 4: Strict occupancy enforcement — clear all non-occupied cells.
     // Save Gemini's original readings for disputed cells (Gemini found a
     // letter but color detection says empty) so we can re-verify with crops.
@@ -2718,6 +2771,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             sink.write(msg.data(), msg.size());
         }
     }
+
+    // Stage snapshot: after transposed OCR corrections (Cases 1+3)
+    { std::string s="{\"stage\":\"trans\",\"stage_cgp\":\""+json_escape(cells_to_cgp(dr.cells))+"\"}\n"; sink.write(s.data(),s.size()); }
 
     // Step 5: Re-query Gemini for cells needing verification (crop + retry)
     // Two categories:
@@ -2904,6 +2960,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             }
         }
     }
+
+    // Stage snapshot: after all retry crops + connectivity
+    { std::string s="{\"stage\":\"retry\",\"stage_cgp\":\""+json_escape(cells_to_cgp(dr.cells))+"\"}\n"; sink.write(s.data(),s.size()); }
 
     // Step 6: Bag-math validation — re-query cells with over-counted letters
     if (have_opencv && !gemini_bag.empty()) {
@@ -3844,6 +3903,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
+    // Stage snapshot: after word completion + dict requery
+    { std::string s="{\"stage\":\"wc\",\"stage_cgp\":\""+json_escape(cells_to_cgp(dr.cells))+"\"}\n"; sink.write(s.data(),s.size()); }
+
     // --- Rack validation & auto-correction ---
     // Runs after word corrections so the warning reflects the final board state.
     // full bag - board tiles - bag tiles = expected rack
@@ -4475,17 +4537,22 @@ if(DATA){
     <div style="margin-left:auto"><div class="ts">${ts}</div><div class="ts">${relTime(DATA.timestamp)}</div></div>
   </div>`;
   // Summary table
-  h+=`<table><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>`;
+  h+=`<table><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th style="color:#68a">Occ%</th><th style="color:#68a">Raw%</th><th style="color:#68a">Align%</th><th style="color:#68a">Trans%</th><th style="color:#68a">Retry%</th><th style="color:#68a">WC%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>`;
   for(const c of DATA.cases||[]){
     const cp=c.cells?((c.correct/c.cells)*100).toFixed(1)+'%':'—';
     const scOk=c.exp_scores&&c.got_scores?(c.exp_scores===c.got_scores?'<span class="pass">&#10003;</span>':'<span class="fail">&#10007;</span>'):'—';
     const expSc=c.exp_scores||'—';const gotSc=c.got_scores||'—';
     const scMismatch=c.exp_scores&&c.got_scores&&c.exp_scores!==c.got_scores;
-    h+=`<tr><td>${c.name}</td><td>${c.cells||'—'}</td><td>${c.correct||'—'}</td><td class="${c.wrong>0?'fail':'pass'}">${c.wrong||'0'}</td><td>${cp}</td><td style="font-family:monospace;${scMismatch?'color:#f88':''}">${expSc}</td><td style="font-family:monospace;${scMismatch?'color:#f88':''}">${gotSc}</td><td>${scOk}</td></tr>`;
+    const sa=c.stage_accs||{};
+    function s(k){return sa[k]!=null?sa[k]+'%':'—';}
+    const stageCols=`<td>${s('occ')}</td><td>${s('raw')}</td><td>${s('realigned')}</td><td>${s('trans')}</td><td>${s('retry')}</td><td>${s('wc')}</td>`;
+    h+=`<tr><td>${c.name}</td><td>${c.cells||'—'}</td><td>${c.correct||'—'}</td><td class="${c.wrong>0?'fail':'pass'}">${c.wrong||'0'}</td><td>${cp}</td>${stageCols}<td style="font-family:monospace;${scMismatch?'color:#f88':''}">${expSc}</td><td style="font-family:monospace;${scMismatch?'color:#f88':''}">${gotSc}</td><td>${scOk}</td></tr>`;
+    if(c.diffs&&c.diffs.length)h+=`<tr><td colspan="14" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${c.diffs.join('&nbsp;&nbsp;')}</td></tr>`;
   }
   h+=`<tr style="font-weight:bold;border-top:2px solid #444">
     <td>TOTAL</td><td>${DATA.total_cells}</td><td>${DATA.correct}</td>
     <td class="${wrong?'fail':'pass'}">${wrong}</td><td>${pct}%</td>
+    <td colspan="6"></td>
     <td colspan="3" style="color:#ccc">${DATA.scores_correct}/${DATA.scores_total} scores &#10003;</td></tr></table>`;
   // Failing case boards
   for(const c of DATA.cases||[]){
