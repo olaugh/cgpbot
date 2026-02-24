@@ -654,13 +654,11 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
 .test-list li{padding:4px 6px;border-radius:4px;cursor:pointer;font-size:.75rem;color:#aaa;display:flex;align-items:center;gap:6px}
 .test-list li:hover{background:#1e2d50;color:#fff}
 .test-list li.active{background:#1e2d50;color:#58a6ff}
-.test-list li.running{background:#0d1f0d;color:#8f8}
-.test-list .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:#555;font-style:normal}
+.test-list li.running{background:#1a1630;color:#aaf}
+.test-list .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:#555}
 .test-list li.pass .dot{background:#4c4}
 .test-list li.fail .dot{background:#f44}
-@keyframes braille-spin{0%{content:'\u2801'}12.5%{content:'\u2802'}25%{content:'\u2804'}37.5%{content:'\u2840'}50%{content:'\u2880'}62.5%{content:'\u2820'}75%{content:'\u2810'}87.5%{content:'\u2808'}}
-.test-list li.running .dot{width:auto;height:auto;background:none;border-radius:0;color:#8f8;font-size:.85rem;line-height:1}
-.test-list li.running .dot::before{content:'\u2801';animation:braille-spin .8s steps(8,end) infinite}
+.test-list li.running .dot{width:auto;height:auto;background:none;border-radius:0;color:#88f;font-size:.85rem;line-height:1}
 .panel{background:#16213e;border-radius:12px;padding:20px;border:1px solid #2a2a4a}
 .panel h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.1em;color:#888;margin-bottom:12px}
 
@@ -867,6 +865,30 @@ let selectedCell=null; // {r, c} or null
 // Test case tracking
 let currentTestCase=null;   // name of currently loaded test case, or null
 let expectedBoard=null;     // 15x15 array of expected letters (from testdata CGP), or null
+
+// Braille spinner for eval progress
+const BRAILLE='\u28cb\u28d7\u28f7\u28ff\u28fb\u28ef\u28cf\u28c7';
+let _spinInterval=null,_spinFrame=0;
+function startSpinner(name){
+  stopSpinner();
+  _spinFrame=0;
+  for(const li of document.querySelectorAll('#test-list li')){
+    li.classList.toggle('running',li.dataset.name===name);
+    if(li.dataset.name===name){const d=li.querySelector('.dot');if(d)d.textContent=BRAILLE[0];}
+  }
+  _spinInterval=setInterval(()=>{
+    _spinFrame=(_spinFrame+1)%BRAILLE.length;
+    const li=document.querySelector('#test-list li.running');
+    if(li){const d=li.querySelector('.dot');if(d)d.textContent=BRAILLE[_spinFrame];}
+  },100);
+}
+function stopSpinner(){
+  if(_spinInterval){clearInterval(_spinInterval);_spinInterval=null;}
+  for(const li of document.querySelectorAll('#test-list li.running')){
+    li.classList.remove('running');
+    const d=li.querySelector('.dot');if(d)d.textContent='';
+  }
+}
 
 // Parse CGP board string -> 15x15 array of chars ('' = empty)
 function parseCGPBoard(cgp){
@@ -1477,8 +1499,7 @@ async function evalAllGemini(){
 
   for(const tc of cases){
     document.getElementById('eval-running').textContent='Running: '+tc.name+'...';
-    for(const li of document.querySelectorAll('#test-list li'))
-      li.classList.toggle('running',li.dataset.name===tc.name);
+    startSpinner(tc.name);
     let expCGP='',expBoard=null,expScores=null;
     if(tc.has_expected){
       try{const r=await fetch('/testdata-cgp/'+encodeURIComponent(tc.name));expCGP=(await r.text()).trim();}catch(e){}
@@ -1542,10 +1563,10 @@ async function evalAllGemini(){
       got_cgp:caseWrong>0?gotCGP.split(' ')[0]:'',
       exp_scores:expScores?expScores[0]+' '+expScores[1]:null,
       got_scores:gotScMatch?gotScMatch[1]+' '+gotScMatch[2]:null});
-    // update sidebar: remove running, set pass/fail
+    // update sidebar: stop spinner, set pass/fail
+    stopSpinner();
     for(const li of document.querySelectorAll('#test-list li')){
       if(li.dataset.name===tc.name){
-        li.classList.remove('running');
         li.classList.toggle('pass',caseWrong===0);
         li.classList.toggle('fail',caseWrong>0);
       }
