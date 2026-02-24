@@ -513,7 +513,8 @@ static std::array<std::array<char, 15>, 15> parse_cgp_board(const std::string& c
 // Forward declarations for run_tests_cli.
 static bool parse_board_rect_from_log(const std::string& log,
                                        int& bx, int& by, int& cell_sz,
-                                       int* board_w);
+                                       int* board_w = nullptr,
+                                       int* board_h = nullptr);
 static bool detect_board_mode(const std::vector<uint8_t>& image_data,
                                int bx, int by, int cell_sz);
 static void detect_tiles_by_color(const std::vector<uint8_t>& image_data,
@@ -762,6 +763,11 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
         <img id="transposed-img" style="max-width:100%;border-radius:6px;image-rendering:pixelated">
         <div id="transposed-disagree" style="margin-top:8px;font-size:.75rem;line-height:2"></div>
       </div>
+      <div id="trail-area" style="display:none;margin-top:16px">
+        <h3 style="font-size:.85rem;color:#aaa;margin-bottom:6px">OCR Trail</h3>
+        <div id="trail-raw-cgp" style="font-family:monospace;font-size:.7rem;color:#888;word-break:break-all;margin-bottom:8px;background:#111;padding:6px;border-radius:4px"></div>
+        <div id="trail-table"></div>
+      </div>
     </div>
   </div>
   <div>
@@ -893,7 +899,10 @@ async function processStream(res){
           for(const crop of data.crops){
             const d=document.createElement('div');
             d.style.cssText='text-align:center;background:#1a1a2e;border-radius:6px;padding:6px;min-width:60px';
-            d.innerHTML=`<img src="${crop.img}" style="width:48px;height:48px;image-rendering:pixelated;border-radius:4px"><div style="font-size:.7rem;color:#ccc;margin-top:4px">${crop.pos}: ${crop.cur}</div>`;
+            const lbl=crop.initial&&crop.initial!==crop.cur
+              ?`${crop.initial}<span style="color:#fa8">\u2192${crop.cur}</span>`
+              :crop.cur;
+            d.innerHTML=`<img src="${crop.img}" style="width:48px;height:48px;image-rendering:pixelated;border-radius:4px"><div style="font-size:.7rem;color:#ccc;margin-top:4px">${crop.pos}: ${lbl}</div>`;
             cc.appendChild(d);
           }
           ca.style.display='block';
@@ -907,10 +916,32 @@ async function processStream(res){
           if(data.transposed_disagree.length===0){
             td.innerHTML='<span style="color:#8f8">&#10003; Transposed OCR agrees with main OCR on all occupied cells.</span>';
           }else{
-            td.innerHTML='Disagreements: '+data.transposed_disagree.map(
+            td.innerHTML='Raw OCR disagreements (main\u2192trans): '+data.transposed_disagree.map(
               x=>`<span style="background:#2a1010;border:1px solid #a33;padding:1px 6px;border-radius:3px;margin:2px;display:inline-block">${x.pos}: <b>${x.orig}</b>&rarr;<b style="color:#f88">${x.trans}</b></span>`
             ).join(' ');
           }
+        }
+        if(data.raw_main_cgp){
+          document.getElementById('trail-raw-cgp').textContent='Raw main OCR: '+data.raw_main_cgp;
+          document.getElementById('trail-area').style.display='block';
+        }
+        if(data.ocr_trail&&data.ocr_trail.length>0){
+          const ta=document.getElementById('trail-area');
+          ta.style.display='block';
+          const tbl=document.getElementById('trail-table');
+          let h='<table style="font-size:.72rem;border-collapse:collapse;width:100%">';
+          h+='<tr style="color:#888"><th style="text-align:left;padding:2px 6px">Cell</th><th style="padding:2px 6px">Raw Main</th><th style="padding:2px 6px">Trans OCR</th><th style="padding:2px 6px">Final</th><th style="text-align:left;padding:2px 6px">Note</th></tr>';
+          for(const e of data.ocr_trail){
+            const raw=e.raw||'\u2014';
+            const trans=e.trans||'\u2014';
+            const fin=e.final||'\u2014';
+            let note='corrected',bg='#1a0a1a',nc='#d8a';
+            if(e.trans&&e.trans===e.final&&e.raw!==e.final){note='trans helped';bg='#0a1f0a';nc='#8f8';}
+            else if(e.raw===e.final&&e.trans&&e.trans!==e.final){note='trans wrong';bg='#1f1a00';nc='#bb8';}
+            h+=`<tr style="background:${bg}"><td style="padding:2px 8px;font-weight:bold">${e.pos}</td><td style="text-align:center;padding:2px 8px">${raw}</td><td style="text-align:center;padding:2px 8px">${trans}</td><td style="text-align:center;padding:2px 8px;font-weight:bold">${fin}</td><td style="padding:2px 8px;color:${nc}">${note}</td></tr>`;
+          }
+          h+='</table>';
+          tbl.innerHTML=h;
         }
         if(data.cgp){
           cgpOut.value=data.cgp;
@@ -1316,13 +1347,15 @@ static std::string json_extract_string(const std::string& body,
 // ---------------------------------------------------------------------------
 static bool parse_board_rect_from_log(const std::string& log,
                                        int& bx, int& by, int& cell_sz,
-                                       int* board_w = nullptr) {
+                                       int* board_w,
+                                       int* board_h) {
     auto pos = log.find("Final: rect=");
     if (pos == std::string::npos) return false;
     int bw, bh;
     bool ok = sscanf(log.c_str() + pos, "Final: rect=%d,%d %dx%d cell=%d",
                      &bx, &by, &bw, &bh, &cell_sz) == 5;
     if (ok && board_w) *board_w = bw;
+    if (ok && board_h) *board_h = bh;
     return ok;
 }
 
@@ -1671,27 +1704,38 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     std::future<GeminiCallResult> transposed_fut;
 
     if (have_opencv) {
-        int bx_t, by_t, cs_t;
-        if (parse_board_rect_from_log(opencv_dr.log, bx_t, by_t, cs_t)) {
+        int bx_t, by_t, cs_t, bw_t = 0, bh_t = 0;
+        if (parse_board_rect_from_log(opencv_dr.log, bx_t, by_t, cs_t, &bw_t, &bh_t)) {
             cv::Mat raw_t(1, static_cast<int>(buf.size()), CV_8UC1,
                           const_cast<uint8_t*>(buf.data()));
             cv::Mat img_t = cv::imdecode(raw_t, cv::IMREAD_COLOR);
             if (!img_t.empty()) {
+                // Subpixel cell boundaries: avoid ±1 pixel accumulation error.
+                double cw = (bw_t > 0) ? bw_t / 15.0 : static_cast<double>(cs_t);
+                double ch = (bh_t > 0) ? bh_t / 15.0 : static_cast<double>(cs_t);
+                // per-cell left/top pixel boundaries (rounded)
+                auto cell_x = [&](int c) { return bx_t + static_cast<int>(std::round(c * cw)); };
+                auto cell_y = [&](int r) { return by_t + static_cast<int>(std::round(r * ch)); };
+
                 int tsz = 15 * cs_t;
                 cv::Mat timg(tsz, tsz, CV_8UC3, cv::Scalar(30, 30, 30));
                 for (int tr = 0; tr < 15; tr++) {
                     for (int tc = 0; tc < 15; tc++) {
-                        // source: original cell (row=tc, col=tr)
-                        int sx = bx_t + tr * cs_t;
-                        int sy = by_t + tc * cs_t;
-                        // dest: transposed position (row=tr, col=tc)
+                        // source: original cell (row=tc, col=tr) with subpixel boundaries
+                        int sx = cell_x(tr), sw = cell_x(tr + 1) - sx;
+                        int sy = cell_y(tc), sh = cell_y(tc + 1) - sy;
+                        // dest: uniform output cell (row=tr, col=tc)
                         int dx = tc * cs_t;
                         int dy = tr * cs_t;
-                        if (sx < 0 || sy < 0 ||
-                            sx + cs_t > img_t.cols ||
-                            sy + cs_t > img_t.rows) continue;
-                        img_t(cv::Rect(sx, sy, cs_t, cs_t)).copyTo(
-                            timg(cv::Rect(dx, dy, cs_t, cs_t)));
+                        if (sx < 0 || sy < 0 || sw <= 0 || sh <= 0 ||
+                            sx + sw > img_t.cols ||
+                            sy + sh > img_t.rows) continue;
+                        cv::Mat src_roi = img_t(cv::Rect(sx, sy, sw, sh));
+                        cv::Mat dst_roi = timg(cv::Rect(dx, dy, cs_t, cs_t));
+                        if (sw == cs_t && sh == cs_t)
+                            src_roi.copyTo(dst_roi);
+                        else
+                            cv::resize(src_roi, dst_roi, dst_roi.size(), 0, 0, cv::INTER_LANCZOS4);
                     }
                 }
                 cv::imencode(".png", timg, transposed_png);
@@ -1724,6 +1768,14 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         intermediate = "{\"status\":\"Board detected \\u2014 calling Gemini Flash...\","
                       + intermediate.substr(1) + "\n";
         sink.write(intermediate.data(), intermediate.size());
+
+        // Stream transposed board image immediately so the user can see it
+        if (!transposed_png.empty()) {
+            std::string t_msg = "{\"status\":\"Building transposed board...\","
+                "\"transposed_image\":\"data:image/png;base64,"
+                + base64_encode(transposed_png) + "\"}\n";
+            sink.write(t_msg.data(), t_msg.size());
+        }
     }
 
     // Step 3: Call Gemini Flash
@@ -1851,7 +1903,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         if (!transposed_occ_grid.empty()) {
             prompt_t += "\\n\\nOccupancy grid (already transposed to match the "
                 "image — X=tile present, .=empty):\\n" + transposed_occ_grid +
-                "\\n\\nEvery X cell MUST have a letter — do NOT return null for any X cell.";
+                "\\n\\nSTRICT RULES based on the grid above:"
+                "\\n- Every cell marked 'X' MUST have a letter (do NOT return null)."
+                "\\n- Every cell marked '.' MUST return null (do NOT return a letter).";
         }
         prompt_t += "\\n\\nTile types:";
         if (is_light_mode) {
@@ -1972,6 +2026,156 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                 + std::string(have_transposed_ocr ? "parsed." : "failed to parse.")
                 + "\"}\n";
             sink.write(tmsg.data(), tmsg.size());
+        }
+    }
+
+    // Save raw OCR snapshot (before any corrections) for trail comparison.
+    CellResult raw_main_cells[15][15];
+    std::memcpy(raw_main_cells, dr.cells, sizeof(raw_main_cells));
+
+    // Stream the raw main OCR board immediately so the user can see it
+    // while corrections are being computed.
+    {
+        std::string raw_cgp = cells_to_cgp(raw_main_cells);
+        // Build minimal board-cells JSON for the raw board update
+        std::string cells_json = "[";
+        for (int r = 0; r < 15; r++) {
+            if (r > 0) cells_json += ",";
+            cells_json += "[";
+            for (int c = 0; c < 15; c++) {
+                if (c > 0) cells_json += ",";
+                char ch = raw_main_cells[r][c].letter;
+                if (ch == 0) cells_json += "null";
+                else cells_json += "\"" + std::string(1, ch) + "\"";
+            }
+            cells_json += "]";
+        }
+        cells_json += "]";
+        std::string rmsg = "{\"status\":\"Raw Gemini OCR — applying corrections...\","
+            "\"raw_main_cgp\":\"" + json_escape(raw_cgp) + "\","
+            "\"raw_cells\":" + cells_json + "}\n";
+        sink.write(rmsg.data(), rmsg.size());
+    }
+
+    // Use transposed OCR to improve the initial board reading before corrections.
+    if (have_transposed_ocr) {
+        // Helper: transposed letter for original cell (r, c)
+        auto trans_letter = [&](int r, int c) -> char {
+            return transposed_cells[c][r].letter;
+        };
+
+        // --- Case 1: Fill occupied cells that main OCR missed ---
+        std::string trans_fill_detail;
+        for (int r = 0; r < 15; r++) {
+            for (int c = 0; c < 15; c++) {
+                if (!get_occupied(r, c) || dr.cells[r][c].letter != 0) continue;
+                char t_ch = trans_letter(r, c);
+                if (t_ch == 0) continue;
+                dr.cells[r][c].letter = t_ch;
+                dr.cells[r][c].confidence = 0.7f;
+                dr.cells[r][c].is_blank = (t_ch >= 'a' && t_ch <= 'z');
+                if (!trans_fill_detail.empty()) trans_fill_detail += ", ";
+                trans_fill_detail += std::string(1, static_cast<char>('A' + c))
+                    + std::to_string(r + 1) + "="
+                    + static_cast<char>(std::toupper(static_cast<unsigned char>(t_ch)));
+            }
+        }
+        if (!trans_fill_detail.empty()) {
+            std::string msg = "{\"status\":\"Transposed OCR filled missed cells: "
+                + json_escape(trans_fill_detail) + "\"}\n";
+            sink.write(msg.data(), msg.size());
+        }
+
+        // --- Case 3: Detect shifts corroborated by transposed OCR ---
+        // If main[pos] == trans[pos+shift] for >= 75% of a block, main is shifted
+        // by -shift. Apply transposed letters (correctly positioned) for the block.
+        std::string shift_detail;
+
+        auto check_and_apply_shift = [&](int line, int p_start, int p_end, bool is_row) {
+            int len = p_end - p_start;
+            if (len < 3) return;
+            auto get_main = [&](int p) -> char {
+                return is_row ? dr.cells[line][p].letter : dr.cells[p][line].letter;
+            };
+            auto get_trans = [&](int p) -> char {
+                return is_row ? trans_letter(line, p) : trans_letter(p, line);
+            };
+            auto set_cell = [&](int p, char ch, float conf) {
+                auto& cell = is_row ? dr.cells[line][p] : dr.cells[p][line];
+                cell.letter = ch;
+                cell.confidence = conf;
+                cell.is_blank = (ch >= 'a' && ch <= 'z');
+            };
+
+            for (int shift : {-1, +1, -2, +2}) {
+                int matches = 0, total = 0;
+                for (int pi = p_start; pi < p_end; pi++) {
+                    char m_ch = get_main(pi);
+                    if (m_ch == 0) continue;
+                    int pi_t = pi + shift;
+                    if (pi_t < p_start || pi_t >= p_end) continue;
+                    char t_ch = get_trans(pi_t);
+                    if (t_ch == 0) continue;
+                    total++;
+                    if (std::toupper(static_cast<unsigned char>(m_ch))
+                        == std::toupper(static_cast<unsigned char>(t_ch)))
+                        matches++;
+                }
+                if (total < len / 2 || matches * 4 < total * 3) continue;
+
+                // Corroborated shift: apply transposed letters for this block.
+                std::string block_changes;
+                for (int pi = p_start; pi < p_end; pi++) {
+                    char t_ch = get_trans(pi);
+                    if (t_ch == 0) continue;
+                    char old_ch = get_main(pi);
+                    char old_u = old_ch ? static_cast<char>(
+                        std::toupper(static_cast<unsigned char>(old_ch))) : 0;
+                    char t_u = static_cast<char>(
+                        std::toupper(static_cast<unsigned char>(t_ch)));
+                    if (old_u != t_u) {
+                        if (!block_changes.empty()) block_changes += ", ";
+                        std::string pos_str = is_row
+                            ? std::string(1, static_cast<char>('A' + pi))
+                              + std::to_string(line + 1)
+                            : std::string(1, static_cast<char>('A' + line))
+                              + std::to_string(pi + 1);
+                        block_changes += pos_str + ":"
+                            + (old_u ? std::string(1, old_u) : std::string("?"))
+                            + "->" + t_u;
+                        set_cell(pi, t_ch, 0.75f);
+                    }
+                }
+                if (!block_changes.empty()) {
+                    if (!shift_detail.empty()) shift_detail += "; ";
+                    shift_detail += (is_row ? "row " : "col ")
+                        + (is_row ? std::to_string(line + 1)
+                                  : std::string(1, static_cast<char>('A' + line)))
+                        + " shift " + (shift > 0 ? "+" : "")
+                        + std::to_string(shift) + " [" + block_changes + "]";
+                }
+                break; // apply only best shift
+            }
+        };
+
+        for (int r = 0; r < 15; r++) {
+            int s = -1;
+            for (int c = 0; c <= 15; c++) {
+                if (c < 15 && get_occupied(r, c)) { if (s < 0) s = c; }
+                else if (s >= 0) { check_and_apply_shift(r, s, c, true); s = -1; }
+            }
+        }
+        for (int c = 0; c < 15; c++) {
+            int s = -1;
+            for (int r = 0; r <= 15; r++) {
+                if (r < 15 && get_occupied(r, c)) { if (s < 0) s = r; }
+                else if (s >= 0) { check_and_apply_shift(c, s, r, false); s = -1; }
+            }
+        }
+        if (!shift_detail.empty()) {
+            std::string msg = "{\"status\":\"Transposed OCR corroborated shift: "
+                + json_escape(shift_detail) + "\"}\n";
+            sink.write(msg.data(), msg.size());
         }
     }
 
@@ -2480,14 +2684,19 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                                 "\"data\":\"" + b64_crop + "\"}}";
                             // Add to status crops
                             if (si > 0) crop_status += ",";
-                            char pos_label = static_cast<char>(
-                                std::toupper(static_cast<unsigned char>(
-                                    dr.cells[sp.r][sp.c].letter)));
+                            char cur_lbl = static_cast<char>(std::toupper(
+                                static_cast<unsigned char>(dr.cells[sp.r][sp.c].letter)));
+                            char raw_lbl = raw_main_cells[sp.r][sp.c].letter
+                                ? static_cast<char>(std::toupper(static_cast<unsigned char>(
+                                    raw_main_cells[sp.r][sp.c].letter))) : 0;
                             crop_status += "{\"pos\":\"" +
                                 std::string(1, static_cast<char>('A' + sp.c)) +
                                 std::to_string(sp.r + 1) + "\",\"cur\":\"" +
-                                std::string(1, pos_label) +
-                                "\",\"img\":\"data:image/png;base64," +
+                                std::string(1, cur_lbl) + "\"" +
+                                (raw_lbl && raw_lbl != cur_lbl
+                                    ? ",\"initial\":\"" + std::string(1, raw_lbl) + "\""
+                                    : "") +
+                                ",\"img\":\"data:image/png;base64," +
                                 b64_crop + "\"}";
                         }
                         vfy_payload += "]}]}";
@@ -2886,6 +3095,57 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                         return true;
                     };
 
+                    // Case 2: Try the transposed OCR letter first for each suspect
+                    // cell. If it immediately makes all touching words valid, apply
+                    // it and remove the suspect — avoids the 26-letter sweep.
+                    if (have_transposed_ocr) {
+                        std::string hint_detail;
+                        for (auto it = suspects.begin(); it != suspects.end(); ) {
+                            int r = it->first, c = it->second;
+                            char t_ch = transposed_cells[c][r].letter;
+                            if (t_ch == 0) { ++it; continue; }
+                            char t_u = static_cast<char>(std::toupper(
+                                static_cast<unsigned char>(t_ch)));
+                            char m_u = static_cast<char>(std::toupper(
+                                static_cast<unsigned char>(dr.cells[r][c].letter)));
+                            if (t_u == m_u) { ++it; continue; }
+                            auto orig = dr.cells[r][c];
+                            dr.cells[r][c].letter = t_u;
+                            dr.cells[r][c].is_blank = false;
+                            if (all_touching_valid({*it})) {
+                                dr.cells[r][c].confidence = 0.85f;
+                                if (!hint_detail.empty()) hint_detail += ", ";
+                                hint_detail += std::string(1, static_cast<char>('A' + c))
+                                    + std::to_string(r + 1) + ": " + m_u + "->" + t_u;
+                                suspect_set.erase(*it);
+                                it = suspects.erase(it);
+                            } else {
+                                dr.cells[r][c] = orig;
+                                ++it;
+                            }
+                        }
+                        if (!hint_detail.empty()) {
+                            all_words = extract_words(dr.cells);
+                            invalid.clear();
+                            for (const auto& bw : all_words) {
+                                if (!g_kwg.is_valid(bw.word)) {
+                                    InvalidWord ihw;
+                                    ihw.word = bw.word; ihw.cells = bw.cells;
+                                    ihw.horizontal = bw.horizontal;
+                                    if (bw.horizontal)
+                                        ihw.position = "row " + std::to_string(bw.cells[0].first + 1);
+                                    else
+                                        ihw.position = "col " + std::string(1,
+                                            static_cast<char>('A' + bw.cells[0].second));
+                                    invalid.push_back(std::move(ihw));
+                                }
+                            }
+                            std::string msg = "{\"status\":\"Transposed OCR hint applied: "
+                                + json_escape(hint_detail) + "\"}\n";
+                            sink.write(msg.data(), msg.size());
+                        }
+                    }
+
                     for (const auto& iw : invalid) {
                         // Find suspect cells in this invalid word
                         std::vector<std::pair<int,int>> word_suspects;
@@ -3079,12 +3339,18 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                                 char cur_ltr = static_cast<char>(std::toupper(
                                     static_cast<unsigned char>(
                                         dr.cells[sp.first][sp.second].letter)));
+                                char raw_ltr = raw_main_cells[sp.first][sp.second].letter
+                                    ? static_cast<char>(std::toupper(static_cast<unsigned char>(
+                                        raw_main_cells[sp.first][sp.second].letter))) : 0;
                                 crop_status += "{\"pos\":\""
                                     + std::string(1, static_cast<char>('A' + sp.second))
                                     + std::to_string(sp.first + 1)
                                     + "\",\"cur\":\""
-                                    + std::string(1, cur_ltr)
-                                    + "\",\"img\":\"data:image/png;base64,"
+                                    + std::string(1, cur_ltr) + "\""
+                                    + (raw_ltr && raw_ltr != cur_ltr
+                                        ? ",\"initial\":\"" + std::string(1, raw_ltr) + "\""
+                                        : "")
+                                    + ",\"img\":\"data:image/png;base64,"
                                     + b64_crop + "\"}";
                             }
                             dict_payload += "]}]}";
@@ -3338,35 +3604,34 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
-    // Send transposed board image and disagreements with the final corrected board
+    // Send transposed board image and disagreements (raw main vs raw transposed).
     if (have_transposed_ocr && !transposed_png.empty()) {
-        // transposed_cells[c][r] corresponds to original board cell (r, c)
+        // transposed_cells[c][r] corresponds to original board cell (r, c).
+        // Compare against raw_main_cells (before corrections) so we see true OCR disagreements.
         std::string disagree_json = "[";
         bool first_d = true;
         for (int r = 0; r < 15; r++) {
             for (int c = 0; c < 15; c++) {
-                char orig_ch = dr.cells[r][c].letter;
+                char raw_ch = raw_main_cells[r][c].letter;
                 char trans_ch = transposed_cells[c][r].letter;
-                if (orig_ch == 0 || trans_ch == 0) continue;
-                char orig_u = static_cast<char>(std::toupper(
-                    static_cast<unsigned char>(orig_ch)));
+                if (raw_ch == 0 || trans_ch == 0) continue;
+                char raw_u = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(raw_ch)));
                 char trans_u = static_cast<char>(std::toupper(
                     static_cast<unsigned char>(trans_ch)));
-                if (orig_u != trans_u) {
+                if (raw_u != trans_u) {
                     if (!first_d) disagree_json += ",";
                     first_d = false;
                     disagree_json += "{\"pos\":\""
                         + std::string(1, static_cast<char>('A' + c))
                         + std::to_string(r + 1)
-                        + "\",\"orig\":\"" + orig_u
+                        + "\",\"orig\":\"" + raw_u
                         + "\",\"trans\":\"" + trans_u + "\"}";
                 }
             }
         }
         disagree_json += "]";
         std::string tmsg = "{\"status\":\"Transposed OCR comparison\","
-            "\"transposed_image\":\"data:image/png;base64,"
-            + base64_encode(transposed_png) + "\","
             "\"transposed_disagree\":" + disagree_json + "}\n";
         sink.write(tmsg.data(), tmsg.size());
     }
@@ -3380,6 +3645,42 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         extra += ",\"rack_warning\":\"" + json_escape(rack_warning) + "\"";
     if (!invalid_words_json.empty())
         extra += ",\"invalid_words\":" + invalid_words_json;
+    // OCR trail: per-cell comparison of raw main / transposed / final
+    {
+        std::string trail = "[";
+        bool first_t = true;
+        for (int r = 0; r < 15; r++) {
+            for (int c = 0; c < 15; c++) {
+                char raw_ch = raw_main_cells[r][c].letter;
+                char trans_ch = have_transposed_ocr
+                    ? transposed_cells[c][r].letter : 0;
+                char fin_ch = dr.cells[r][c].letter;
+                // Skip cells that are empty in both raw main OCR and final board —
+                // these are empty cells where transposed OCR hallucinated, just noise.
+                if (raw_ch == 0 && fin_ch == 0) continue;
+                char raw_u = raw_ch ? static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(raw_ch))) : 0;
+                char trans_u = trans_ch ? static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(trans_ch))) : 0;
+                char fin_u = fin_ch ? static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(fin_ch))) : 0;
+                // Skip if raw==final and trans agrees or is absent
+                if (raw_u == fin_u
+                    && (trans_u == 0 || trans_u == fin_u)) continue;
+                if (!first_t) trail += ",";
+                first_t = false;
+                std::string pos = std::string(1, static_cast<char>('A' + c))
+                    + std::to_string(r + 1);
+                trail += "{\"pos\":\"" + pos + "\","
+                    "\"raw\":\"" + (raw_u ? std::string(1, raw_u) : "") + "\","
+                    "\"trans\":\"" + (trans_u ? std::string(1, trans_u) : "") + "\","
+                    "\"final\":\"" + (fin_u ? std::string(1, fin_u) : "") + "\"}";
+            }
+        }
+        trail += "]";
+        extra += ",\"ocr_trail\":" + trail;
+        extra += ",\"raw_main_cgp\":\"" + json_escape(cells_to_cgp(raw_main_cells)) + "\"";
+    }
     // Include occupancy grid so UI can show it
     if (have_color || have_opencv) {
         extra += ",\"occupancy\":[";
