@@ -646,7 +646,17 @@ body{
   background:#1a1a2e;color:#e0e0e0;min-height:100vh;padding:24px;
 }
 h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
-.layout{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:1400px;margin:0 auto}
+.layout{display:grid;grid-template-columns:180px 1fr 1fr;gap:20px;max-width:1600px;margin:0 auto}
+.sidebar{display:flex;flex-direction:column;gap:12px}
+.sidebar-panel{background:#16213e;border-radius:12px;padding:14px;border:1px solid #2a2a4a}
+.sidebar-panel h2{font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:#888;margin-bottom:10px}
+.test-list{list-style:none}
+.test-list li{padding:4px 6px;border-radius:4px;cursor:pointer;font-size:.75rem;color:#aaa;display:flex;align-items:center;gap:6px}
+.test-list li:hover{background:#1e2d50;color:#fff}
+.test-list li.active{background:#1e2d50;color:#58a6ff}
+.test-list .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:#555}
+.test-list li.pass .dot{background:#4c4}
+.test-list li.fail .dot{background:#f44}
 .panel{background:#16213e;border-radius:12px;padding:20px;border:1px solid #2a2a4a}
 .panel h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.1em;color:#888;margin-bottom:12px}
 
@@ -739,17 +749,31 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
 <body>
 <h1>CGP Bot &mdash; Test Bench</h1>
 <div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-panel">
+      <h2>Test Cases</h2>
+      <ul class="test-list" id="test-list"></ul>
+    </div>
+    <div class="sidebar-panel">
+      <h2>Last Eval</h2>
+      <div id="eval-summary-bar">
+        <div id="eval-summary-acc" style="font-size:.85rem;font-weight:600;color:#4c4;margin-bottom:2px"></div>
+        <div id="eval-summary-time" style="font-size:.7rem;color:#666;margin-bottom:6px"></div>
+        <a href="/eval" target="_blank" style="font-size:.72rem;color:#58a6ff;text-decoration:none">details &rarr;</a>
+        &nbsp;<button class="btn" style="font-size:.65rem;padding:2px 6px" onclick="evalAllGemini()">re-run</button>
+      </div>
+      <div id="eval-summary-none" style="font-size:.72rem;color:#555">
+        No eval yet.<br>
+        <button class="btn" style="font-size:.65rem;padding:2px 6px;margin-top:6px" onclick="evalAllGemini()">Run eval</button>
+      </div>
+    </div>
+  </div>
   <div>
     <div class="panel">
       <h2>Input</h2>
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.85rem">
-          <input type="checkbox" id="use-gemini" checked> Use Gemini Flash
-        </label>
-        <select id="test-selector" style="background:#0d1117;border:1px solid #444;color:#ccc;padding:3px 6px;border-radius:4px;font-size:.75rem;cursor:pointer" onchange="loadTestCase(this.value)">
-          <option value="">— Load test case —</option>
-        </select>
-      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;font-size:.85rem">
+        <input type="checkbox" id="use-gemini" checked> Use Gemini Flash
+      </label>
       <div id="drop-zone">
         <p>Drop a board screenshot here</p>
         <p style="font-size:.8rem;margin-top:8px">or click to select a file &mdash; also accepts image URLs (e.g. from Discord)</p>
@@ -1318,19 +1342,61 @@ function displayTestResults(results){
   panel.style.display='block';
 }
 
-// --- Load test cases into selector ---
+function relTime(ts){
+  const d=Math.floor((Date.now()/1000)-ts);
+  if(d<60)return 'just now';
+  if(d<3600)return Math.round(d/60)+'m ago';
+  if(d<86400)return Math.round(d/3600)+'h ago';
+  return Math.round(d/86400)+'d ago';
+}
+
+let testCaseNames=[];
+
+// --- Load test cases into sidebar list ---
 async function loadTestList(){
   try{
     const res=await fetch('/testdata-list');
     const cases=await res.json();
-    const sel=document.getElementById('test-selector');
+    testCaseNames=cases.map(c=>c.name);
+    const list=document.getElementById('test-list');
+    list.innerHTML='';
     for(const tc of cases){
-      const opt=document.createElement('option');
-      opt.value=tc.name;
-      opt.textContent=tc.name+(tc.has_expected?' ✓':'');
-      sel.appendChild(opt);
+      const li=document.createElement('li');
+      li.dataset.name=tc.name;
+      li.innerHTML=`<span class="dot"></span>${tc.name}`;
+      li.onclick=()=>loadTestCase(tc.name);
+      list.appendChild(li);
     }
   }catch(e){}
+  loadEvalSummary();
+}
+
+// --- Load and display compact eval summary ---
+async function loadEvalSummary(){
+  try{
+    const r=await fetch('/eval-summary');
+    if(!r.ok)throw new Error();
+    const d=await r.json();
+    const pct=(d.correct/d.total_cells*100).toFixed(1);
+    const wrong=d.total_cells-d.correct;
+    document.getElementById('eval-summary-acc').textContent=
+      pct+'% ('+d.correct+'/'+d.total_cells+(wrong?' \u2022 '+wrong+' wrong':'')+')';
+    document.getElementById('eval-summary-time').textContent=relTime(d.timestamp);
+    document.getElementById('eval-summary-bar').style.display='block';
+    document.getElementById('eval-summary-none').style.display='none';
+    // apply pass/fail dots if case results available
+    if(d.cases){
+      const byName={};
+      for(const c of d.cases)byName[c.name]=c;
+      for(const li of document.querySelectorAll('#test-list li')){
+        const c=byName[li.dataset.name];
+        if(c){li.classList.toggle('pass',c.wrong===0);li.classList.toggle('fail',c.wrong>0);}
+      }
+    }
+  }catch(e){
+    document.getElementById('eval-summary-bar').style.display='none';
+    document.getElementById('eval-summary-none').style.display='block';
+  }
 }
 
 // --- Load and submit a test case image ---
@@ -1339,6 +1405,10 @@ async function loadTestCase(name){
   currentTestCase=name;
   expectedBoard=null;
   document.getElementById('diff-summary').style.display='none';
+  // highlight active in sidebar
+  for(const li of document.querySelectorAll('#test-list li')){
+    li.classList.toggle('active',li.dataset.name===name);
+  }
   // Fetch expected CGP
   try{
     const r=await fetch('/testdata-cgp/'+encodeURIComponent(name));
@@ -1397,6 +1467,7 @@ async function evalAllGemini(){
   if(!cases.length){results.innerHTML='<div style="color:#888">No test cases found.</div>';return;}
 
   let totalCells=0,totalCorrect=0,totalWrong=0,scoresCorrect=0,scoresTotal=0;
+  const caseResults=[];
   let h='<table class="test-results"><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>';
   results.innerHTML=h+'</table><div id="eval-running" style="color:#888;margin-top:8px">Starting...</div>';
 
@@ -1459,12 +1530,26 @@ async function evalAllGemini(){
     h+=`<tr><td>${tc.name}</td><td>${caseCells||'—'}</td><td>${caseCorrect||'—'}</td><td style="${wrongCol}">${caseWrong||'0'}</td><td>${pct}</td><td style="font-family:monospace">${expSc}</td><td style="font-family:monospace">${gotSc}</td><td>${scOk}</td></tr>`;
     if(diffs.length)h+=`<tr><td colspan="8" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`;
     totalCells+=caseCells;totalCorrect+=caseCorrect;totalWrong+=caseWrong;
+    caseResults.push({name:tc.name,cells:caseCells,correct:caseCorrect,wrong:caseWrong,diffs});
+    // update pass/fail dot in sidebar
+    for(const li of document.querySelectorAll('#test-list li')){
+      if(li.dataset.name===tc.name){li.classList.toggle('pass',caseWrong===0);li.classList.toggle('fail',caseWrong>0);}
+    }
     results.innerHTML=h+'</table><div id="eval-running" style="color:#888;margin-top:8px">Running...</div>';
   }
 
   const totPct=totalCells?((totalCorrect/totalCells)*100).toFixed(1)+'%':'—';
   h+=`<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td></tr>`;
   results.innerHTML=h+'</table>';
+
+  // Save eval results to server and refresh summary
+  try{
+    await fetch('/eval-save',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({total_cells:totalCells,correct:totalCorrect,
+        scores_correct:scoresCorrect,scores_total:scoresTotal,cases:caseResults})});
+  }catch(e){}
+  loadEvalSummary();
 }
 
 loadTestList();
@@ -4157,6 +4242,109 @@ int main(int argc, char* argv[]) {
 
         json += "]";
         res.set_content(json, "application/json");
+    });
+
+    // POST /eval-save — save eval results to testdata/last_eval.json
+    svr.Post("/eval-save", [](const httplib::Request& req, httplib::Response& res) {
+        fs::create_directories("testdata");
+        // Inject timestamp
+        std::string body = req.body;
+        // Insert timestamp field after opening {
+        auto pos = body.find('{');
+        if (pos != std::string::npos) {
+            time_t now = time(nullptr);
+            body.insert(pos + 1, "\"timestamp\":" + std::to_string(now) + ",");
+        }
+        std::ofstream ofs("testdata/last_eval.json");
+        ofs << body;
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
+    // GET /eval-summary — compact summary from last_eval.json
+    svr.Get("/eval-summary", [](const httplib::Request&, httplib::Response& res) {
+        std::string path = "testdata/last_eval.json";
+        if (!fs::exists(path)) { res.status = 404; return; }
+        std::ifstream ifs(path);
+        std::string body((std::istreambuf_iterator<char>(ifs)),
+                          std::istreambuf_iterator<char>());
+        res.set_content(body, "application/json");
+    });
+
+    // GET /eval — full eval results page
+    svr.Get("/eval", [](const httplib::Request&, httplib::Response& res) {
+        std::string path = "testdata/last_eval.json";
+        std::string json;
+        if (fs::exists(path)) {
+            std::ifstream ifs(path);
+            json.assign(std::istreambuf_iterator<char>(ifs),
+                        std::istreambuf_iterator<char>());
+        }
+        // Escape for embedding in JS
+        std::string json_esc;
+        for (char c : json) {
+            if (c == '\\') json_esc += "\\\\";
+            else if (c == '`') json_esc += "\\`";
+            else if (c == '$') json_esc += "\\$";
+            else json_esc += c;
+        }
+        std::string html = R"html(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>CGP Bot &mdash; Eval Results</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:#1a1a2e;color:#e0e0e0;min-height:100vh;padding:24px}
+h1{font-size:1.2rem;margin-bottom:6px;color:#fff}
+.back{font-size:.8rem;color:#58a6ff;text-decoration:none;display:inline-block;margin-bottom:20px}
+.summary{background:#16213e;border-radius:8px;padding:14px 20px;margin-bottom:20px;border:1px solid #2a2a4a;display:flex;gap:32px;align-items:center;flex-wrap:wrap}
+.stat-val{font-size:1.4rem;font-weight:700;color:#4c4}
+.stat-lbl{font-size:.7rem;color:#888;text-transform:uppercase;letter-spacing:.05em}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th,td{padding:6px 10px;border:1px solid #2a2a4a;text-align:left}
+th{background:#16213e;color:#888;font-size:.72rem;text-transform:uppercase}
+tr:hover td{background:#1a2540}
+.pass{color:#4c4}.fail{color:#f44}.mono{font-family:'SF Mono','Fira Code',monospace}
+.diff-row td{color:#f88;font-family:'SF Mono','Fira Code',monospace;font-size:.72rem;background:#1a1015;padding:3px 10px}
+.ts{font-size:.72rem;color:#666}
+</style></head><body>
+<a href="/" class="back">&larr; Back to test bench</a>
+<h1>Gemini Eval Results</h1>
+<div id="root"><p style="color:#666">No eval data found.</p></div>
+<script>
+function relTime(ts){
+  const d=Math.floor(Date.now()/1000-ts);
+  if(d<60)return 'just now';
+  if(d<3600)return Math.round(d/60)+'m ago';
+  if(d<86400)return Math.round(d/3600)+'h ago';
+  return Math.round(d/86400)+'d ago';
+}
+const DATA=)html" + (json.empty() ? "null" : json_esc) + R"html(;
+if(DATA){
+  const pct=(DATA.correct/DATA.total_cells*100).toFixed(1);
+  const wrong=DATA.total_cells-DATA.correct;
+  const ts=new Date(DATA.timestamp*1000).toLocaleString();
+  let h=`<div class="summary">
+    <div><div class="stat-val">${pct}%</div><div class="stat-lbl">Board accuracy</div></div>
+    <div><div class="stat-val" style="color:${wrong?'#f88':'#4c4'}">${wrong}</div><div class="stat-lbl">Wrong cells</div></div>
+    <div><div class="stat-val">${DATA.scores_correct}/${DATA.scores_total}</div><div class="stat-lbl">Scores correct</div></div>
+    <div style="margin-left:auto"><div class="ts">${ts}</div><div class="ts">${relTime(DATA.timestamp)}</div></div>
+  </div>`;
+  h+=`<table><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th></tr>`;
+  for(const c of DATA.cases||[]){
+    const cp=c.cells?((c.correct/c.cells)*100).toFixed(1)+'%':'—';
+    const wc=c.wrong>0?'fail':'pass';
+    h+=`<tr><td>${c.name}</td><td>${c.cells||'—'}</td><td>${c.correct||'—'}</td><td class="${wc}">${c.wrong||'0'}</td><td>${cp}</td></tr>`;
+    if(c.diffs&&c.diffs.length)
+      h+=`<tr class="diff-row"><td colspan="5">&nbsp;&nbsp;${c.diffs.join('&nbsp;&nbsp;')}</td></tr>`;
+  }
+  h+=`<tr style="font-weight:bold;border-top:2px solid #444">
+    <td>TOTAL</td><td>${DATA.total_cells}</td><td>${DATA.correct}</td>
+    <td class="${wrong?'fail':'pass'}">${wrong}</td><td>${pct}%</td></tr>`;
+  h+='</table>';
+  document.getElementById('root').innerHTML=h;
+}
+</script></body></html>)html";
+        res.set_content(html, "text/html");
     });
 
     // GET /testdata-list -> [{name, has_expected, has_image}]
