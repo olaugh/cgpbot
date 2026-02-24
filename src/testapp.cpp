@@ -707,6 +707,8 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
 .cell.has-tip{cursor:pointer}
 .cell.selected{outline:2px solid #ffeb3b;outline-offset:-2px;z-index:1}
 .cell.edited{box-shadow:inset 0 0 0 2px rgba(255,165,0,0.6)}
+.cell.diff-wrong{outline:2px solid #f44;outline-offset:-2px;z-index:1}
+.cell.diff-wrong .diff-exp{position:absolute;top:1px;left:2px;font-size:.45rem;color:#f88;font-weight:700}
 #tip{
   display:none;position:fixed;background:#0d1117;color:#c9d1d9;
   border:1px solid #444;border-radius:6px;padding:8px 10px;
@@ -740,9 +742,14 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
   <div>
     <div class="panel">
       <h2>Input</h2>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;font-size:.85rem">
-        <input type="checkbox" id="use-gemini" checked> Use Gemini Flash
-      </label>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.85rem">
+          <input type="checkbox" id="use-gemini" checked> Use Gemini Flash
+        </label>
+        <select id="test-selector" style="background:#0d1117;border:1px solid #444;color:#ccc;padding:3px 6px;border-radius:4px;font-size:.75rem;cursor:pointer" onchange="loadTestCase(this.value)">
+          <option value="">— Load test case —</option>
+        </select>
+      </div>
       <div id="drop-zone">
         <p>Drop a board screenshot here</p>
         <p style="font-size:.8rem;margin-top:8px">or click to select a file &mdash; also accepts image URLs (e.g. from Discord)</p>
@@ -777,17 +784,18 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
         <button class="btn" onclick="renderFromField()">Render</button>
         <button class="btn" onclick="copyCGP()">Copy</button>
         <button class="btn" onclick="saveTest()">Save Test</button>
-        <button class="btn" onclick="runTests()">Run Tests</button>
+        <button class="btn" onclick="evalAllGemini()">Eval All</button>
       </div>
       <textarea id="cgp-output" rows="3" spellcheck="false"></textarea>
     </div>
     <div class="panel" style="margin-top:20px">
       <h2>Board</h2>
       <div id="board-area"></div>
+      <div id="diff-summary" style="display:none;margin-top:10px;font-size:.75rem;font-family:'SF Mono','Fira Code',monospace"></div>
     </div>
-    <div id="test-results-panel" class="panel" style="margin-top:20px;display:none">
-      <h2>Test Results</h2>
-      <div id="test-results"></div>
+    <div id="eval-panel" class="panel" style="margin-top:20px;display:none">
+      <h2>Gemini Eval</h2>
+      <div id="eval-results"></div>
     </div>
   </div>
 </div>
@@ -827,6 +835,29 @@ let cellData=null;
 let boardLetters=Array.from({length:15},()=>Array(15).fill(''));
 let ocrLetters=null;   // snapshot after OCR, for showing edited indicators
 let selectedCell=null; // {r, c} or null
+
+// Test case tracking
+let currentTestCase=null;   // name of currently loaded test case, or null
+let expectedBoard=null;     // 15x15 array of expected letters (from testdata CGP), or null
+
+// Parse CGP board string -> 15x15 array of chars ('' = empty)
+function parseCGPBoard(cgp){
+  const board=Array.from({length:15},()=>Array(15).fill(''));
+  const boardStr=cgp.split(' ')[0];
+  const rows=boardStr.split('/');
+  for(let r=0;r<Math.min(rows.length,15);r++){
+    let c=0,i=0;
+    while(i<rows[r].length&&c<15){
+      const ch=rows[r][i];
+      if(ch>='0'&&ch<='9'){
+        let n=0;
+        while(i<rows[r].length&&rows[r][i]>='0'&&rows[r][i]<='9')n=n*10+parseInt(rows[r][i++]);
+        c+=n;
+      }else{board[r][c++]=ch;i++;}
+    }
+  }
+  return board;
+}
 let currentRack='';
 let currentLexicon='';
 let currentBag='';
@@ -954,6 +985,7 @@ async function processStream(res){
           renderBoard(data.cgp);
           ocrLetters=boardLetters.map(row=>[...row]);
           if(!data.status) status.textContent='Done.';
+          if(currentTestCase) updateDiffSummary(data.cgp);
         }
       }catch(e){}
     }
@@ -1111,9 +1143,13 @@ function renderBoardUI(){
       const selCls=sel?' selected':'';
       const edited=ocrLetters&&ocrLetters[r][c]!==boardLetters[r][c];
       const editCls=edited?' edited':'';
+      const expCh=expectedBoard&&expectedBoard[r]&&expectedBoard[r][c]||'';
+      const diffWrong=expCh&&(expCh!==ch); // expected has something that differs from got
+      const diffCls=diffWrong?' diff-wrong':'';
       if(!ch){
         const p=PREMIUM[r][c];
-        h+=`<div class="cell ${PCLS[p]}${selCls}${editCls}" data-r="${r}" data-c="${c}"><span class="lbl">${PLBL[p]}</span></div>`;
+        const expLabel=diffWrong?`<span class="diff-exp">${expCh.toUpperCase()}</span>`:'';
+        h+=`<div class="cell ${PCLS[p]}${selCls}${editCls}${diffCls}" data-r="${r}" data-c="${c}">${expLabel}<span class="lbl">${PLBL[p]}</span></div>`;
       }else{
         const blank=ch===ch.toLowerCase();
         const cls=blank?'blank-tile':'tile';
@@ -1125,7 +1161,8 @@ function renderBoardUI(){
           const ep=LETTER_PTS[ch.toUpperCase()];
           if(ep) sub=`<span class="sub" style="opacity:.35">${ep}</span>`;
         }
-        h+=`<div class="cell ${cls} ${hasTip}${selCls}${editCls}" data-r="${r}" data-c="${c}">${ch.toUpperCase()}${sub}</div>`;
+        const expLabel=diffWrong?`<span class="diff-exp">${expCh.toUpperCase()}</span>`:'';
+        h+=`<div class="cell ${cls} ${hasTip}${selCls}${editCls}${diffCls}" data-r="${r}" data-c="${c}">${expLabel}${ch.toUpperCase()}${sub}</div>`;
       }
     }
   }
@@ -1281,6 +1318,156 @@ function displayTestResults(results){
   panel.style.display='block';
 }
 
+// --- Load test cases into selector ---
+async function loadTestList(){
+  try{
+    const res=await fetch('/testdata-list');
+    const cases=await res.json();
+    const sel=document.getElementById('test-selector');
+    for(const tc of cases){
+      const opt=document.createElement('option');
+      opt.value=tc.name;
+      opt.textContent=tc.name+(tc.has_expected?' ✓':'');
+      sel.appendChild(opt);
+    }
+  }catch(e){}
+}
+
+// --- Load and submit a test case image ---
+async function loadTestCase(name){
+  if(!name)return;
+  currentTestCase=name;
+  expectedBoard=null;
+  document.getElementById('diff-summary').style.display='none';
+  // Fetch expected CGP
+  try{
+    const r=await fetch('/testdata-cgp/'+encodeURIComponent(name));
+    if(r.ok){const t=await r.text();expectedBoard=parseCGPBoard(t.trim());}
+  }catch(e){}
+  // Fetch image and submit
+  try{
+    const r=await fetch('/testdata-image/'+encodeURIComponent(name));
+    if(!r.ok){status.textContent='Error loading test image.';return;}
+    const blob=await r.blob();
+    const file=new File([blob],name+'.png',{type:'image/png'});
+    preview.src=URL.createObjectURL(blob);
+    preview.style.display='block';
+    handleFile(file);
+  }catch(e){status.textContent='Error: '+e.message;}
+}
+
+// --- Update diff summary after a result comes in ---
+function updateDiffSummary(gotCGP){
+  const ds=document.getElementById('diff-summary');
+  if(!expectedBoard||!gotCGP){ds.style.display='none';return;}
+  const got=parseCGPBoard(gotCGP);
+  const diffs=[];
+  for(let r=0;r<15;r++)for(let c=0;c<15;c++){
+    const e=expectedBoard[r][c]||'';
+    const g=got[r][c]||'';
+    if(e||g){
+      if(e!==g){
+        const pos=String.fromCharCode(65+c)+(r+1);
+        diffs.push(`${pos}:exp=${e||'.'} got=${g||'.'}`);
+      }
+    }
+  }
+  if(diffs.length===0){
+    ds.innerHTML='<span style="color:#4c4">\u2713 Board matches expected ('+currentTestCase+')</span>';
+  }else{
+    ds.innerHTML=`<span style="color:#f88">\u2717 ${diffs.length} diff(s) vs ${currentTestCase}: </span>`
+      +diffs.map(d=>`<span style="color:#f88">${d}</span>`).join(' ');
+  }
+  ds.style.display='block';
+}
+
+// --- Eval all test cases sequentially via Gemini ---
+async function evalAllGemini(){
+  const panel=document.getElementById('eval-panel');
+  const results=document.getElementById('eval-results');
+  panel.style.display='block';
+  results.innerHTML='<div style="color:#888">Running Gemini eval on all test cases...</div>';
+
+  let cases=[];
+  try{
+    const r=await fetch('/testdata-list');
+    cases=await r.json();
+  }catch(e){results.innerHTML='<div style="color:#f88">Error fetching test list.</div>';return;}
+
+  if(!cases.length){results.innerHTML='<div style="color:#888">No test cases found.</div>';return;}
+
+  let totalCells=0,totalCorrect=0,totalWrong=0,scoresCorrect=0,scoresTotal=0;
+  let h='<table class="test-results"><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>';
+  results.innerHTML=h+'</table><div id="eval-running" style="color:#888;margin-top:8px">Starting...</div>';
+
+  for(const tc of cases){
+    document.getElementById('eval-running').textContent='Running: '+tc.name+'...';
+    let expCGP='',expBoard=null,expScores=null;
+    if(tc.has_expected){
+      try{const r=await fetch('/testdata-cgp/'+encodeURIComponent(tc.name));expCGP=(await r.text()).trim();}catch(e){}
+      if(expCGP){
+        expBoard=parseCGPBoard(expCGP);
+        const sm=expCGP.match(/\/\s*(\d+)\s+(\d+)/);
+        if(sm)expScores=[parseInt(sm[1]),parseInt(sm[2])];
+      }
+    }
+    // Fetch image and submit to Gemini
+    let gotCGP='';
+    try{
+      const ir=await fetch('/testdata-image/'+encodeURIComponent(tc.name));
+      if(ir.ok){
+        const blob=await ir.blob();
+        const form=new FormData();
+        form.append('image',new File([blob],tc.name+'.png',{type:'image/png'}));
+        const resp=await fetch('/analyze-gemini',{method:'POST',body:form});
+        const text=await resp.text();
+        for(const line of text.trim().split('\n').reverse()){
+          try{const d=JSON.parse(line);if(d.cgp){gotCGP=d.cgp;break;}}catch(e){}
+        }
+      }
+    }catch(e){}
+
+    // Compare
+    let caseCells=0,caseCorrect=0,caseWrong=0;
+    const diffs=[];
+    if(expBoard&&gotCGP){
+      const got=parseCGPBoard(gotCGP);
+      for(let r=0;r<15;r++)for(let c=0;c<15;c++){
+        const e=expBoard[r][c]||'';
+        const g=got[r][c]||'';
+        if(e||g){
+          caseCells++;
+          if(e===g)caseCorrect++;
+          else{caseWrong++;diffs.push(String.fromCharCode(65+c)+(r+1)+':'+e+'→'+(g||'.'));}
+        }
+      }
+    }
+    const pct=caseCells?((caseCorrect/caseCells)*100).toFixed(1)+'%':'—';
+
+    // Scores
+    let expSc='—',gotSc='—',scOk='—';
+    if(expScores){
+      scoresTotal++;
+      const sm=gotCGP.match(/\/\s*(\d+)\s+(\d+)/);
+      const gs=sm?[parseInt(sm[1]),parseInt(sm[2])]:null;
+      expSc=expScores[0]+' '+expScores[1];
+      gotSc=gs?gs[0]+' '+gs[1]:'?';
+      if(gs&&gs[0]===expScores[0]&&gs[1]===expScores[1]){scOk='✓';scoresCorrect++;}
+      else scOk='<span style="color:#f88">✗</span>';
+    }
+    const wrongCol=caseWrong>0?'color:#f88':'color:#4c4';
+    h+=`<tr><td>${tc.name}</td><td>${caseCells||'—'}</td><td>${caseCorrect||'—'}</td><td style="${wrongCol}">${caseWrong||'0'}</td><td>${pct}</td><td style="font-family:monospace">${expSc}</td><td style="font-family:monospace">${gotSc}</td><td>${scOk}</td></tr>`;
+    if(diffs.length)h+=`<tr><td colspan="8" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`;
+    totalCells+=caseCells;totalCorrect+=caseCorrect;totalWrong+=caseWrong;
+    results.innerHTML=h+'</table><div id="eval-running" style="color:#888;margin-top:8px">Running...</div>';
+  }
+
+  const totPct=totalCells?((totalCorrect/totalCells)*100).toFixed(1)+'%':'—';
+  h+=`<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td></tr>`;
+  results.innerHTML=h+'</table>';
+}
+
+loadTestList();
 renderBoard('15/15/15/15/15/15/15/15/15/15/15/15/15/15/15');
 </script>
 </body>
@@ -3970,6 +4157,70 @@ int main(int argc, char* argv[]) {
 
         json += "]";
         res.set_content(json, "application/json");
+    });
+
+    // GET /testdata-list -> [{name, has_expected, has_image}]
+    svr.Get("/testdata-list", [](const httplib::Request&, httplib::Response& res) {
+        std::string json = "[";
+        bool first = true;
+        if (fs::exists("testdata")) {
+            std::vector<fs::directory_entry> entries;
+            for (const auto& e : fs::directory_iterator("testdata"))
+                if (e.path().extension() == ".cgp") entries.push_back(e);
+            std::sort(entries.begin(), entries.end());
+            for (const auto& entry : entries) {
+                std::string name = entry.path().stem().string();
+                // find image with any common extension
+                std::string img_path;
+                for (auto& ext : std::vector<std::string>{".png", ".jpg", ".jpeg"}) {
+                    std::string p = "testdata/" + name + ext;
+                    if (fs::exists(p)) { img_path = p; break; }
+                }
+                if (img_path.empty()) continue;
+                if (!first) json += ",";
+                first = false;
+                json += "{\"name\":\"" + json_escape(name) + "\""
+                    ",\"has_expected\":true"
+                    ",\"has_image\":true}";
+            }
+        }
+        json += "]";
+        res.set_content(json, "application/json");
+    });
+
+    // GET /testdata-image/:name -> serve the image file
+    svr.Get("/testdata-image/(.*)", [](const httplib::Request& req, httplib::Response& res) {
+        std::string name = req.matches[1];
+        // sanitize: no path traversal
+        if (name.find('/') != std::string::npos || name.find("..") != std::string::npos) {
+            res.status = 400; return;
+        }
+        std::string img_path;
+        std::string mime;
+        for (auto& [ext, m] : std::vector<std::pair<std::string,std::string>>{
+                {".png","image/png"},{".jpg","image/jpeg"},{".jpeg","image/jpeg"}}) {
+            std::string p = "testdata/" + name + ext;
+            if (fs::exists(p)) { img_path = p; mime = m; break; }
+        }
+        if (img_path.empty()) { res.status = 404; return; }
+        std::ifstream ifs(img_path, std::ios::binary);
+        std::vector<char> buf((std::istreambuf_iterator<char>(ifs)),
+                               std::istreambuf_iterator<char>());
+        res.set_content(std::string(buf.begin(), buf.end()), mime);
+    });
+
+    // GET /testdata-cgp/:name -> serve the expected CGP text
+    svr.Get("/testdata-cgp/(.*)", [](const httplib::Request& req, httplib::Response& res) {
+        std::string name = req.matches[1];
+        if (name.find('/') != std::string::npos || name.find("..") != std::string::npos) {
+            res.status = 400; return;
+        }
+        std::string path = "testdata/" + name + ".cgp";
+        if (!fs::exists(path)) { res.status = 404; return; }
+        std::ifstream ifs(path);
+        std::string cgp;
+        std::getline(ifs, cgp);
+        res.set_content(cgp, "text/plain");
     });
 
     const char* port_env = std::getenv("PORT");
