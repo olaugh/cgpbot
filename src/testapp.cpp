@@ -3517,6 +3517,21 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                                     { found = l; found_count++; }
                             }
                             dr.cells[sp.first][sp.second] = orig;
+                            if (found_count == 0) continue;
+                            // Multiple valid letters: use transposed OCR as tiebreaker
+                            if (found_count > 1 && have_transposed_ocr) {
+                                char t_ch = transposed_cells[sp.second][sp.first].letter;
+                                char t_u = t_ch ? static_cast<char>(std::toupper(
+                                    static_cast<unsigned char>(t_ch))) : 0;
+                                if (t_u && t_u != orig_upper) {
+                                    dr.cells[sp.first][sp.second].letter = t_u;
+                                    dr.cells[sp.first][sp.second].is_blank = false;
+                                    if (all_touching_valid({sp})) {
+                                        found = t_u; found_count = 1;
+                                    }
+                                    dr.cells[sp.first][sp.second] = orig;
+                                }
+                            }
                             if (found_count != 1) continue;
 
                             if (!wc_detail.empty()) wc_detail += ", ";
@@ -3556,6 +3571,27 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                             }
                             dr.cells[sp0.first][sp0.second] = orig0;
                             dr.cells[sp1.first][sp1.second] = orig1;
+                            if (found_count == 0) continue;
+                            // Multiple valid combos: use transposed OCR as tiebreaker
+                            if (found_count > 1 && have_transposed_ocr) {
+                                char t0 = transposed_cells[sp0.second][sp0.first].letter;
+                                char t1 = transposed_cells[sp1.second][sp1.first].letter;
+                                char t0u = t0 ? static_cast<char>(std::toupper(
+                                    static_cast<unsigned char>(t0))) : 0;
+                                char t1u = t1 ? static_cast<char>(std::toupper(
+                                    static_cast<unsigned char>(t1))) : 0;
+                                if (t0u && t1u) {
+                                    dr.cells[sp0.first][sp0.second].letter = t0u;
+                                    dr.cells[sp0.first][sp0.second].is_blank = false;
+                                    dr.cells[sp1.first][sp1.second].letter = t1u;
+                                    dr.cells[sp1.first][sp1.second].is_blank = false;
+                                    if (all_touching_valid({sp0, sp1})) {
+                                        found0 = t0u; found1 = t1u; found_count = 1;
+                                    }
+                                    dr.cells[sp0.first][sp0.second] = orig0;
+                                    dr.cells[sp1.first][sp1.second] = orig1;
+                                }
+                            }
                             if (found_count != 1) continue;
 
                             if (!wc_detail.empty()) wc_detail += ", ";
