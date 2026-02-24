@@ -1862,15 +1862,17 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         "\\n- The TILE TRACKING section (\\\"tiles in bag\\\" area) — read the letters "
         "listed there. They show remaining unseen tiles. Transcribe exactly, e.g. "
         "\\\"A E II O U B C D L N S TT X\\\"."
-        "\\n- The SCORES for both players. The current player (whose rack is shown) "
-        "has a colored score bar below their name. Read both scores as integers."
+        "\\n- The SCORES for both players. Find the two player panels in the UI. "
+        "The ON-TURN player's score number is shown on a GREEN background. "
+        "The waiting player's score is on a gray or inactive background. "
+        "Put the GREEN-background (on-turn) player's score FIRST."
         "\\n\\nReturn ONLY a JSON object with these fields:"
         "\\n{"
         "\\n  \\\"board\\\": [[...], ...],  // 15x15 array"
         "\\n  \\\"rack\\\": \\\"ABCDE?F\\\",  // current player rack (? = blank)"
         "\\n  \\\"lexicon\\\": \\\"NWL23\\\",  // lexicon name"
         "\\n  \\\"bag\\\": \\\"A E II O U B C D L N S TT X\\\",  // tile tracking text"
-        "\\n  \\\"scores\\\": [329, 351]  // [current player score, opponent score]"
+        "\\n  \\\"scores\\\": [351, 329]  // [ON-TURN player score (green bg), waiting player score]"
         "\\n}";
     prompt += "\\n\\nBoard array elements:";
     if (is_light_mode) {
