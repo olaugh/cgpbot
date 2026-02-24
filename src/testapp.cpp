@@ -1477,29 +1477,70 @@ function updateDiffSummary(gotCGP){
   ds.style.display='block';
 }
 
+// --- Eval helpers ---
+function stageAccFromBoards(cgpStr,expBoard){
+  if(!cgpStr||!expBoard)return null;
+  const got=parseCGPBoard(cgpStr);
+  let sc=0,st=0;
+  for(let r=0;r<15;r++)for(let c=0;c<15;c++){
+    const e=expBoard[r][c]||'',g=got[r][c]||'';
+    if(e||g){st++;if(e===g)sc++;}
+  }
+  return st?((sc/st)*100).toFixed(1):null;
+}
+function occAccFromBoards(occCGP,expBoard){
+  if(!occCGP||!expBoard)return null;
+  const occ=parseCGPBoard(occCGP);
+  let os=0;
+  for(let r=0;r<15;r++)for(let c=0;c<15;c++)
+    if(!!(expBoard[r][c])===!!(occ[r][c]))os++;
+  return ((os/225)*100).toFixed(1);
+}
+// Shared braille spinner for eval table cells
+let _evalSpinIv=null,_evalSpinF=0;
+function startEvalSpinner(){
+  if(_evalSpinIv)return;
+  _evalSpinF=0;
+  _evalSpinIv=setInterval(()=>{
+    _evalSpinF=(_evalSpinF+1)%BRAILLE.length;
+    for(const el of document.querySelectorAll('.eval-spin'))
+      el.textContent=BRAILLE[_evalSpinF];
+  },100);
+}
+function stopEvalSpinner(){
+  if(_evalSpinIv){clearInterval(_evalSpinIv);_evalSpinIv=null;}
+  for(const el of document.querySelectorAll('.eval-spin'))el.textContent='—';
+}
+const EVAL_SCOLS=['occ','raw','realigned','trans','retry','wc'];
+function evalSetCell(n,col,val){
+  const el=document.getElementById('ec-'+n+'-'+col);
+  if(el)el.innerHTML=val!=null?(val+'%'):'—';
+}
+
 // --- Eval all test cases sequentially via Gemini ---
 async function evalAllGemini(){
   const panel=document.getElementById('eval-panel');
   const results=document.getElementById('eval-results');
   panel.style.display='block';
-  results.innerHTML='<div style="color:#888">Running Gemini eval on all test cases...</div>';
 
   let cases=[];
-  try{
-    const r=await fetch('/testdata-list');
-    cases=await r.json();
-  }catch(e){results.innerHTML='<div style="color:#f88">Error fetching test list.</div>';return;}
-
+  try{const r=await fetch('/testdata-list');cases=await r.json();}
+  catch(e){results.innerHTML='<div style="color:#f88">Error fetching test list.</div>';return;}
   if(!cases.length){results.innerHTML='<div style="color:#888">No test cases found.</div>';return;}
+
+  const TH=`<tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th style="color:#68a">Occ%</th><th style="color:#68a">Raw%</th><th style="color:#68a">Align%</th><th style="color:#68a">Trans%</th><th style="color:#68a">Retry%</th><th style="color:#68a">WC%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>`;
+  results.innerHTML=`<table class="test-results" id="eval-table">${TH}</table><div id="eval-running" style="color:#888;margin-top:6px"></div>`;
+  const tbl=document.getElementById('eval-table');
+  startEvalSpinner();
 
   let totalCells=0,totalCorrect=0,totalWrong=0,scoresCorrect=0,scoresTotal=0;
   const caseResults=[];
-  let h='<table class="test-results"><tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th style="color:#68a">Occ%</th><th style="color:#68a">Raw%</th><th style="color:#68a">Align%</th><th style="color:#68a">Trans%</th><th style="color:#68a">Retry%</th><th style="color:#68a">WC%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>';
-  results.innerHTML=h+'</table><div id="eval-running" style="color:#888;margin-top:8px">Starting...</div>';
+  const SP=`<span class="eval-spin" style="color:#88f">${BRAILLE[0]}</span>`;
 
   for(const tc of cases){
     document.getElementById('eval-running').textContent='Running: '+tc.name+'...';
     startSpinner(tc.name);
+
     let expCGP='',expBoard=null,expScores=null;
     if(tc.has_expected){
       try{const r=await fetch('/testdata-cgp/'+encodeURIComponent(tc.name));expCGP=(await r.text()).trim();}catch(e){}
@@ -1509,117 +1550,115 @@ async function evalAllGemini(){
         if(sm)expScores=[parseInt(sm[1]),parseInt(sm[2])];
       }
     }
-    // Fetch image and submit to Gemini
+
+    // Pre-insert row with spinners
+    const n=tc.name;
+    const stCols=EVAL_SCOLS.map(col=>`<td id="ec-${n}-${col}">${SP}</td>`).join('');
+    tbl.insertAdjacentHTML('beforeend',
+      `<tr id="eval-row-${n}"><td>${n}</td>`
+      +`<td id="ec-${n}-cells">${SP}</td><td id="ec-${n}-correct">${SP}</td>`
+      +`<td id="ec-${n}-wrong">${SP}</td><td id="ec-${n}-pct">${SP}</td>`
+      +stCols
+      +`<td id="ec-${n}-exps" style="font-family:monospace">${expScores?expScores[0]+' '+expScores[1]:'—'}</td>`
+      +`<td id="ec-${n}-gots" style="font-family:monospace">${SP}</td>`
+      +`<td id="ec-${n}-scok">—</td></tr>`);
+
+    // Stream NDJSON and update cells as stages arrive
     let gotCGP='',stageCGPs={};
     try{
-      const ir=await fetch('/testdata-image/'+encodeURIComponent(tc.name));
+      const ir=await fetch('/testdata-image/'+encodeURIComponent(n));
       if(ir.ok){
         const blob=await ir.blob();
         const form=new FormData();
-        form.append('image',new File([blob],tc.name+'.png',{type:'image/png'}));
+        form.append('image',new File([blob],n+'.png',{type:'image/png'}));
         const resp=await fetch('/analyze-gemini',{method:'POST',body:form});
-        const text=await resp.text();
-        for(const line of text.trim().split('\n')){
-          try{const d=JSON.parse(line);
-            if(d.cgp) gotCGP=d.cgp;
-            if(d.raw_main_cgp) stageCGPs.raw=d.raw_main_cgp;
-            if(d.stage&&d.stage_cgp) stageCGPs[d.stage]=d.stage_cgp;
-            if(d.stage==='occupancy'&&d.occupancy_cgp) stageCGPs.occupancy=d.occupancy_cgp;
-          }catch(e){}
+        const reader=resp.body.getReader(),dec=new TextDecoder();
+        let buf='';
+        while(true){
+          const {done,value}=await reader.read();
+          if(done)break;
+          buf+=dec.decode(value,{stream:true});
+          let nl;
+          while((nl=buf.indexOf('\n'))>=0){
+            const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);
+            if(!line)continue;
+            try{const d=JSON.parse(line);
+              if(d.cgp)gotCGP=d.cgp;
+              if(d.raw_main_cgp){stageCGPs.raw=d.raw_main_cgp;evalSetCell(n,'raw',stageAccFromBoards(d.raw_main_cgp,expBoard));}
+              if(d.stage==='occupancy'&&d.occupancy_cgp){stageCGPs.occupancy=d.occupancy_cgp;evalSetCell(n,'occ',occAccFromBoards(d.occupancy_cgp,expBoard));}
+              if(d.stage&&d.stage_cgp){
+                stageCGPs[d.stage]=d.stage_cgp;
+                const m={realigned:'realigned',trans:'trans',retry:'retry',wc:'wc'};
+                if(m[d.stage])evalSetCell(n,m[d.stage],stageAccFromBoards(d.stage_cgp,expBoard));
+              }
+            }catch(e){}
+          }
         }
       }
     }catch(e){}
 
-    // Compare
-    let caseCells=0,caseCorrect=0,caseWrong=0;
-    const diffs=[];
+    // Final board comparison
+    let caseCells=0,caseCorrect=0,caseWrong=0;const diffs=[];
     if(expBoard&&gotCGP){
       const got=parseCGPBoard(gotCGP);
       for(let r=0;r<15;r++)for(let c=0;c<15;c++){
-        const e=expBoard[r][c]||'';
-        const g=got[r][c]||'';
-        if(e||g){
-          caseCells++;
-          if(e===g)caseCorrect++;
-          else{caseWrong++;diffs.push(String.fromCharCode(65+c)+(r+1)+':'+e+'→'+(g||'.'));}
-        }
+        const e=expBoard[r][c]||'',g=got[r][c]||'';
+        if(e||g){caseCells++;if(e===g)caseCorrect++;
+          else{caseWrong++;diffs.push(String.fromCharCode(65+c)+(r+1)+':'+e+'\u2192'+(g||'.'));}}
       }
     }
     const pct=caseCells?((caseCorrect/caseCells)*100).toFixed(1)+'%':'—';
-
-    // Per-stage accuracy
     const stageAccs={};
-    function stageCorrect(cgpStr){
-      if(!cgpStr||!expBoard)return null;
-      const got=parseCGPBoard(cgpStr);
-      let sc=0,st=0;
-      for(let r=0;r<15;r++)for(let c=0;c<15;c++){
-        const e=expBoard[r][c]||'',g=got[r][c]||'';
-        if(e||g){st++;if(e===g)sc++;}
-      }
-      return st?((sc/st)*100).toFixed(1):null;
-    }
-    // Occupancy: compare '?' present/absent vs expected occupied/empty
-    if(stageCGPs.occupancy&&expBoard){
-      const occ=parseCGPBoard(stageCGPs.occupancy);
-      let os=0,ot=225;
-      for(let r=0;r<15;r++)for(let c=0;c<15;c++){
-        const expOcc=!!(expBoard[r][c]),gotOcc=!!(occ[r][c]);
-        if(expOcc===gotOcc)os++;
-      }
-      stageAccs.occ=((os/ot)*100).toFixed(1);
-    }
+    const ov=occAccFromBoards(stageCGPs.occupancy,expBoard);if(ov)stageAccs.occ=ov;
     ['raw','realigned','trans','retry','wc'].forEach(sn=>{
-      const v=stageCorrect(sn==='raw'?stageCGPs.raw:stageCGPs[sn]);
+      const v=stageAccFromBoards(sn==='raw'?stageCGPs.raw:stageCGPs[sn],expBoard);
       if(v!=null)stageAccs[sn]=v;
     });
 
+    // Fill in main accuracy columns
+    const wc=caseWrong>0?'color:#f88':'color:#4c4';
+    document.getElementById(`ec-${n}-cells`).textContent=caseCells||'—';
+    document.getElementById(`ec-${n}-correct`).textContent=caseCorrect||'—';
+    document.getElementById(`ec-${n}-wrong`).innerHTML=`<span style="${wc}">${caseWrong||'0'}</span>`;
+    document.getElementById(`ec-${n}-pct`).textContent=pct;
+    // Clear any remaining spinners in stage cells
+    EVAL_SCOLS.forEach(col=>{const el=document.getElementById(`ec-${n}-${col}`);if(el&&el.querySelector('.eval-spin'))el.textContent='—';});
+    if(diffs.length)document.getElementById(`eval-row-${n}`)
+      .insertAdjacentHTML('afterend',`<tr><td colspan="14" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`);
+
     // Scores
-    let expSc='—',gotSc='—',scOk='—';
+    let gotSc='—',scOk='—';
     if(expScores){
       scoresTotal++;
       const sm=gotCGP.match(/\/\s*(\d+)\s+(\d+)/);
       const gs=sm?[parseInt(sm[1]),parseInt(sm[2])]:null;
-      expSc=expScores[0]+' '+expScores[1];
       gotSc=gs?gs[0]+' '+gs[1]:'?';
       if(gs&&gs[0]===expScores[0]&&gs[1]===expScores[1]){scOk='✓';scoresCorrect++;}
       else scOk='<span style="color:#f88">✗</span>';
     }
-    const wrongCol=caseWrong>0?'color:#f88':'color:#4c4';
-    function sa(k){return stageAccs[k]!=null?stageAccs[k]+'%':'—';}
-    const stageCols=`<td>${sa('occ')}</td><td>${sa('raw')}</td><td>${sa('realigned')}</td><td>${sa('trans')}</td><td>${sa('retry')}</td><td>${sa('wc')}</td>`;
-    h+=`<tr><td>${tc.name}</td><td>${caseCells||'—'}</td><td>${caseCorrect||'—'}</td><td style="${wrongCol}">${caseWrong||'0'}</td><td>${pct}</td>${stageCols}<td style="font-family:monospace">${expSc}</td><td style="font-family:monospace">${gotSc}</td><td>${scOk}</td></tr>`;
-    if(diffs.length)h+=`<tr><td colspan="14" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`;
+    document.getElementById(`ec-${n}-gots`).textContent=gotSc;
+    document.getElementById(`ec-${n}-scok`).innerHTML=scOk;
+
     totalCells+=caseCells;totalCorrect+=caseCorrect;totalWrong+=caseWrong;
-    const gotScMatch=gotCGP?gotCGP.match(/\/\s*(\d+)\s+(\d+)/):null;
-    caseResults.push({name:tc.name,cells:caseCells,correct:caseCorrect,wrong:caseWrong,diffs,
-      exp_cgp:caseWrong>0?expCGP.split(' ')[0]:'',
-      got_cgp:caseWrong>0?gotCGP.split(' ')[0]:'',
+    const gsm=gotCGP?gotCGP.match(/\/\s*(\d+)\s+(\d+)/):null;
+    caseResults.push({name:n,cells:caseCells,correct:caseCorrect,wrong:caseWrong,diffs,
+      exp_cgp:caseWrong>0?expCGP.split(' ')[0]:'',got_cgp:caseWrong>0?gotCGP.split(' ')[0]:'',
       exp_scores:expScores?expScores[0]+' '+expScores[1]:null,
-      got_scores:gotScMatch?gotScMatch[1]+' '+gotScMatch[2]:null,
-      stage_accs:stageAccs});
-    // update sidebar: stop spinner, set pass/fail
+      got_scores:gsm?gsm[1]+' '+gsm[2]:null,stage_accs:stageAccs});
     stopSpinner();
-    for(const li of document.querySelectorAll('#test-list li')){
-      if(li.dataset.name===tc.name){
-        li.classList.toggle('pass',caseWrong===0);
-        li.classList.toggle('fail',caseWrong>0);
-      }
-    }
-    results.innerHTML=h+'</table><div id="eval-running" style="color:#888;margin-top:8px">Running...</div>';
+    for(const li of document.querySelectorAll('#test-list li'))
+      if(li.dataset.name===n){li.classList.toggle('pass',caseWrong===0);li.classList.toggle('fail',caseWrong>0);}
   }
 
+  stopEvalSpinner();
+  document.getElementById('eval-running').textContent='';
   const totPct=totalCells?((totalCorrect/totalCells)*100).toFixed(1)+'%':'—';
-  h+=`<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="6"></td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td></tr>`;
-  results.innerHTML=h+'</table>';
+  tbl.insertAdjacentHTML('beforeend',
+    `<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="6"></td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td></tr>`);
 
-  // Save eval results to server and refresh summary
-  try{
-    await fetch('/eval-save',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({total_cells:totalCells,correct:totalCorrect,
-        scores_correct:scoresCorrect,scores_total:scoresTotal,cases:caseResults})});
-  }catch(e){}
+  try{await fetch('/eval-save',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({total_cells:totalCells,correct:totalCorrect,
+      scores_correct:scoresCorrect,scores_total:scoresTotal,cases:caseResults})});}catch(e){}
   loadEvalSummary();
 }
 
@@ -2220,8 +2259,10 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         "\\n- The SCORES for both players. To determine who is ON TURN:"
         "\\n  STEP 1 — Look at the TURN HISTORY list. Find the MOST RECENT move "
         "(the last entry at the bottom of the visible list). "
-        "IMPORTANT: the history may be scrolled — verify the last visible entry matches "
-        "the current scores (the running totals in the history should match the score boxes). "
+        "Each history entry shows a small avatar/icon next to it matching the player's avatar "
+        "in the player panel — use this to identify which player just moved. "
+        "IMPORTANT: the history may be scrolled — verify the last visible entry's cumulative "
+        "score matches the current score shown in that player's panel. "
         "That player just finished their turn — they are WAITING. "
         "The OTHER player is ON TURN."
         "\\n  STEP 2 — Confirm: the ON-TURN player's score box usually has a GREEN background."
