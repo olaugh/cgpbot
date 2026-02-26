@@ -70,6 +70,20 @@ target_link_libraries(cgpbot PRIVATE board_lib dpp)
 add_executable(cgptest src/testapp.cpp)
 target_link_libraries(cgptest PRIVATE board_lib httplib::httplib)
 
+# ── Occupancy test / diagnostics ─────────────────────────────────────────────
+
+add_executable(occ_test src/occ_test.cpp)
+target_link_libraries(occ_test PRIVATE board_lib)
+
+add_executable(occ_diag src/occ_diag.cpp)
+target_link_libraries(occ_diag PRIVATE board_lib)
+
+add_executable(color_survey src/color_survey.cpp)
+target_link_libraries(color_survey PRIVATE board_lib)
+
+add_executable(cell_hsv src/cell_hsv.cpp)
+target_link_libraries(cell_hsv PRIVATE board_lib)
+
 # ── Gemini parse unit tests ────────────────────────────────────────────────
 
 add_executable(test_gemini_parse tests/test_gemini_parse.cpp)

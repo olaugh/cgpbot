@@ -126,7 +126,13 @@ static double score_premium(const cv::Mat& hsv, cv::Rect r,
                 // Skip very dark (likely outside board)
                 if (val < 25) { score -= 0.5; continue; }
 
-                bool green  = (h >= 35 && h <= 90 && s > 30 && val > 25);
+                // Ground truth HSV from Woogles dark mode:
+                //   normal: H=0 S=0 V=49 (pure dark gray)
+                //   DL:  H=99  S=117 V=201  (blue-ish)
+                //   TL:  H=102 S=225 V=146  (saturated blue)
+                //   DW:  H=178 S=128 V=169  (cyan/red)
+                //   TW:  H=178 S=176 V=107  (cyan/red)
+                bool dark_gray = (s < 20 && val >= 35 && val <= 75);
                 bool red    = ((h < 12 || h > 162) && s > 50 && val > 35);
                 bool pink   = ((h < 15 || h > 158) && s > 15 && s < 160 && val > 100);
                 bool blue   = (h >= 85 && h <= 130 && s > 35 && val > 35);
@@ -136,17 +142,17 @@ static double score_premium(const cv::Mat& hsv, cv::Rect r,
                                   (col == 0 || col == 14));
 
                 if (prem == 0) {
-                    if (green) score += 1.0;
+                    if (dark_gray) score += 1.0;
                     else if (red || blue) score -= 2.0;
                 } else if (prem == 4 || prem == 5) {  // TW or center
                     if (red || pink) score += (is_corner ? 10.0 : 4.0);
-                    else if (green) score -= (is_corner ? 8.0 : 2.0);
+                    else if (dark_gray) score -= (is_corner ? 8.0 : 2.0);
                 } else if (prem == 3) {  // DW
                     if (pink) score += 2.5;
-                    else if (green) score -= 0.3;
+                    else if (dark_gray) score -= 0.3;
                 } else if (prem == 2) {  // TL
                     if (blue) score += 3.0;
-                    else if (green) score -= 0.3;
+                    else if (dark_gray) score -= 0.3;
                 } else if (prem == 1) {  // DL
                     if (ltblue) score += 2.0;
                 }
@@ -199,12 +205,12 @@ static double score_edges_light(const cv::Mat& hsv, cv::Rect r) {
 
                 if (prem == 0) {
                     if (white) score += 0.5;
-                    // Any non-white color in a normal cell = spillover.
-                    // Catches premium colors AND tile/purple slivers.
-                    // Tiles on normal cells cause equal penalty at any offset
-                    // (tile fills cell regardless), so this correctly drives
-                    // the search toward minimal spillover.
-                    if (!white && s > 20 && val > 60) score -= 2.0;
+                    // No penalty for non-white in normal cells: tile colors
+                    // vary widely across themes (off-white in standard light,
+                    // golden/orange in Memento) and would swamp the signal on
+                    // tile-heavy boards.  Correct alignment is indicated by
+                    // maximizing white at normal edges + premium colors at
+                    // premium edges — purely reward-based.
                 } else if (prem == 4 || prem == 5) {
                     if (red_pink) score += 2.0 * w;
                     if (white) score -= 1.0 * w;
@@ -352,18 +358,25 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
             search = r;
         }
     }
-    // For tall (mobile) images, contour detection often picks up non-board
-    // UI elements.  Use a generous search area covering the upper portion.
-    bool is_mobile = (img.rows > img.cols * 3 / 2);
-    if (best_area == 0 || is_mobile) {
-        if (is_mobile) {
-            // Board is in the upper portion, spans most of the width.
-            int h = img.rows * 3 / 4;
-            search = cv::Rect(0, 0, img.cols, h);
-        } else {
-            int side = std::min(img.cols * 2 / 3, img.rows);
-            search = cv::Rect(0, 0, side, side);
-        }
+    // Determine if the board likely fills the image width (mobile/memento).
+    // Pure aspect ratio is unreliable with cropped screenshots — a desktop
+    // crop can be portrait (531x633) and a mobile crop may only be 1.3:1.
+    // Use portrait orientation + absolute width: real mobile screenshots and
+    // memento share images are >=800px wide; desktop crops are smaller.
+    bool is_portrait = (img.rows > img.cols);
+    bool wide_board = (img.rows > img.cols * 3 / 2)          // very tall → always mobile
+                   || (is_portrait && img.cols >= 800);       // moderately tall + wide
+
+    // For wide-board images, contour detection often picks up player cards
+    // or partial board areas.  Use a generous full-width search area.
+    // For desktop images, dark mode contour detection is unreliable (may
+    // anchor to a UI element right of the board, making the actual board
+    // position unreachable).  Always search from (0,0).
+    if (wide_board) {
+        int h = img.rows * 3 / 4;
+        search = cv::Rect(0, 0, img.cols, h);
+    } else {
+        search = cv::Rect(0, 0, img.cols, img.rows);
     }
     log << "Search area: " << search.x << "," << search.y
         << " " << search.width << "x" << search.height << "\n";
@@ -406,22 +419,23 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
     // already handles color differences via is_light.
 
     int max_x_offset, max_y_offset, min_size, max_size;
-    if (is_mobile) {
-        // Mobile: board is ~90% of width, Y position varies (after status/player info)
+    if (wide_board) {
+        // Wide-board: board fills ~85-95% of width, Y position varies.
         max_x_offset = img.cols / 8;
         max_y_offset = img.rows / 2;
-        min_size = img.cols * 80 / 100;
-        max_size = std::min(img.cols, img.rows * 2 / 3);
+        min_size = img.cols * 75 / 100;
+        max_size = img.cols;  // loop y-bounds enforce height constraint
     } else {
-        max_x_offset = search.width / 3;
-        max_y_offset = max_x_offset;
-        min_size = search.width * 55 / 100;
-        max_size = std::min({search.width, search.height,
-                             img.cols - search.x, img.rows - search.y});
+        // Desktop: board occupies 50-95% of image width, starts near top-left.
+        // Search the full image for the board position.
+        max_x_offset = img.cols / 3;
+        max_y_offset = img.rows / 3;
+        min_size = std::min(img.cols, img.rows) * 50 / 100;
+        max_size = std::min(img.cols, img.rows);
     }
 
-    int coarse_x_step = std::max(3, max_x_offset / (is_mobile ? 15 : 20));
-    int coarse_y_step = std::max(3, max_y_offset / (is_mobile ? 40 : 20));
+    int coarse_x_step = std::max(3, max_x_offset / (wide_board ? 15 : 20));
+    int coarse_y_step = std::max(3, max_y_offset / (wide_board ? 40 : 20));
     int coarse_size_step = std::max(3, (max_size - min_size) / 15);
 
     cv::Rect best_rect(search.x, search.y, max_size, max_size);
@@ -446,7 +460,7 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
         << "x" << best_rect.height << "\n";
 
     // ── Step 3: Fine grid search around the best coarse result ──────────
-    int coarse_step_for_fine = is_mobile ? std::max(coarse_x_step, coarse_y_step)
+    int coarse_step_for_fine = wide_board ? std::max(coarse_x_step, coarse_y_step)
                                          : coarse_x_step;  // desktop: x=y
     int fine_pos = coarse_step_for_fine * 2;
     int fine_pos_step = std::max(1, coarse_step_for_fine / 3);
@@ -483,7 +497,7 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
         double prec_score = is_light ? score_edges_light(hsv, best_rect)
                                      : score_premium(hsv, best_rect, false);
 
-        int size_range = is_mobile ? 15 : 5;
+        int size_range = wide_board ? 15 : 5;
         {
             int n_threads = std::max(1u, std::thread::hardware_concurrency());
             struct ThreadResult { cv::Rect rect; double score; };
@@ -692,12 +706,40 @@ static tesseract::TessBaseAPI* get_tess() {
 }
 #endif
 
-static bool is_tile(const cv::Mat& cell, bool is_light, int row, int col,
+static bool is_tile(const cv::Mat& cell, bool is_light, int /*row*/, int /*col*/,
                     std::ostringstream& /*log*/) {
+    // Corner check (light mode): sample the 4 corners of the inset cell.
+    // If corners show pure premium-square background color, the cell is empty
+    // regardless of what appears in the center (badges, tooltips, etc.).
+    // Real tiles always extend to the corners; UI overlays typically don't.
+    // Same color condition as the center is_pink filter, with the same V>160
+    // threshold that distinguishes empty premium squares (V~200+) from dark
+    // Memento blank tiles (V~120) and crabcat blank tiles (H=145, not pink).
+    if (is_light && cell.channels() == 3) {
+        int kw = std::max(1, cell.cols / 5);
+        int kh = std::max(1, cell.rows / 5);
+        cv::Rect patches[4] = {
+            {0,              0,              kw, kh},
+            {cell.cols - kw, 0,              kw, kh},
+            {0,              cell.rows - kh, kw, kh},
+            {cell.cols - kw, cell.rows - kh, kw, kh},
+        };
+        float ch = 0, cs = 0, cv_val = 0;
+        for (auto& p : patches) {
+            cv::Mat hsv_p;
+            cv::cvtColor(cell(p), hsv_p, cv::COLOR_BGR2HSV);
+            cv::Scalar m = cv::mean(hsv_p);
+            ch += m[0]; cs += m[1]; cv_val += m[2];
+        }
+        ch /= 4; cs /= 4; cv_val /= 4;
+        bool corner_is_premium = ((ch < 12 || ch > 155) && cs > 25 && cv_val > 160);
+        if (corner_is_premium) return false;
+    }
+
     int cx = cell.cols / 5, cy = cell.rows / 5;
-    int cw = cell.cols * 3 / 5, ch = cell.rows * 3 / 5;
-    if (cw <= 0 || ch <= 0) return false;
-    cv::Mat center = cell(cv::Rect(cx, cy, cw, ch));
+    int cw = cell.cols * 3 / 5, ch_inner = cell.rows * 3 / 5;
+    if (cw <= 0 || ch_inner <= 0) return false;
+    cv::Mat center = cell(cv::Rect(cx, cy, cw, ch_inner));
 
     cv::Mat gray;
     if (center.channels() == 3)
@@ -710,54 +752,38 @@ static bool is_tile(const cv::Mat& cell, bool is_light, int row, int col,
     double brightness = mean_val[0];
     double contrast = stddev_val[0];
 
-    if (brightness < 80 || contrast < 8) return false;
+    // Ground truth from color_survey across all board styles:
+    //   Empty cells (including all premium types): contrast 0-5
+    //   Tiles (all styles, all premiums):          contrast 37+
+    // Tiles always show a printed letter creating visible contrast.
+    // Empty premium squares are solid-colored with near-zero contrast.
 
-    if (center.channels() == 3) {
-        cv::Mat hsv;
-        cv::cvtColor(center, hsv, cv::COLOR_BGR2HSV);
-        cv::Scalar hmean = cv::mean(hsv);
-        double h = hmean[0], s = hmean[1], v = hmean[2];
+    // Reject very dark cells (outside board area or dark TW empties at bri=56)
+    if (brightness < 50) return false;
 
-        if (is_light) {
-            // Reject pink DW/TW squares (even with tooltip/"2x word" text)
-            bool is_pink = ((h < 12 || h > 155) && s > 25 && v > 100);
+    // Primary discriminator: contrast from printed letter
+    if (contrast >= 35) {
+        // Reject light-mode UI overlays that create spurious contrast.
+        if (center.channels() == 3 && is_light) {
+            cv::Mat hsv;
+            cv::cvtColor(center, hsv, cv::COLOR_BGR2HSV);
+            cv::Scalar hmean = cv::mean(hsv);
+            double h = hmean[0], s = hmean[1], v = hmean[2];
+            // Pink/red: empty DW/TW premium squares with tooltip text.
+            // Blank tiles on Memento DW/TW appear orange-red (H<12) but are
+            // much darker (V~120) than empty premium squares (V~246).
+            bool is_pink = ((h < 12 || h > 155) && s > 25 && v > 160);
             if (is_pink) return false;
-
-            // Normal tiles: beige/tan
-            bool is_beige = (h >= 8 && h <= 40 && s >= 15 && s <= 140 && v > 140);
-            // Recently committed move: gold/orange ~(H14-19,S141-200,V173-240).
-            // H starts at 8 (not 15) to catch borderline gold tiles.
-            bool is_gold = (h >= 8 && h <= 45 && s > 100 && v > 160);
-            if ((is_beige || is_gold) && contrast > 15) return true;
-
-            // Older recently-played tiles: blue/purple tint (H ~80-150).
-            // Observed: H=78-98 for cyan-blue (V up to 213), H=116-146 for purple.
-            // Empty premium squares have contrast=0; tiles have 30-85+.
-            // Exclude DW/TW tooltips: low saturation + very bright (S<70, V>210).
-            bool is_played = (h >= 78 && h <= 150 && s > 30 && v > 80);
-            if (is_played && contrast > 30 && !(s < 70 && v > 210)) {
-                // Reject empty TLS/DL squares that look like played tiles.
-                // Empty TLS: V >= 168, played tiles: V <= 159. Use 163 as
-                // threshold (middle of the 9-unit gap).
-                int prem = PREMIUM[row][col];
-                if ((prem == 1 || prem == 2) && v >= 163) return false;
-                return true;
-            }
-
-            return false;
+            // Gray overlay: toasts and exchange-notification popups covering
+            // the board are nearly desaturated (S<35) and very bright (V>200).
+            // (More aggressive S thresholds risk catching blank tiles whose HSV
+            // overlaps with premium-square tooltip colors in some themes.)
+            bool is_gray_overlay = (s < 35 && v > 200);
+            if (is_gray_overlay) return false;
         }
-
-        bool is_beige = (h >= 8 && h <= 40 && s >= 15 && s <= 140 && v > 140);
-        bool is_cream = (s < 30 && v > 180);
-        bool is_gold = (h >= 15 && h <= 45 && s > 100 && v > 160);
-
-        if ((is_beige || is_cream || is_gold) && contrast > 15) return true;
-        // Dark mode recently-played tiles: low-saturation blue/purple tint
-        // (H~120, S~14, V~150, contrast 41-54). Empty cells all have contrast=0.
-        if (contrast > 40) return true;
-    } else {
-        if (brightness > 170 && contrast > 20) return true;
+        return true;
     }
+
     return false;
 }
 

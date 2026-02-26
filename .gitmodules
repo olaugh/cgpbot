@@ -1,3 +1,6 @@
 [submodule "magpie"]
 	path = magpie
 	url = https://github.com/jvc56/MAGPIE.git
+[submodule "liwords"]
+	path = liwords
+	url = https://github.com/woogles-io/liwords.git
