@@ -68,7 +68,7 @@ public:
         if (word.size() < 2 || nodes_.empty()) return false;
         // DAWG root = arc_index of node[0]
         uint32_t idx = arc_index(nodes_[0]);
-        if (idx == 0) return false;
+        if (idx == 0 || idx >= nodes_.size()) return false;
 
         int lidx = 0;
         uint32_t node = nodes_[idx];
@@ -76,15 +76,17 @@ public:
         while (true) {
             if (lidx > wlen - 1) return false;
             uint32_t ml = static_cast<uint32_t>(word[lidx] - 'A' + 1);
+            if (ml < 1 || ml > 26) return false; // not A-Z
             if (tile(node) == ml) {
                 if (lidx == wlen - 1) return accepts(node);
                 idx = arc_index(node);
-                if (idx == 0) return false;
+                if (idx == 0 || idx >= nodes_.size()) return false;
                 node = nodes_[idx];
                 lidx++;
             } else {
                 if (is_end(node)) return false;
                 idx++;
+                if (idx >= nodes_.size()) return false;
                 node = nodes_[idx];
             }
         }
@@ -517,11 +519,6 @@ static bool parse_board_rect_from_log(const std::string& log,
                                        int* board_h = nullptr);
 static bool detect_board_mode(const std::vector<uint8_t>& image_data,
                                int bx, int by, int cell_sz);
-static void detect_tiles_by_color(const std::vector<uint8_t>& image_data,
-                                   int bx, int by, int cell_sz,
-                                   bool occupied[15][15],
-                                   bool is_light_mode, int board_w);
-
 // ---------------------------------------------------------------------------
 // Run all test cases from testdata/ directory (CLI mode).
 // ---------------------------------------------------------------------------
@@ -563,17 +560,6 @@ static int run_tests_cli() {
 
         DebugResult dr = process_board_image_debug(img_data);
 
-        // Color-based occupancy detection (same as Gemini pipeline)
-        bool color_occupied[15][15] = {};
-        bool have_color = false;
-        int bx, by, cell_sz, board_w = 0;
-        if (parse_board_rect_from_log(dr.log, bx, by, cell_sz, &board_w)) {
-            bool is_light = detect_board_mode(img_data, bx, by, cell_sz);
-            detect_tiles_by_color(img_data, bx, by, cell_sz, color_occupied,
-                                  is_light, board_w);
-            have_color = true;
-        }
-
         auto expected = parse_cgp_board(expected_cgp);
 
         int occ_expected = 0, occ_correct = 0, occ_false_pos = 0;
@@ -581,8 +567,7 @@ static int run_tests_cli() {
         for (int r = 0; r < 15; r++) {
             for (int c = 0; c < 15; c++) {
                 bool exp_occ = (expected[r][c] != 0);
-                bool got_occ = have_color ? color_occupied[r][c]
-                                          : (dr.cells[r][c].letter != 0);
+                bool got_occ = (dr.cells[r][c].letter != 0);
                 if (exp_occ) {
                     occ_expected++;
                     if (got_occ) occ_correct++;
@@ -811,6 +796,7 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
         <button class="btn" onclick="copyCGP()">Copy</button>
         <button class="btn" onclick="saveTest()">Save Test</button>
         <button class="btn" onclick="evalAllGemini()">Eval All</button>
+        <button class="btn" id="eval-stop-btn" onclick="evalStop()" style="display:none;background:#a33">Stop Eval</button>
       </div>
       <textarea id="cgp-output" rows="3" spellcheck="false"></textarea>
     </div>
@@ -1517,8 +1503,14 @@ function evalSetCell(n,col,val){
   if(el)el.innerHTML=val!=null?(val+'%'):'—';
 }
 
+// --- Eval stop ---
+let _evalStopped=false;
+function evalStop(){_evalStopped=true;document.getElementById('eval-stop-btn').style.display='none';}
+
 // --- Eval all test cases sequentially via Gemini ---
 async function evalAllGemini(){
+  _evalStopped=false;
+  document.getElementById('eval-stop-btn').style.display='';
   const panel=document.getElementById('eval-panel');
   const results=document.getElementById('eval-results');
   panel.style.display='block';
@@ -1538,6 +1530,7 @@ async function evalAllGemini(){
   const SP=`<span class="eval-spin" style="color:#88f">${BRAILLE[0]}</span>`;
 
   for(const tc of cases){
+    if(_evalStopped){document.getElementById('eval-running').textContent='Stopped.';break;}
     document.getElementById('eval-running').textContent='Running: '+tc.name+'...';
     startSpinner(tc.name);
 
@@ -1651,6 +1644,7 @@ async function evalAllGemini(){
   }
 
   stopEvalSpinner();
+  document.getElementById('eval-stop-btn').style.display='none';
   document.getElementById('eval-running').textContent='';
   const totPct=totalCells?((totalCorrect/totalCells)*100).toFixed(1)+'%':'—';
   tbl.insertAdjacentHTML('beforeend',
@@ -1782,109 +1776,6 @@ static bool detect_board_mode(const std::vector<uint8_t>& image_data,
 // where subscript lives) give the background color without letter
 // interference, avoiding mis-detection of heavy letters like W/M.
 // ---------------------------------------------------------------------------
-static void detect_tiles_by_color(const std::vector<uint8_t>& image_data,
-                                   int bx, int by, int cell_sz,
-                                   bool occupied[15][15],
-                                   bool is_light_mode = false,
-                                   int board_w = 0) {
-    cv::Mat raw(1, static_cast<int>(image_data.size()), CV_8UC1,
-                const_cast<uint8_t*>(image_data.data()));
-    cv::Mat img = cv::imdecode(raw, cv::IMREAD_COLOR);
-    if (img.empty()) {
-        for (int r = 0; r < 15; r++)
-            for (int c = 0; c < 15; c++)
-                occupied[r][c] = false;
-        return;
-    }
-
-    cv::Mat hsv;
-    cv::cvtColor(img, hsv, cv::COLOR_BGR2HSV);
-
-    // Subpixel cell width: use board_w if provided, else cell_sz.
-    double cell_w = (board_w > 0) ? board_w / 15.0 : static_cast<double>(cell_sz);
-    double inset_frac = 0.15;
-
-    for (int r = 0; r < 15; r++) {
-        for (int c = 0; c < 15; c++) {
-            // Subpixel cell boundaries with inset
-            double fx0 = bx + c * cell_w + cell_w * inset_frac;
-            double fy0 = by + r * cell_w + cell_w * inset_frac;
-            double fx1 = bx + (c + 1) * cell_w - cell_w * inset_frac;
-            double fy1 = by + (r + 1) * cell_w - cell_w * inset_frac;
-
-            int x0 = std::clamp(static_cast<int>(fx0), 0, img.cols - 1);
-            int y0 = std::clamp(static_cast<int>(fy0), 0, img.rows - 1);
-            int x1 = std::clamp(static_cast<int>(fx1), 1, img.cols);
-            int y1 = std::clamp(static_cast<int>(fy1), 1, img.rows);
-
-            if (x1 <= x0 || y1 <= y0) {
-                occupied[r][c] = false;
-                continue;
-            }
-
-            cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
-
-            // Brightness contrast — tiles have letter text
-            cv::Mat gray;
-            cv::cvtColor(img(roi), gray, cv::COLOR_BGR2GRAY);
-            cv::Scalar gm, gs;
-            cv::meanStdDev(gray, gm, gs);
-
-            // Corner-sampled HSV: average of top-left, top-right,
-            // bottom-left corners (skip bottom-right where subscript
-            // lives).  Gives background color immune to heavy-letter
-            // interference for both light and dark modes.
-            int rw = x1 - x0, rh = y1 - y0;
-            int csz = std::max(2, std::min(rw, rh) / 5);
-            cv::Scalar c_tl = cv::mean(hsv(cv::Rect(x0, y0, csz, csz)));
-            cv::Scalar c_tr = cv::mean(hsv(cv::Rect(x1-csz, y0, csz, csz)));
-            cv::Scalar c_bl = cv::mean(hsv(cv::Rect(x0, y1-csz, csz, csz)));
-            double h = (c_tl[0] + c_tr[0] + c_bl[0]) / 3.0;
-            double s = (c_tl[1] + c_tr[1] + c_bl[1]) / 3.0;
-            double v = (c_tl[2] + c_tr[2] + c_bl[2]) / 3.0;
-
-            // Center sample — blank tiles have a colored circle here
-            int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-            cv::Scalar c_center = cv::mean(hsv(cv::Rect(cx - csz/2, cy - csz/2, csz, csz)));
-            double ch = c_center[0], cs_val = c_center[1], cv_val = c_center[2];
-
-            if (is_light_mode) {
-                // Require gs[0] > 10 to exclude empty premium squares
-                // (TLS/DL) which share similar H/S/V but have no letter text.
-                bool is_blue_tile = (h >= 95 && h <= 145 && s > 30 &&
-                                     v >= 40 && v <= 210 && gs[0] > 10);
-                // Blank tile: tile-colored corners (blue) + lavender circle center
-                bool corner_is_tile = (h >= 95 && h <= 145 && s > 30 && v >= 40);
-                bool center_is_lavender = (ch >= 120 && ch <= 160 && cs_val > 15 && cv_val > 150);
-                bool is_blank = corner_is_tile && center_is_lavender;
-                bool is_orange = (h >= 8 && h <= 35 && s > 60 && v > 140);
-                bool has_text = (gs[0] > 15 && v < 190 && s > 25);
-
-                occupied[r][c] = is_blue_tile || is_blank ||
-                                 is_orange || has_text;
-            } else {
-                // Tile: warm beige — recently-played / golden tiles
-                bool is_beige = (h >= 8 && h <= 38 && s > 40 && v > 130);
-                // Tile: bright desaturated — normal tiles in dark mode have
-                // cream/off-white corners (S≈15, V≈186) while premium squares
-                // are all strongly saturated (S>100).
-                bool is_light_tile = (s < 30 && v > 130);
-                // Blank tile: tile-colored corners + purple circle center
-                bool corner_is_tile = is_beige || is_light_tile;
-                bool center_is_purple = (ch >= 120 && ch <= 160 && cs_val > 30 && cv_val > 60);
-                bool is_blank = corner_is_tile && center_is_purple;
-                // High internal contrast on a light, desaturated background
-                // — but exclude empty board cells (H≈120-150, S<30) which
-                // have gs≈40-57 from grid lines.
-                bool has_text = (gs[0] > 20 && gm[0] > 110 && s >= 30);
-
-                occupied[r][c] = is_beige || is_light_tile || is_blank || has_text;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Detect rack tiles below the board by scanning for beige/tan rectangles.
 // Returns cropped images + bounding rects for each rack tile found.
 // ---------------------------------------------------------------------------
@@ -2003,14 +1894,131 @@ static void draw_rack_debug(std::vector<uint8_t>& debug_png,
 }
 
 // ---------------------------------------------------------------------------
-// Gemini Flash analysis with color-based occupancy assist.
-// 1. Run OpenCV for board rect, then color-based tile detection
-// 2. Show occupancy mask on board while waiting for Gemini
-// 3. Include occupancy grid in Gemini prompt
-// 4. Enforce occupancy mask on Gemini results
+// Word-crop OCR helpers: crop each word run and send to Gemini.
+// ---------------------------------------------------------------------------
+struct WordRun {
+    bool horizontal;
+    int r;      // row (horiz), -1 for vert
+    int c;      // col (vert),  -1 for horiz
+    int start;  // start col (horiz) or start row (vert)
+    int end;    // end col/row (inclusive)
+    std::string label;  // e.g. "H11H" (horiz row 11, col H) or "VH12" (vert col H, row 12)
+    int length() const { return end - start + 1; }
+};
+
+static std::vector<WordRun> find_word_runs(
+        const std::function<bool(int,int)>& occ) {
+    static const char COL[] = "ABCDEFGHIJKLMNO";
+    std::vector<WordRun> runs;
+    for (int r = 0; r < 15; r++) {
+        for (int c = 0; c < 15; ) {
+            if (!occ(r, c)) { c++; continue; }
+            int c2 = c;
+            while (c2 < 15 && occ(r, c2)) c2++;
+            WordRun wr; wr.horizontal = true; wr.r = r; wr.c = -1;
+            wr.start = c; wr.end = c2 - 1;
+            wr.label = "H" + std::to_string(r + 1) + COL[c];
+            runs.push_back(wr); c = c2;
+        }
+    }
+    for (int c = 0; c < 15; c++) {
+        for (int r = 0; r < 15; ) {
+            if (!occ(r, c)) { r++; continue; }
+            int r2 = r;
+            while (r2 < 15 && occ(r2, c)) r2++;
+            WordRun wr; wr.horizontal = false; wr.c = c; wr.r = -1;
+            wr.start = r; wr.end = r2 - 1;
+            wr.label = "V" + std::string(1, COL[c]) + std::to_string(r + 1);
+            runs.push_back(wr); r = r2;
+        }
+    }
+    return runs;
+}
+
+// img: original board image (for horizontal words).
+// transposed: cell-level transposed image where col C of board becomes row C
+//             (for vertical words — letters stay upright, no rotation needed).
+// cs_t: uniform cell size (pixels) used in the transposed image.
+static std::vector<uint8_t> crop_word_run(
+        const cv::Mat& img, const cv::Mat& transposed, int cs_t,
+        const WordRun& wr,
+        int bx, int by, double cw, double ch) {
+    cv::Mat crop;
+    if (wr.horizontal) {
+        auto cx = [&](int col) { return bx + (int)std::round(col * cw); };
+        auto cy = [&](int row) { return by + (int)std::round(row * ch); };
+        int x0 = cx(wr.start), y0 = cy(wr.r);
+        int pw = cx(wr.end + 1) - x0, ph = cy(wr.r + 1) - y0;
+        x0 = std::max(0, x0); y0 = std::max(0, y0);
+        if (x0 + pw > img.cols) pw = img.cols - x0;
+        if (y0 + ph > img.rows) ph = img.rows - y0;
+        if (pw <= 0 || ph <= 0) return {};
+        crop = img(cv::Rect(x0, y0, pw, ph)).clone();
+    } else {
+        // Vertical word: crop from transposed image where board column C is row C.
+        // Letters are upright — no rotation needed.
+        if (transposed.empty() || cs_t <= 0) return {};
+        int x0 = wr.start * cs_t, y0 = wr.c * cs_t;
+        int pw = wr.length() * cs_t, ph = cs_t;
+        x0 = std::max(0, x0); y0 = std::max(0, y0);
+        if (x0 + pw > transposed.cols) pw = transposed.cols - x0;
+        if (y0 + ph > transposed.rows) ph = transposed.rows - y0;
+        if (pw <= 0 || ph <= 0) return {};
+        crop = transposed(cv::Rect(x0, y0, pw, ph)).clone();
+    }
+    // Normalize to 80px tall per cell for compact, consistent payloads
+    const int STD_H = 80;
+    if (crop.rows != STD_H) {
+        double scale = (double)STD_H / crop.rows;
+        cv::resize(crop, crop, cv::Size((int)(crop.cols * scale), STD_H),
+                   0, 0, cv::INTER_AREA);
+    }
+    std::vector<uint8_t> png;
+    cv::imencode(".png", crop, png);
+    return png;
+}
+
+// Parse {"key":"value",...} JSON — string values only.
+static std::map<std::string, std::string> parse_json_str_map(
+        const std::string& text) {
+    std::map<std::string, std::string> result;
+    size_t p = text.find('{');
+    if (p == std::string::npos) return result;
+    p++;
+    while (p < text.size()) {
+        while (p < text.size() && std::isspace((unsigned char)text[p])) p++;
+        if (p >= text.size() || text[p] == '}') break;
+        if (text[p] != '"') { p++; continue; }
+        p++;
+        size_t ks = p;
+        while (p < text.size() && text[p] != '"') { if (text[p]=='\\') p++; p++; }
+        std::string key = text.substr(ks, p - ks);
+        if (p < text.size()) p++;
+        while (p < text.size() && text[p] != ':') p++;
+        if (p < text.size()) p++;
+        while (p < text.size() && std::isspace((unsigned char)text[p])) p++;
+        if (p >= text.size()) break;
+        if (text[p] == '"') {
+            p++;
+            size_t vs = p;
+            while (p < text.size() && text[p] != '"') { if (text[p]=='\\') p++; p++; }
+            result[key] = text.substr(vs, p - vs);
+            if (p < text.size()) p++;
+        } else {
+            while (p < text.size() && text[p] != ',' && text[p] != '}') p++;
+        }
+        while (p < text.size() && std::isspace((unsigned char)text[p])) p++;
+        if (p < text.size() && text[p] == ',') p++;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini Flash analysis with OpenCV occupancy + per-word crop OCR.
 // ---------------------------------------------------------------------------
 static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
-                                   httplib::DataSink& sink) {
+                                   httplib::DataSink& sink,
+                                   bool is_memento = false) {
     // Step 1: Run OpenCV pipeline for board detection
     {
         std::string msg = "{\"status\":\"Detecting board layout...\"}\n";
@@ -2024,19 +2032,13 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         have_opencv = true;
     } catch (...) {}
 
-    // Step 2: Color-based tile detection
-    bool color_occupied[15][15] = {};
-    bool have_color = false;
-
+    // Step 2: Board mode + rack detection
     std::vector<RackTile> rack_tiles;
     bool is_light_mode = false;
     if (have_opencv) {
         int bx, by, cell_sz, board_w = 0;
         if (parse_board_rect_from_log(opencv_dr.log, bx, by, cell_sz, &board_w)) {
             is_light_mode = detect_board_mode(buf, bx, by, cell_sz);
-            detect_tiles_by_color(buf, bx, by, cell_sz, color_occupied,
-                                  is_light_mode, board_w);
-            have_color = true;
             rack_tiles = detect_rack_tiles(buf, bx, by, cell_sz,
                                            is_light_mode);
             // Draw rack detections on debug image
@@ -2054,7 +2056,8 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             sink.write(rack_msg.data(), rack_msg.size());
             // Report detected mode
             std::string mode_msg = std::string("{\"status\":\"Board mode: ") +
-                (is_light_mode ? "light" : "dark") + "\"}\n";
+                (is_light_mode ? "light" : "dark") +
+                (is_memento ? " (memento share image)" : "") + "\"}\n";
             sink.write(mode_msg.data(), mode_msg.size());
         }
     }
@@ -2062,9 +2065,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     // Build occupancy grid for Gemini prompt
     std::string occupancy_grid;
     auto get_occupied = [&](int r, int c) -> bool {
-        if (have_color) return color_occupied[r][c];
-        if (have_opencv) return opencv_dr.cells[r][c].letter != 0;
-        return false;
+        return have_opencv && opencv_dr.cells[r][c].letter != 0;
     };
 
     if (have_opencv) {
@@ -2075,58 +2076,110 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
-    // Build transposed board image: each column of the real board becomes a row.
-    // transposed cell (tr, tc) = original cell (row=tc, col=tr).
-    // Letters stay upright — cells are only rearranged, not rotated.
-    std::vector<uint8_t> transposed_png;
-    std::string transposed_occ_grid;
-    std::string prompt_t, payload_t;
-    CellResult transposed_cells[15][15] {};
-    bool have_transposed_ocr = false;
-    std::future<GeminiCallResult> transposed_fut;
+    // Build per-word crop images for focused Gemini OCR.
+    std::vector<WordRun> word_runs;
+    std::vector<std::string> wc_payloads;   // one payload per batch
+    std::vector<std::future<GeminiCallResult>> wc_futs;
 
     if (have_opencv) {
-        int bx_t, by_t, cs_t, bw_t = 0, bh_t = 0;
-        if (parse_board_rect_from_log(opencv_dr.log, bx_t, by_t, cs_t, &bw_t, &bh_t)) {
-            cv::Mat raw_t(1, static_cast<int>(buf.size()), CV_8UC1,
+        int bx_w, by_w, cs_w, bw_w = 0, bh_w = 0;
+        if (parse_board_rect_from_log(opencv_dr.log, bx_w, by_w, cs_w, &bw_w, &bh_w)) {
+            cv::Mat raw_w(1, static_cast<int>(buf.size()), CV_8UC1,
                           const_cast<uint8_t*>(buf.data()));
-            cv::Mat img_t = cv::imdecode(raw_t, cv::IMREAD_COLOR);
-            if (!img_t.empty()) {
-                // Subpixel cell boundaries: avoid ±1 pixel accumulation error.
-                double cw = (bw_t > 0) ? bw_t / 15.0 : static_cast<double>(cs_t);
-                double ch = (bh_t > 0) ? bh_t / 15.0 : static_cast<double>(cs_t);
-                // per-cell left/top pixel boundaries (rounded)
-                auto cell_x = [&](int c) { return bx_t + static_cast<int>(std::round(c * cw)); };
-                auto cell_y = [&](int r) { return by_t + static_cast<int>(std::round(r * ch)); };
+            cv::Mat img_w = cv::imdecode(raw_w, cv::IMREAD_COLOR);
+            if (!img_w.empty()) {
+                double cw_w = bw_w > 0 ? bw_w / 15.0 : (double)cs_w;
+                double ch_w = bh_w > 0 ? bh_w / 15.0 : (double)cs_w;
+                word_runs = find_word_runs(get_occupied);
 
-                int tsz = 15 * cs_t;
-                cv::Mat timg(tsz, tsz, CV_8UC3, cv::Scalar(30, 30, 30));
-                for (int tr = 0; tr < 15; tr++) {
-                    for (int tc = 0; tc < 15; tc++) {
-                        // source: original cell (row=tc, col=tr) with subpixel boundaries
-                        int sx = cell_x(tr), sw = cell_x(tr + 1) - sx;
-                        int sy = cell_y(tc), sh = cell_y(tc + 1) - sy;
-                        // dest: uniform output cell (row=tr, col=tc)
-                        int dx = tc * cs_t;
-                        int dy = tr * cs_t;
-                        if (sx < 0 || sy < 0 || sw <= 0 || sh <= 0 ||
-                            sx + sw > img_t.cols ||
-                            sy + sh > img_t.rows) continue;
-                        cv::Mat src_roi = img_t(cv::Rect(sx, sy, sw, sh));
-                        cv::Mat dst_roi = timg(cv::Rect(dx, dy, cs_t, cs_t));
-                        if (sw == cs_t && sh == cs_t)
-                            src_roi.copyTo(dst_roi);
-                        else
-                            cv::resize(src_roi, dst_roi, dst_roi.size(), 0, 0, cv::INTER_LANCZOS4);
+                // Build transposed image: original column C becomes row C,
+                // so vertical words appear as horizontal strips with upright letters.
+                int cs_t = (int)std::round(std::min(cw_w, ch_w));
+                cv::Mat timg;
+                if (cs_t > 0) {
+                    int tsz = 15 * cs_t;
+                    timg = cv::Mat(tsz, tsz, CV_8UC3, cv::Scalar(30, 30, 30));
+                    auto cell_x = [&](int c) { return bx_w + (int)std::round(c * cw_w); };
+                    auto cell_y = [&](int r) { return by_w + (int)std::round(r * ch_w); };
+                    for (int tr = 0; tr < 15; tr++) {
+                        for (int tc = 0; tc < 15; tc++) {
+                            int sx = cell_x(tr), sw = cell_x(tr+1) - sx;
+                            int sy = cell_y(tc), sh = cell_y(tc+1) - sy;
+                            int dx = tc * cs_t, dy = tr * cs_t;
+                            if (sx < 0 || sy < 0 || sw <= 0 || sh <= 0 ||
+                                sx+sw > img_w.cols || sy+sh > img_w.rows) continue;
+                            cv::Mat src_roi = img_w(cv::Rect(sx, sy, sw, sh));
+                            cv::Mat dst_roi = timg(cv::Rect(dx, dy, cs_t, cs_t));
+                            if (sw == cs_t && sh == cs_t)
+                                src_roi.copyTo(dst_roi);
+                            else
+                                cv::resize(src_roi, dst_roi, dst_roi.size(),
+                                           0, 0, cv::INTER_LANCZOS4);
+                        }
                     }
                 }
-                cv::imencode(".png", timg, transposed_png);
-            }
-            // Transposed occupancy: occ[tr][tc] = get_occupied(tc, tr)
-            for (int tr = 0; tr < 15; tr++) {
-                if (tr > 0) transposed_occ_grid += "\\n";
-                for (int tc = 0; tc < 15; tc++)
-                    transposed_occ_grid += get_occupied(tc, tr) ? 'X' : '.';
+
+                std::string wc_prompt =
+                    "Read the letters on Scrabble tiles in each labeled image. "
+                    "Images labeled H* are horizontal words; V* are vertical words "
+                    "(presented with upright letters reading left to right).\\n"
+                    "Tile rules:\\n";
+                if (is_memento) {
+                    wc_prompt +=
+                        "- Regular tiles: PURPLE or GOLD squares with a letter and small "
+                        "subscript number \\u2014 return UPPERCASE.\\n"
+                        "- Blank tiles: CIRCLES with italic letters, NO subscript "
+                        "\\u2014 return lowercase.\\n";
+                } else if (is_light_mode) {
+                    wc_prompt +=
+                        "- Regular tiles: BLUE/PURPLE squares with a letter and small "
+                        "subscript number \\u2014 return UPPERCASE.\\n"
+                        "- Blank tiles: GREEN CIRCLES with italic letters, NO subscript "
+                        "\\u2014 return lowercase.\\n";
+                } else {
+                    wc_prompt +=
+                        "- Regular tiles: beige squares with a letter and small subscript "
+                        "number \\u2014 return UPPERCASE.\\n"
+                        "- Blank tiles: PURPLE CIRCLES with italic letters, NO subscript "
+                        "\\u2014 return lowercase.\\n";
+                }
+                wc_prompt +=
+                    "The small subscript number is just the point value \\u2014 ignore it.\\n"
+                    "Reply ONLY as JSON: {\\\"LABEL\\\": \\\"LETTERS\\\", ...}\\n"
+                    "Example: {\\\"H11H\\\": \\\"WORMER\\\", \\\"VH8\\\": \\\"WAVES\\\"}";
+
+                // Build batched payloads: split at 200 KB to avoid Gemini timeouts
+                const size_t BATCH_LIMIT = 200 * 1024;
+                std::string cur_payload = "{\"contents\":[{\"parts\":["
+                    "{\"text\":\"" + wc_prompt + "\"}";
+                int n_crops = 0;
+                for (const auto& wr : word_runs) {
+                    auto png = crop_word_run(img_w, timg, cs_t, wr, bx_w, by_w, cw_w, ch_w);
+                    if (png.empty()) continue;
+                    std::string b64 = base64_encode(png);
+                    std::string part =
+                        ",{\"text\":\"" + wr.label + ":\"}"
+                        ",{\"inlineData\":{\"mimeType\":\"image/png\","
+                        "\"data\":\"" + b64 + "\"}}";
+                    // Seal current batch and start a new one if over limit
+                    if (n_crops > 0 && cur_payload.size() + part.size() > BATCH_LIMIT) {
+                        wc_payloads.push_back(cur_payload + "]}]}");
+                        cur_payload = "{\"contents\":[{\"parts\":["
+                            "{\"text\":\"" + wc_prompt + "\"}";
+                    }
+                    cur_payload += part;
+                    n_crops++;
+                }
+                if (n_crops > 0) wc_payloads.push_back(cur_payload + "]}]}");
+                size_t total_kb = 0;
+                for (const auto& p : wc_payloads) total_kb += p.size() / 1024;
+                std::string wc_msg = "{\"status\":\"Built " + std::to_string(n_crops)
+                    + " word crop images (" + std::to_string(total_kb) + " KB"
+                    + (wc_payloads.size() > 1
+                        ? ", " + std::to_string(wc_payloads.size()) + " batches"
+                        : "")
+                    + ", 2.0+2.5-flash in parallel)\"}\n";
+                sink.write(wc_msg.data(), wc_msg.size());
             }
         }
     }
@@ -2151,17 +2204,10 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                       + intermediate.substr(1) + "\n";
         sink.write(intermediate.data(), intermediate.size());
 
-        // Stream transposed board image immediately so the user can see it
-        if (!transposed_png.empty()) {
-            std::string t_msg = "{\"status\":\"Building transposed board...\","
-                "\"transposed_image\":\"data:image/png;base64,"
-                + base64_encode(transposed_png) + "\"}\n";
-            sink.write(t_msg.data(), t_msg.size());
-        }
     }
 
     // Stage snapshot: occupancy mask (which cells are detected as occupied)
-    if (have_color || have_opencv) {
+    if (have_opencv) {
         CellResult occ_cells[15][15] = {};
         for (int r = 0; r < 15; r++)
             for (int c = 0; c < 15; c++)
@@ -2218,137 +2264,159 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         prompt += ".";
     }
 
-    prompt += "\\n\\nIMPORTANT — tile types in this Scrabble app (Woogles.io):";
-    if (is_light_mode) {
-        prompt +=
-            "\\n- REGULAR tiles: BLUE/PURPLE SQUARES with WHITE upright letters "
-            "and a small white subscript number (point value) in the bottom-right."
-            "\\n- BLANK tiles on the BOARD: GREEN CIRCLES with italic/left-tilting "
-            "letters and NO subscript."
-            "\\n- Recently played tiles: ORANGE/GOLD highlighted squares."
-            "\\n- BLANK tiles on the RACK: BLUE/PURPLE tiles with NO letter and NO "
-            "subscript number. Any rack tile that has no visible letter is a blank (?). "
-            "\\n  IMPORTANT: Count ALL blue/purple squares in the rack row, including "
-            "empty-looking ones. If the bag has tiles, the rack MUST have exactly 7 "
-            "tiles. If you only see 6 letters, one tile is a blank (?).";
+    if (is_memento) {
+        // --- Memento (server-rendered share image) prompt ---
+        prompt += "\\n\\nIMPORTANT — this is a Woogles.io SHARE IMAGE (server-rendered), "
+            "NOT a browser screenshot. The layout is:"
+            "\\n- \\\"Woogles.io\\\" header with logo at top-left"
+            "\\n- Two SCORE BOXES at top-right: one PURPLE, one GOLD/YELLOW"
+            "\\n- 15x15 board below the header"
+            "\\n- Player RACK below the board"
+            "\\n\\nTile colors indicate which PLAYER owns them:"
+            "\\n- One player's tiles are PURPLE with white letters + subscript number"
+            "\\n- Other player's tiles are GOLD/YELLOW with dark letters + subscript number"
+            "\\n- BLANK tiles on the board: CIRCLES (not squares) with italic letters, NO subscript"
+            "\\n- BLANK tiles on the rack: tiles with NO letter and NO subscript number — "
+            "report as '?'";
+        prompt += "\\n\\nAlso read:"
+            "\\n- The current player's RACK (row of tiles below the board). "
+            "Use uppercase for regular tiles, '?' for blank tiles (tiles with no letter)."
+            "\\n- The SCORES for both players. To determine who is ON TURN:"
+            "\\n  Look at the RACK tiles below the board — they are either PURPLE or GOLD."
+            "\\n  The rack color tells you which player is ON TURN."
+            "\\n  Match the rack color to the score box of the SAME color at the top-right."
+            "\\n  That score is the ON-TURN player's score."
+            "\\n  The OTHER score box is the waiting player's score."
+            "\\n  List ON-TURN player's score FIRST, waiting player SECOND."
+            "\\n\\nReturn ONLY a JSON object with these fields:"
+            "\\n{"
+            "\\n  \\\"board\\\": [[...], ...],  // 15x15 array"
+            "\\n  \\\"rack\\\": \\\"ABCDE?F\\\",  // current player rack (? = blank)"
+            "\\n  \\\"scores\\\": [241, 198]  // [ON-TURN player score, waiting player score]"
+            "\\n}";
+        prompt += "\\n\\nBoard array elements:"
+            "\\n- Uppercase letter (e.g. \\\"A\\\") for regular tiles (purple or gold squares)"
+            "\\n- Lowercase letter (e.g. \\\"s\\\") for BLANK tiles (circles, italic, no subscript)"
+            "\\n- null for empty cells";
+        prompt += "\\n\\nSanity check: board tiles + rack tiles should be consistent with "
+            "a standard 100-tile English Scrabble distribution."
+            "\\n\\nReturn ONLY the JSON object, no other text.";
     } else {
-        prompt +=
-            "\\n- REGULAR tiles: beige/tan SQUARES with upright letters AND a small "
-            "subscript number (point value) in the bottom-right corner. "
-            "The subscript IS the key indicator — if you see a small number, "
-            "it is ALWAYS a regular tile."
-            "\\n- BLANK tiles on the BOARD: PURPLE CIRCLES (not squares!) with "
-            "italic letters and NO subscript number. The tile SHAPE changes from "
-            "square to circle for blanks."
-            "\\n- IMPORTANT: If the tile is a SQUARE (not circle), it is ALWAYS "
-            "a regular tile — return UPPERCASE even if the letter looks italic."
-            "\\n- BLANK tiles on the RACK: plain BEIGE tiles with NO letter and NO "
-            "subscript number — they look like empty beige squares. Any rack tile "
-            "that has no visible letter on it is a blank (?). "
-            "\\n  IMPORTANT: Count ALL beige squares in the rack row, including "
-            "empty-looking ones. If the bag has tiles, the rack MUST have exactly 7 "
-            "tiles. If you only see 6 letters, one tile is a blank (?).";
+        // --- Browser screenshot prompt ---
+        prompt += "\\n\\nIMPORTANT — tile types in this Scrabble app (Woogles.io):";
+        if (is_light_mode) {
+            prompt +=
+                "\\n- REGULAR tiles: BLUE/PURPLE SQUARES with WHITE upright letters "
+                "and a small white subscript number (point value) in the bottom-right."
+                "\\n- BLANK tiles on the BOARD: GREEN CIRCLES with italic/left-tilting "
+                "letters and NO subscript."
+                "\\n- Recently played tiles: ORANGE/GOLD highlighted squares."
+                "\\n- BLANK tiles on the RACK: BLUE/PURPLE tiles with NO letter and NO "
+                "subscript number. Any rack tile that has no visible letter is a blank (?). "
+                "\\n  IMPORTANT: Count ALL blue/purple squares in the rack row, including "
+                "empty-looking ones. If the bag has tiles, the rack MUST have exactly 7 "
+                "tiles. If you only see 6 letters, one tile is a blank (?).";
+        } else {
+            prompt +=
+                "\\n- REGULAR tiles: beige/tan SQUARES with upright letters AND a small "
+                "subscript number (point value) in the bottom-right corner. "
+                "The subscript IS the key indicator — if you see a small number, "
+                "it is ALWAYS a regular tile."
+                "\\n- BLANK tiles on the BOARD: PURPLE CIRCLES (not squares!) with "
+                "italic letters and NO subscript number. The tile SHAPE changes from "
+                "square to circle for blanks."
+                "\\n- IMPORTANT: If the tile is a SQUARE (not circle), it is ALWAYS "
+                "a regular tile — return UPPERCASE even if the letter looks italic."
+                "\\n- BLANK tiles on the RACK: plain BEIGE tiles with NO letter and NO "
+                "subscript number — they look like empty beige squares. Any rack tile "
+                "that has no visible letter on it is a blank (?). "
+                "\\n  IMPORTANT: Count ALL beige squares in the rack row, including "
+                "empty-looking ones. If the bag has tiles, the rack MUST have exactly 7 "
+                "tiles. If you only see 6 letters, one tile is a blank (?).";
+        }
+        prompt += "\\n\\nAlso read:"
+            "\\n- The current player's RACK (row of tiles below the board). "
+            "Use uppercase for regular tiles, '?' for blank tiles (tiles with no letter)."
+            "\\n- The LEXICON shown in the game info area (e.g. \\\"NWL23\\\", \\\"CSW21\\\")."
+            "\\n- The TILE TRACKING section (\\\"tiles in bag\\\" area) — read the letters "
+            "listed there. They show remaining unseen tiles. Transcribe exactly, e.g. "
+            "\\\"A E II O U B C D L N S TT X\\\"."
+            "\\n- The SCORES for both players. To determine who is ON TURN:"
+            "\\n  STEP 1 — Look at the TURN HISTORY list. Find the MOST RECENT move "
+            "(the last entry at the bottom of the visible list). "
+            "Each history entry shows a small avatar/icon next to it matching the player's avatar "
+            "in the player panel — use this to identify which player just moved. "
+            "IMPORTANT: the history may be scrolled — verify the last visible entry's cumulative "
+            "score matches the current score shown in that player's panel. "
+            "That player just finished their turn — they are WAITING. "
+            "The OTHER player is ON TURN."
+            "\\n  STEP 2 — Confirm: the ON-TURN player's score box usually has a GREEN background."
+            "\\n  STEP 3 — Confirm: the rack tiles shown belong to the ON-TURN player."
+            "\\nList the ON-TURN player's score FIRST, waiting player SECOND."
+            "\\n\\nReturn ONLY a JSON object with these fields:"
+            "\\n{"
+            "\\n  \\\"board\\\": [[...], ...],  // 15x15 array"
+            "\\n  \\\"rack\\\": \\\"ABCDE?F\\\",  // current player rack (? = blank)"
+            "\\n  \\\"lexicon\\\": \\\"NWL23\\\",  // lexicon name"
+            "\\n  \\\"bag\\\": \\\"A E II O U B C D L N S TT X\\\",  // tile tracking text"
+            "\\n  \\\"scores\\\": [241, 198]  // [ON-TURN player score, waiting player score]"
+            "\\n}";
+        prompt += "\\n\\nBoard array elements:";
+        if (is_light_mode) {
+            prompt +=
+                "\\n- Uppercase letter (e.g. \\\"A\\\") for regular tiles (blue/purple squares)"
+                "\\n- Lowercase letter (e.g. \\\"s\\\") for BLANK tiles (green circles, italic)";
+        } else {
+            prompt +=
+                "\\n- Uppercase letter (e.g. \\\"A\\\") for regular tiles (beige, with subscript)"
+                "\\n- Lowercase letter (e.g. \\\"s\\\") for BLANK tiles (purple circles, italic)";
+        }
+        prompt += "\\n- null for empty cells"
+            "\\n\\nSanity check: board tiles + rack tiles + bag tiles + opponent rack "
+            "should total 100 tiles (standard English Scrabble distribution). "
+            "If a rack tile is a plain ";
+        prompt += is_light_mode ? "blue/purple" : "beige";
+        prompt += " square with no letter, it is a blank (?)."
+            "\\n\\nReturn ONLY the JSON object, no other text.";
     }
-    prompt += "\\n\\nAlso read:"
-        "\\n- The current player's RACK (row of tiles below the board). "
-        "Use uppercase for regular tiles, '?' for blank tiles (tiles with no letter)."
-        "\\n- The LEXICON shown in the game info area (e.g. \\\"NWL23\\\", \\\"CSW21\\\")."
-        "\\n- The TILE TRACKING section (\\\"tiles in bag\\\" area) — read the letters "
-        "listed there. They show remaining unseen tiles. Transcribe exactly, e.g. "
-        "\\\"A E II O U B C D L N S TT X\\\"."
-        "\\n- The SCORES for both players. To determine who is ON TURN:"
-        "\\n  STEP 1 — Look at the TURN HISTORY list. Find the MOST RECENT move "
-        "(the last entry at the bottom of the visible list). "
-        "Each history entry shows a small avatar/icon next to it matching the player's avatar "
-        "in the player panel — use this to identify which player just moved. "
-        "IMPORTANT: the history may be scrolled — verify the last visible entry's cumulative "
-        "score matches the current score shown in that player's panel. "
-        "That player just finished their turn — they are WAITING. "
-        "The OTHER player is ON TURN."
-        "\\n  STEP 2 — Confirm: the ON-TURN player's score box usually has a GREEN background."
-        "\\n  STEP 3 — Confirm: the rack tiles shown belong to the ON-TURN player."
-        "\\nList the ON-TURN player's score FIRST, waiting player SECOND."
-        "\\n\\nReturn ONLY a JSON object with these fields:"
-        "\\n{"
-        "\\n  \\\"board\\\": [[...], ...],  // 15x15 array"
-        "\\n  \\\"rack\\\": \\\"ABCDE?F\\\",  // current player rack (? = blank)"
-        "\\n  \\\"lexicon\\\": \\\"NWL23\\\",  // lexicon name"
-        "\\n  \\\"bag\\\": \\\"A E II O U B C D L N S TT X\\\",  // tile tracking text"
-        "\\n  \\\"scores\\\": [241, 198]  // [ON-TURN player score, waiting player score]"
-        "\\n}";
-    prompt += "\\n\\nBoard array elements:";
-    if (is_light_mode) {
-        prompt +=
-            "\\n- Uppercase letter (e.g. \\\"A\\\") for regular tiles (blue/purple squares)"
-            "\\n- Lowercase letter (e.g. \\\"s\\\") for BLANK tiles (green circles, italic)";
-    } else {
-        prompt +=
-            "\\n- Uppercase letter (e.g. \\\"A\\\") for regular tiles (beige, with subscript)"
-            "\\n- Lowercase letter (e.g. \\\"s\\\") for BLANK tiles (purple circles, italic)";
-    }
-    prompt += "\\n- null for empty cells"
-        "\\n\\nSanity check: board tiles + rack tiles + bag tiles + opponent rack "
-        "should total 100 tiles (standard English Scrabble distribution). "
-        "If a rack tile is a plain ";
-    prompt += is_light_mode ? "blue/purple" : "beige";
-    prompt += " square with no letter, it is a blank (?)."
-        "\\n\\nReturn ONLY the JSON object, no other text.";
 
     std::string payload = "{\"contents\":[{\"parts\":["
         "{\"text\":\"" + prompt + "\"},"
         "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"" + b64 + "\"}}"
         "]}]}";
 
-    // Build transposed board Gemini payload
-    if (!transposed_png.empty()) {
-        prompt_t = "Look at this Scrabble board image. Each row shows what was "
-            "originally a COLUMN of the real board — vertical words now appear "
-            "horizontally, reading left to right. Read every cell in the 15x15 grid.";
-        if (!transposed_occ_grid.empty()) {
-            prompt_t += "\\n\\nOccupancy grid (already transposed to match the "
-                "image — X=tile present, .=empty):\\n" + transposed_occ_grid +
-                "\\n\\nSTRICT RULES based on the grid above:"
-                "\\n- Every cell marked 'X' MUST have a letter (do NOT return null)."
-                "\\n- Every cell marked '.' MUST return null (do NOT return a letter).";
-        }
-        prompt_t += "\\n\\nTile types:";
-        if (is_light_mode) {
-            prompt_t +=
-                "\\n- Regular tiles: BLUE/PURPLE SQUARES with white upright letters "
-                "and a small subscript number — return UPPERCASE."
-                "\\n- Blank tiles: GREEN CIRCLES with italic letters, NO subscript "
-                "— return lowercase.";
-        } else {
-            prompt_t +=
-                "\\n- Regular tiles: beige SQUARES with upright letters and a small "
-                "subscript number — return UPPERCASE."
-                "\\n- Blank tiles: PURPLE CIRCLES (not squares!), italic letters, "
-                "NO subscript — return lowercase.";
-        }
-        prompt_t += "\\n- Empty cells: return null"
-            "\\n\\nReturn ONLY a JSON array of 15 rows x 15 columns. No other text.";
-        std::string b64_t = base64_encode(transposed_png);
-        payload_t = "{\"contents\":[{\"parts\":["
-            "{\"text\":\"" + prompt_t + "\"},"
-            "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"" + b64_t + "\"}}"
-            "]}]}";
-    }
 
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
                       "gemini-2.5-flash:generateContent?key=";
     url += api_key;
+    // Cheaper/faster model for word crops: no thinking overhead, lower latency.
+    std::string wc_url_20 = "https://generativelanguage.googleapis.com/v1beta/models/"
+                            "gemini-2.0-flash:generateContent?key=";
+    wc_url_20 += api_key;
 
     auto t0 = std::chrono::steady_clock::now();
-    // Launch original and transposed OCR in parallel
+    // Launch main OCR and word-crop OCR in parallel
     auto main_fut = std::async(std::launch::async,
         [&url, &payload, &prompt]() {
             return call_gemini(url, payload, "main", prompt, 60, 2);
         });
-    if (!payload_t.empty())
-        transposed_fut = std::async(std::launch::async,
-            [&url, &payload_t, &prompt_t]() {
-                return call_gemini(url, payload_t, "transposed", prompt_t, 60, 1);
-            });
+    // For each batch, query both gemini-2.0-flash (fast, no thinking) and
+    // gemini-2.5-flash (thinking disabled via thinkingBudget=0) in parallel.
+    // Results are merged — whichever model reads more words wins for each cell.
+    for (const auto& wcp : wc_payloads) {
+        // 2.0-flash: fast, no thinking by default
+        wc_futs.push_back(std::async(std::launch::async,
+            [&wc_url_20, p = wcp]() {
+                return call_gemini(wc_url_20, p, "wc_2.0", "wc", 30, 1);
+            }));
+        // 2.5-flash with thinking disabled: strip final } and inject thinkingBudget=0
+        std::string wcp_nt = wcp.substr(0, wcp.size() - 1)
+            + ",\"generationConfig\":{\"thinkingConfig\":{\"thinkingBudget\":0}}}";
+        wc_futs.push_back(std::async(std::launch::async,
+            [&url, p = wcp_nt]() {
+                return call_gemini(url, p, "wc_2.5", "wc", 45, 1);
+            }));
+    }
     auto gcr = main_fut.get();
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -2420,17 +2488,25 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         return;
     }
 
-    // Join transposed OCR future (launched in parallel with main OCR).
-    // Runs here so it overlaps with the main board parsing and rack detection above.
-    if (transposed_fut.valid()) {
-        auto gcr_t = transposed_fut.get();
-        if (!gcr_t.text.empty()) {
-            have_transposed_ocr = parse_gemini_board(gcr_t.text, transposed_cells);
-            std::string tmsg = "{\"status\":\"Transposed OCR "
-                + std::string(have_transposed_ocr ? "parsed." : "failed to parse.")
-                + "\"}\n";
-            sink.write(tmsg.data(), tmsg.size());
+    // Join all word-crop OCR batch futures (launched in parallel with main OCR).
+    // Runs here so it overlaps with main board parsing and rack detection above.
+    std::map<std::string, std::string> word_crop_map;
+    bool have_word_crop_ocr = false;
+    for (auto& fut : wc_futs) {
+        auto gcr_wc = fut.get();
+        if (!gcr_wc.text.empty()) {
+            auto batch_map = parse_json_str_map(gcr_wc.text);
+            word_crop_map.insert(batch_map.begin(), batch_map.end());
         }
+    }
+    if (!wc_futs.empty()) {
+        have_word_crop_ocr = !word_crop_map.empty();
+        std::string wmsg = "{\"status\":\"Word crop OCR "
+            + std::string(have_word_crop_ocr
+                ? "parsed (" + std::to_string(word_crop_map.size()) + " words)."
+                : "failed to parse.")
+            + "\"}\n";
+        sink.write(wmsg.data(), wmsg.size());
     }
 
     // Save raw OCR snapshot (before any corrections) for trail comparison.
@@ -2536,7 +2612,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     // For each row, find contiguous blocks in both mask and Gemini output.
     // If blocks match in count and relative spacing, realign Gemini's
     // letters to the mask positions.
-    if (have_color || have_opencv) {
+    if (have_opencv) {
         std::string realign_log;
         for (int r = 0; r < 15; r++) {
             // Find contiguous blocks in mask
@@ -2661,7 +2737,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     // letter but color detection says empty) so we can re-verify with crops.
     struct DisputedCell { int r, c; CellResult orig; };
     std::vector<DisputedCell> disputed;
-    if (have_color || have_opencv) {
+    if (have_opencv) {
         for (int r = 0; r < 15; r++)
             for (int c = 0; c < 15; c++)
                 if (!get_occupied(r, c) && dr.cells[r][c].letter != 0) {
@@ -2671,152 +2747,91 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                 }
     }
 
-    // Use transposed OCR to improve the board AFTER realignment + occupancy.
-    // Running here ensures realignment sees clean raw OCR block counts and can
-    // correctly shift mis-placed words before we fill/adjust individual cells.
-    if (have_transposed_ocr) {
-        auto trans_letter = [&](int r, int c) -> char {
-            return transposed_cells[c][r].letter;
-        };
+    // Apply word-crop OCR results: per-word Gemini reads of tight rectangular
+    // crops, which are immune to toast/UI overlays that confuse full-board OCR.
+    // Only accept a run's reading if it forms a valid lexicon word — this guards
+    // against Gemini confusing labels when processing many images at once.
+    if (have_word_crop_ocr) {
+        struct WCReading { char letter; int run_len; bool is_horiz; };
+        std::map<std::pair<int,int>, WCReading> cell_readings;
 
-        // Case 1: Fill occupied cells that main OCR missed
-        std::string trans_fill_detail;
-        for (int r = 0; r < 15; r++) {
-            for (int c = 0; c < 15; c++) {
-                if (!get_occupied(r, c) || dr.cells[r][c].letter != 0) continue;
-                char t_ch = trans_letter(r, c);
-                if (t_ch == 0) continue;
-                dr.cells[r][c].letter = t_ch;
-                dr.cells[r][c].confidence = 0.7f;
-                dr.cells[r][c].is_blank = (t_ch >= 'a' && t_ch <= 'z');
-                if (!trans_fill_detail.empty()) trans_fill_detail += ", ";
-                trans_fill_detail += std::string(1, static_cast<char>('A' + c))
-                    + std::to_string(r + 1) + "="
-                    + static_cast<char>(std::toupper(static_cast<unsigned char>(t_ch)));
+        for (const auto& wr : word_runs) {
+            // Skip single-cell runs — not enough context for reliable OCR.
+            if (wr.length() < 2) continue;
+
+            auto it = word_crop_map.find(wr.label);
+            if (it == word_crop_map.end()) continue;
+            const std::string& letters = it->second;
+            if ((int)letters.size() != wr.length()) continue;
+
+            // Validate: all chars must be ASCII letters
+            bool all_letters = true;
+            for (char ch : letters)
+                if (!std::isalpha((unsigned char)ch)) { all_letters = false; break; }
+            if (!all_letters) continue;
+
+            // Only accept if the reading forms a valid lexicon word.
+            if (!g_kwg_lexicon.empty()) {
+                std::string upper = letters;
+                for (char& ch : upper)
+                    ch = static_cast<char>(std::toupper((unsigned char)ch));
+                if (!g_kwg.is_valid(upper)) continue;
+            }
+
+            for (int i = 0; i < wr.length(); i++) {
+                int r = wr.horizontal ? wr.r : (wr.start + i);
+                int c = wr.horizontal ? (wr.start + i) : wr.c;
+                if (!get_occupied(r, c)) continue;
+                char ch = letters[i];
+                auto key = std::make_pair(r, c);
+                auto existing = cell_readings.find(key);
+                bool prefer_new = existing == cell_readings.end()
+                    || wr.length() > existing->second.run_len
+                    || (wr.length() == existing->second.run_len && wr.horizontal);
+                if (prefer_new)
+                    cell_readings[key] = {ch, wr.length(), wr.horizontal};
             }
         }
-        if (!trans_fill_detail.empty()) {
-            std::string msg = "{\"status\":\"Transposed OCR filled missed cells: "
-                + json_escape(trans_fill_detail) + "\"}\n";
+
+        std::string wc_fill_detail, wc_fix_detail;
+        for (const auto& [pos, rd] : cell_readings) {
+            int r = pos.first, c = pos.second;
+            char new_ch = rd.letter;
+            if (new_ch == 0) continue;
+            char old_ch = dr.cells[r][c].letter;
+            char old_u = old_ch ? static_cast<char>(std::toupper(
+                static_cast<unsigned char>(old_ch))) : 0;
+            char new_u = static_cast<char>(std::toupper(
+                static_cast<unsigned char>(new_ch)));
+            if (old_ch == 0) {
+                dr.cells[r][c].letter = new_ch;
+                dr.cells[r][c].confidence = 0.8f;
+                dr.cells[r][c].is_blank = (new_ch >= 'a' && new_ch <= 'z');
+                if (!wc_fill_detail.empty()) wc_fill_detail += ", ";
+                wc_fill_detail += std::string(1, static_cast<char>('A' + c))
+                    + std::to_string(r + 1) + "=" + new_u;
+            } else if (old_u != new_u) {
+                dr.cells[r][c].letter = new_ch;
+                dr.cells[r][c].confidence = 0.8f;
+                dr.cells[r][c].is_blank = (new_ch >= 'a' && new_ch <= 'z');
+                if (!wc_fix_detail.empty()) wc_fix_detail += ", ";
+                wc_fix_detail += std::string(1, static_cast<char>('A' + c))
+                    + std::to_string(r + 1) + ":" + old_u + "->" + new_u;
+            }
+        }
+        if (!wc_fill_detail.empty()) {
+            std::string msg = "{\"status\":\"Word crop OCR filled: "
+                + json_escape(wc_fill_detail) + "\"}\n";
             sink.write(msg.data(), msg.size());
         }
-
-        // Case 3: Detect shifts corroborated by transposed OCR
-        std::string shift_detail;
-        auto check_and_apply_shift = [&](int line, int p_start, int p_end, bool is_row) {
-            int len = p_end - p_start;
-            if (len < 4) return;
-            auto get_main = [&](int p) -> char {
-                return is_row ? dr.cells[line][p].letter : dr.cells[p][line].letter;
-            };
-            auto get_trans = [&](int p) -> char {
-                return is_row ? trans_letter(line, p) : trans_letter(p, line);
-            };
-            auto get_cell = [&](int p) -> CellResult& {
-                return is_row ? dr.cells[line][p] : dr.cells[p][line];
-            };
-            for (int shift : {-1, +1, -2, +2}) {
-                int matches = 0, total = 0;
-                for (int pi = p_start; pi < p_end; pi++) {
-                    char m_ch = get_main(pi);
-                    if (m_ch == 0) continue;
-                    int pi_t = pi + shift;
-                    if (pi_t < p_start || pi_t >= p_end) continue;
-                    char t_ch = get_trans(pi_t);
-                    if (t_ch == 0) continue;
-                    total++;
-                    if (std::toupper(static_cast<unsigned char>(m_ch))
-                        == std::toupper(static_cast<unsigned char>(t_ch)))
-                        matches++;
-                }
-                if (total < len / 2 || matches * 4 < total * 3) continue;
-                std::vector<CellResult> saved(len);
-                for (int pi = p_start; pi < p_end; pi++)
-                    saved[pi - p_start] = get_cell(pi);
-                std::vector<std::pair<int,char>> changed;
-                for (int pi = p_start; pi < p_end; pi++) {
-                    char t_ch = get_trans(pi);
-                    if (t_ch == 0) continue;
-                    char old_u = saved[pi - p_start].letter
-                        ? static_cast<char>(std::toupper(static_cast<unsigned char>(
-                              saved[pi - p_start].letter))) : 0;
-                    char t_u = static_cast<char>(
-                        std::toupper(static_cast<unsigned char>(t_ch)));
-                    if (old_u != t_u) {
-                        auto& cell = get_cell(pi);
-                        cell.letter = t_ch;
-                        cell.confidence = 0.75f;
-                        cell.is_blank = (t_ch >= 'a' && t_ch <= 'z');
-                        changed.push_back({pi, t_u});
-                    }
-                }
-                bool valid = true;
-                if (!changed.empty() && !g_kwg_lexicon.empty()) {
-                    auto wl = extract_words(dr.cells);
-                    for (const auto& bw : wl) {
-                        bool touches = false;
-                        for (const auto& [cp, _] : changed)
-                            for (const auto& [wr, wc] : bw.cells) {
-                                bool hit = is_row ? (wr == line && wc == cp)
-                                                  : (wc == line && wr == cp);
-                                if (hit) { touches = true; break; }
-                            }
-                        if (touches && !g_kwg.is_valid(bw.word)) { valid = false; break; }
-                    }
-                }
-                if (!valid) {
-                    for (int pi = p_start; pi < p_end; pi++)
-                        get_cell(pi) = saved[pi - p_start];
-                    continue;
-                }
-                if (!changed.empty()) {
-                    std::string block_changes;
-                    for (const auto& [pi, t_u] : changed) {
-                        char old_u = saved[pi - p_start].letter
-                            ? static_cast<char>(std::toupper(static_cast<unsigned char>(
-                                  saved[pi - p_start].letter))) : 0;
-                        if (!block_changes.empty()) block_changes += ", ";
-                        std::string pos_str = is_row
-                            ? std::string(1, static_cast<char>('A' + pi))
-                              + std::to_string(line + 1)
-                            : std::string(1, static_cast<char>('A' + line))
-                              + std::to_string(pi + 1);
-                        block_changes += pos_str + ":"
-                            + (old_u ? std::string(1, old_u) : std::string("?"))
-                            + "->" + t_u;
-                    }
-                    if (!shift_detail.empty()) shift_detail += "; ";
-                    shift_detail += (is_row ? "row " : "col ")
-                        + (is_row ? std::to_string(line + 1)
-                                  : std::string(1, static_cast<char>('A' + line)))
-                        + " shift " + (shift > 0 ? "+" : "")
-                        + std::to_string(shift) + " [" + block_changes + "]";
-                }
-                break;
-            }
-        };
-        for (int r = 0; r < 15; r++) {
-            int s = -1;
-            for (int c = 0; c <= 15; c++) {
-                if (c < 15 && get_occupied(r, c)) { if (s < 0) s = c; }
-                else if (s >= 0) { check_and_apply_shift(r, s, c, true); s = -1; }
-            }
-        }
-        for (int c = 0; c < 15; c++) {
-            int s = -1;
-            for (int r = 0; r <= 15; r++) {
-                if (r < 15 && get_occupied(r, c)) { if (s < 0) s = r; }
-                else if (s >= 0) { check_and_apply_shift(c, s, r, false); s = -1; }
-            }
-        }
-        if (!shift_detail.empty()) {
-            std::string msg = "{\"status\":\"Transposed OCR corroborated shift: "
-                + json_escape(shift_detail) + "\"}\n";
+        if (!wc_fix_detail.empty()) {
+            std::string msg = "{\"status\":\"Word crop OCR corrected: "
+                + json_escape(wc_fix_detail) + "\"}\n";
             sink.write(msg.data(), msg.size());
         }
     }
 
-    // Stage snapshot: after transposed OCR corrections (Cases 1+3)
+    // Stage snapshot: after word-crop OCR corrections
     { std::string s="{\"stage\":\"trans\",\"stage_cgp\":\""+json_escape(cells_to_cgp(dr.cells))+"\"}\n"; sink.write(s.data(),s.size()); }
 
     // Step 5: Re-query Gemini for cells needing verification (crop + retry)
@@ -2824,7 +2839,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     //   (a) occupied cells Gemini missed
     //   (b) disputed cells (Gemini found letter, color says empty)
     std::vector<RetryCell> retry_cells;
-    if (have_color || have_opencv) {
+    if (have_opencv) {
         for (int r = 0; r < 15; r++)
             for (int c = 0; c < 15; c++)
                 if (get_occupied(r, c) && dr.cells[r][c].letter == 0)
@@ -2876,7 +2891,13 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                     int cy = std::max(0, by + rc.r * cell_sz - pad);
                     int cw = std::min(cell_sz + 2 * pad, img.cols - cx);
                     int ch = std::min(cell_sz + 2 * pad, img.rows - cy);
-                    cv::Mat cell_img = img(cv::Rect(cx, cy, cw, ch));
+                    cv::Mat cell_img = img(cv::Rect(cx, cy, cw, ch)).clone();
+                    // Mask out the subscript (point value) in the bottom-right
+                    // corner — it can mislead Gemini into reading the wrong letter.
+                    int sx = cell_img.cols * 6 / 8;
+                    int sy = cell_img.rows * 6 / 8;
+                    cell_img(cv::Rect(sx, sy, cell_img.cols - sx,
+                                     cell_img.rows - sy)) = cv::Scalar(128, 128, 128);
                     std::vector<uint8_t> png_buf;
                     cv::imencode(".png", cell_img, png_buf);
                     retry_payload += ",{\"inlineData\":{\"mimeType\":\"image/png\","
@@ -2900,7 +2921,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     }
 
     // Any cells still unresolved get '?' placeholder
-    if (have_color || have_opencv) {
+    if (have_opencv) {
         for (int r = 0; r < 15; r++)
             for (int c = 0; c < 15; c++)
                 if (get_occupied(r, c) && dr.cells[r][c].letter == 0) {
@@ -2964,7 +2985,11 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                             int cy = std::max(0, by + rc.r * cell_sz - pad);
                             int cw = std::min(cell_sz + 2 * pad, img_c.cols - cx);
                             int ch = std::min(cell_sz + 2 * pad, img_c.rows - cy);
-                            cv::Mat cell_img = img_c(cv::Rect(cx, cy, cw, ch));
+                            cv::Mat cell_img = img_c(cv::Rect(cx, cy, cw, ch)).clone();
+                            int sx = cell_img.cols * 6 / 8;
+                            int sy = cell_img.rows * 6 / 8;
+                            cell_img(cv::Rect(sx, sy, cell_img.cols - sx,
+                                             cell_img.rows - sy)) = cv::Scalar(128, 128, 128);
                             std::vector<uint8_t> png_buf;
                             cv::imencode(".png", cell_img, png_buf);
                             conn_payload += ",{\"inlineData\":{\"mimeType\":\"image/png\","
@@ -3225,8 +3250,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
            + std::to_string(gemini_score1) + " " + std::to_string(gemini_score2);
     if (!lex_str.empty())
         dr.cgp += " lex " + lex_str + ";";
-    dr.log = have_color ? "Color occupancy + Gemini Flash OCR"
-           : have_opencv ? "OpenCV occupancy + Gemini Flash OCR"
+    dr.log = have_opencv ? "OpenCV occupancy + Gemini Flash OCR"
            : "Gemini Flash analysis";
 
     if (have_opencv)
@@ -3535,57 +3559,6 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                         return true;
                     };
 
-                    // Case 2: Try the transposed OCR letter first for each suspect
-                    // cell. If it immediately makes all touching words valid, apply
-                    // it and remove the suspect — avoids the 26-letter sweep.
-                    if (have_transposed_ocr) {
-                        std::string hint_detail;
-                        for (auto it = suspects.begin(); it != suspects.end(); ) {
-                            int r = it->first, c = it->second;
-                            char t_ch = transposed_cells[c][r].letter;
-                            if (t_ch == 0) { ++it; continue; }
-                            char t_u = static_cast<char>(std::toupper(
-                                static_cast<unsigned char>(t_ch)));
-                            char m_u = static_cast<char>(std::toupper(
-                                static_cast<unsigned char>(dr.cells[r][c].letter)));
-                            if (t_u == m_u) { ++it; continue; }
-                            auto orig = dr.cells[r][c];
-                            dr.cells[r][c].letter = t_u;
-                            dr.cells[r][c].is_blank = false;
-                            if (all_touching_valid({*it})) {
-                                dr.cells[r][c].confidence = 0.85f;
-                                if (!hint_detail.empty()) hint_detail += ", ";
-                                hint_detail += std::string(1, static_cast<char>('A' + c))
-                                    + std::to_string(r + 1) + ": " + m_u + "->" + t_u;
-                                suspect_set.erase(*it);
-                                it = suspects.erase(it);
-                            } else {
-                                dr.cells[r][c] = orig;
-                                ++it;
-                            }
-                        }
-                        if (!hint_detail.empty()) {
-                            all_words = extract_words(dr.cells);
-                            invalid.clear();
-                            for (const auto& bw : all_words) {
-                                if (!g_kwg.is_valid(bw.word)) {
-                                    InvalidWord ihw;
-                                    ihw.word = bw.word; ihw.cells = bw.cells;
-                                    ihw.horizontal = bw.horizontal;
-                                    if (bw.horizontal)
-                                        ihw.position = "row " + std::to_string(bw.cells[0].first + 1);
-                                    else
-                                        ihw.position = "col " + std::string(1,
-                                            static_cast<char>('A' + bw.cells[0].second));
-                                    invalid.push_back(std::move(ihw));
-                                }
-                            }
-                            std::string msg = "{\"status\":\"Transposed OCR hint applied: "
-                                + json_escape(hint_detail) + "\"}\n";
-                            sink.write(msg.data(), msg.size());
-                        }
-                    }
-
                     for (const auto& iw : invalid) {
                         // Find suspect cells in this invalid word
                         std::vector<std::pair<int,int>> word_suspects;
@@ -3620,22 +3593,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                                     { found = l; found_count++; }
                             }
                             dr.cells[sp.first][sp.second] = orig;
-                            if (found_count == 0) continue;
-                            // Multiple valid letters: use transposed OCR as tiebreaker
-                            if (found_count > 1 && have_transposed_ocr) {
-                                char t_ch = transposed_cells[sp.second][sp.first].letter;
-                                char t_u = t_ch ? static_cast<char>(std::toupper(
-                                    static_cast<unsigned char>(t_ch))) : 0;
-                                if (t_u && t_u != orig_upper) {
-                                    dr.cells[sp.first][sp.second].letter = t_u;
-                                    dr.cells[sp.first][sp.second].is_blank = false;
-                                    if (all_touching_valid({sp})) {
-                                        found = t_u; found_count = 1;
-                                    }
-                                    dr.cells[sp.first][sp.second] = orig;
-                                }
-                            }
-                            if (found_count != 1) continue;
+                            if (found_count == 0 || found_count > 1) continue;
 
                             if (!wc_detail.empty()) wc_detail += ", ";
                             wc_detail +=
@@ -3674,28 +3632,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                             }
                             dr.cells[sp0.first][sp0.second] = orig0;
                             dr.cells[sp1.first][sp1.second] = orig1;
-                            if (found_count == 0) continue;
-                            // Multiple valid combos: use transposed OCR as tiebreaker
-                            if (found_count > 1 && have_transposed_ocr) {
-                                char t0 = transposed_cells[sp0.second][sp0.first].letter;
-                                char t1 = transposed_cells[sp1.second][sp1.first].letter;
-                                char t0u = t0 ? static_cast<char>(std::toupper(
-                                    static_cast<unsigned char>(t0))) : 0;
-                                char t1u = t1 ? static_cast<char>(std::toupper(
-                                    static_cast<unsigned char>(t1))) : 0;
-                                if (t0u && t1u) {
-                                    dr.cells[sp0.first][sp0.second].letter = t0u;
-                                    dr.cells[sp0.first][sp0.second].is_blank = false;
-                                    dr.cells[sp1.first][sp1.second].letter = t1u;
-                                    dr.cells[sp1.first][sp1.second].is_blank = false;
-                                    if (all_touching_valid({sp0, sp1})) {
-                                        found0 = t0u; found1 = t1u; found_count = 1;
-                                    }
-                                    dr.cells[sp0.first][sp0.second] = orig0;
-                                    dr.cells[sp1.first][sp1.second] = orig1;
-                                }
-                            }
-                            if (found_count != 1) continue;
+                            if (found_count == 0 || found_count > 1) continue;
 
                             if (!wc_detail.empty()) wc_detail += ", ";
                             wc_detail +=
@@ -4083,37 +4020,6 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
     }
 
-    // Send transposed board image and disagreements (raw main vs raw transposed).
-    if (have_transposed_ocr && !transposed_png.empty()) {
-        // transposed_cells[c][r] corresponds to original board cell (r, c).
-        // Compare against raw_main_cells (before corrections) so we see true OCR disagreements.
-        std::string disagree_json = "[";
-        bool first_d = true;
-        for (int r = 0; r < 15; r++) {
-            for (int c = 0; c < 15; c++) {
-                char raw_ch = raw_main_cells[r][c].letter;
-                char trans_ch = transposed_cells[c][r].letter;
-                if (raw_ch == 0 || trans_ch == 0) continue;
-                char raw_u = static_cast<char>(std::toupper(
-                    static_cast<unsigned char>(raw_ch)));
-                char trans_u = static_cast<char>(std::toupper(
-                    static_cast<unsigned char>(trans_ch)));
-                if (raw_u != trans_u) {
-                    if (!first_d) disagree_json += ",";
-                    first_d = false;
-                    disagree_json += "{\"pos\":\""
-                        + std::string(1, static_cast<char>('A' + c))
-                        + std::to_string(r + 1)
-                        + "\",\"orig\":\"" + raw_u
-                        + "\",\"trans\":\"" + trans_u + "\"}";
-                }
-            }
-        }
-        disagree_json += "]";
-        std::string tmsg = "{\"status\":\"Transposed OCR comparison\","
-            "\"transposed_disagree\":" + disagree_json + "}\n";
-        sink.write(tmsg.data(), tmsg.size());
-    }
 
     std::string final_json = make_json_response(dr);
     // Inject extra fields before the closing }
@@ -4131,21 +4037,15 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         for (int r = 0; r < 15; r++) {
             for (int c = 0; c < 15; c++) {
                 char raw_ch = raw_main_cells[r][c].letter;
-                char trans_ch = have_transposed_ocr
-                    ? transposed_cells[c][r].letter : 0;
                 char fin_ch = dr.cells[r][c].letter;
-                // Skip cells that are empty in both raw main OCR and final board —
-                // these are empty cells where transposed OCR hallucinated, just noise.
                 if (raw_ch == 0 && fin_ch == 0) continue;
                 char raw_u = raw_ch ? static_cast<char>(std::toupper(
                     static_cast<unsigned char>(raw_ch))) : 0;
-                char trans_u = trans_ch ? static_cast<char>(std::toupper(
-                    static_cast<unsigned char>(trans_ch))) : 0;
                 char fin_u = fin_ch ? static_cast<char>(std::toupper(
                     static_cast<unsigned char>(fin_ch))) : 0;
-                // Skip if raw==final and trans agrees or is absent
-                if (raw_u == fin_u
-                    && (trans_u == 0 || trans_u == fin_u)) continue;
+                // Skip if raw==final
+                if (raw_u == fin_u) continue;
+                char trans_u = 0;
                 if (!first_t) trail += ",";
                 first_t = false;
                 std::string pos = std::string(1, static_cast<char>('A' + c))
@@ -4161,7 +4061,7 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         extra += ",\"raw_main_cgp\":\"" + json_escape(cells_to_cgp(raw_main_cells)) + "\"";
     }
     // Include occupancy grid so UI can show it
-    if (have_color || have_opencv) {
+    if (have_opencv) {
         extra += ",\"occupancy\":[";
         for (int r = 0; r < 15; r++) {
             if (r > 0) extra += ",";
@@ -4232,6 +4132,9 @@ int main(int argc, char* argv[]) {
         auto buf = std::make_shared<std::vector<uint8_t>>(
             file.content.begin(), file.content.end());
 
+        // Detect memento (server-rendered share image) from filename
+        bool is_memento = file.filename.find("_memento") != std::string::npos;
+
         // Store for test case saving
         {
             std::lock_guard<std::mutex> lk(g_last_image_mutex);
@@ -4241,8 +4144,8 @@ int main(int argc, char* argv[]) {
         res.set_header("X-Content-Type-Options", "nosniff");
         res.set_chunked_content_provider(
             "application/x-ndjson",
-            [buf](size_t /*offset*/, httplib::DataSink& sink) {
-                stream_analyze_gemini(*buf, sink);
+            [buf, is_memento](size_t /*offset*/, httplib::DataSink& sink) {
+                stream_analyze_gemini(*buf, sink, is_memento);
                 return false;
             });
     });

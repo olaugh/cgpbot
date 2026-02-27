@@ -131,6 +131,8 @@ static inline bool parse_gemini_board(const std::string& text,
                 }
             } else if (pos + 4 <= s.size() && s.substr(pos, 4) == "null") {
                 pos += 4;
+            } else if (pos < s.size()) {
+                pos++; // unknown token — advance to avoid infinite loop
             }
 
             if (c < 15)
