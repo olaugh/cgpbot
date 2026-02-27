@@ -3259,38 +3259,43 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     // Rack validation runs after word corrections (see below).
     std::string rack_warning;
 
-    // Step 7.5: Lexicon inference — if Gemini didn't detect a valid lexicon,
-    // check board words to distinguish NWL23 vs CSW24.
+    // Step 7.5: Lexicon inference — always check board words regardless of
+    // what Gemini returned. If CSW-only words are present, that's definitive
+    // evidence for CSW24 and overrides Gemini's claim (Gemini sometimes says
+    // NWL23 for CSW24 games).
     {
-        bool need_inference = gemini_lexicon.empty();
-        if (!need_inference) {
-            // Check if the lexicon Gemini returned actually has a KWG file
-            std::string lpath = "magpie/data/lexica/" + gemini_lexicon + ".kwg";
-            if (!fs::exists(lpath)) need_inference = true;
-        }
-        if (need_inference) {
+        bool have_valid_gemini_lex = !gemini_lexicon.empty()
+            && fs::exists("magpie/data/lexica/" + gemini_lexicon + ".kwg");
+
         std::vector<std::string> csw_only;
         std::string inferred = infer_lexicon(dr.cells, &csw_only);
-        gemini_lexicon = inferred;
+
         if (!csw_only.empty()) {
+            // Found CSW-only words — override whatever Gemini returned.
             std::string wlist;
             for (const auto& w : csw_only) {
                 if (!wlist.empty()) wlist += ", ";
                 wlist += w;
             }
+            std::string note = (have_valid_gemini_lex && gemini_lexicon != "CSW24")
+                ? " (overrides Gemini's " + gemini_lexicon + ")" : "";
+            gemini_lexicon = "CSW24";
             std::string msg = "{\"status\":\"Inferred lexicon CSW24 (CSW-only words: "
-                + json_escape(wlist) + ")\"}\n";
+                + json_escape(wlist) + json_escape(note) + ")\"}\n";
             sink.write(msg.data(), msg.size());
-        } else {
+        } else if (!have_valid_gemini_lex) {
+            // Gemini gave no valid lexicon and no CSW-only words found.
+            gemini_lexicon = "NWL23";
             std::string msg = "{\"status\":\"Inferred lexicon NWL23 (no CSW-only words found)\"}\n";
             sink.write(msg.data(), msg.size());
         }
-        // Update CGP with inferred lexicon
+        // If Gemini gave a valid lexicon and no CSW-only words, keep it as-is.
+
+        // Update CGP with confirmed lexicon
         dr.cgp = cells_to_cgp(dr.cells) + " "
                + (gemini_rack.empty() ? "" : gemini_rack) + "/ "
                + std::to_string(gemini_score1) + " " + std::to_string(gemini_score2)
                + " lex " + gemini_lexicon + ";";
-        }
     }
 
     // Step 8: Dictionary validation — check all words against KWG
@@ -3595,6 +3600,20 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                             dr.cells[sp.first][sp.second] = orig;
                             if (found_count == 0 || found_count > 1) continue;
 
+                            // If the original letter was agreed on by both raw
+                            // main OCR and word-crop (current == raw_main),
+                            // don't clobber it — defer to visual dict_requery.
+                            char raw_upper = 0;
+                            if (raw_main_cells[sp.first][sp.second].letter)
+                                raw_upper = static_cast<char>(std::toupper(
+                                    static_cast<unsigned char>(
+                                        raw_main_cells[sp.first][sp.second].letter)));
+                            if (raw_upper && raw_upper == orig_upper) {
+                                // Both agreed: leave the cell alone, keep it
+                                // in suspects so dict_requery can crop-verify.
+                                continue;
+                            }
+
                             if (!wc_detail.empty()) wc_detail += ", ";
                             wc_detail +=
                                 std::string(1, static_cast<char>('A' + sp.second))
@@ -3633,6 +3652,16 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                             dr.cells[sp0.first][sp0.second] = orig0;
                             dr.cells[sp1.first][sp1.second] = orig1;
                             if (found_count == 0 || found_count > 1) continue;
+
+                            // If either cell was agreed on by raw OCR and
+                            // word-crop, defer both to dict_requery.
+                            auto raw_upper2 = [&](const std::pair<int,int>& sp) {
+                                char r = raw_main_cells[sp.first][sp.second].letter;
+                                return r ? static_cast<char>(std::toupper(
+                                    static_cast<unsigned char>(r))) : (char)0;
+                            };
+                            char r0 = raw_upper2(sp0), r1 = raw_upper2(sp1);
+                            if ((r0 && r0 == u0) || (r1 && r1 == u1)) continue;
 
                             if (!wc_detail.empty()) wc_detail += ", ";
                             wc_detail +=
