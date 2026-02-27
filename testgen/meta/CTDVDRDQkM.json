@@ -1,0 +1,15 @@
+{
+  "lexicon": "CSW24",
+  "players": [
+    "BestBot",
+    "Jesse Day"
+  ],
+  "move_count": 31,
+  "has_phony": false,
+  "has_blank_on_board": true,
+  "has_exchange": false,
+  "final_scores": [
+    449
+  ],
+  "game_type": "classic"
+}

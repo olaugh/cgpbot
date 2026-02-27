@@ -1,0 +1,15 @@
+{
+  "lexicon": "NWL23",
+  "players": [
+    "BestBot",
+    "Andrew Friedman"
+  ],
+  "move_count": 21,
+  "has_phony": false,
+  "has_blank_on_board": true,
+  "has_exchange": false,
+  "final_scores": [
+    450
+  ],
+  "game_type": "classic"
+}

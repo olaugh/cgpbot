@@ -1,0 +1,15 @@
+{
+  "lexicon": "NWL23",
+  "players": [
+    "BestBot",
+    "C\u00e9sar del Solar"
+  ],
+  "move_count": 9,
+  "has_phony": false,
+  "has_blank_on_board": false,
+  "has_exchange": false,
+  "final_scores": [
+    217
+  ],
+  "game_type": "classic"
+}

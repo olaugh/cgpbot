@@ -1,0 +1,15 @@
+{
+  "lexicon": "NWL23",
+  "players": [
+    "BestBot",
+    "Agnes Kramer"
+  ],
+  "move_count": 23,
+  "has_phony": false,
+  "has_blank_on_board": true,
+  "has_exchange": false,
+  "final_scores": [
+    389
+  ],
+  "game_type": "classic"
+}

@@ -1,0 +1,15 @@
+{
+  "lexicon": "CSW24",
+  "players": [
+    "Jesse Day",
+    "budak"
+  ],
+  "move_count": 31,
+  "has_phony": false,
+  "has_blank_on_board": true,
+  "has_exchange": false,
+  "final_scores": [
+    271
+  ],
+  "game_type": "classic"
+}

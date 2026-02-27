@@ -799,6 +799,7 @@ h1{font-size:1.4rem;margin-bottom:20px;color:#fff;font-weight:600}
         <button class="btn" id="eval-stop-btn" onclick="evalStop()" style="display:none;background:#a33">Stop Eval</button>
       </div>
       <textarea id="cgp-output" rows="3" spellcheck="false"></textarea>
+      <div id="woogles-area" style="display:none;margin-top:8px;padding:8px 12px;background:#0f1f0f;border:1px solid #2a3a2a;border-radius:6px;font-size:.82rem"></div>
     </div>
     <div class="panel" style="margin-top:20px">
       <h2>Board</h2>
@@ -1022,6 +1023,27 @@ async function processStream(res){
           ocrLetters=boardLetters.map(row=>[...row]);
           if(!data.status) status.textContent='Done.';
           if(currentTestCase) updateDiffSummary(data.cgp);
+          // Clear previous woogles result while lookup runs
+          const wa=document.getElementById('woogles-area');
+          wa.style.display='none'; wa.innerHTML='';
+        }
+        if('woogles' in data){
+          const w=data.woogles;
+          const wa=document.getElementById('woogles-area');
+          if(w&&w.game_id){
+            const url=`https://woogles.io/game/${w.game_id}?turn=${w.turn}`;
+            const ps=(w.players||[]).join(' vs ');
+            const lex=w.lexicon?` &middot; ${w.lexicon}`:'';
+            const sim=w.similarity!=null?` &middot; sim&nbsp;${w.similarity.toFixed(3)}`:'';
+            wa.innerHTML=`<span style="color:#8f8">&#9654;</span>&nbsp;<a href="${url}" target="_blank" style="color:#58a6ff;font-weight:600">${w.game_id} turn&nbsp;${w.turn}</a>`
+              +(ps?`&nbsp;&nbsp;<span style="color:#aaa">${ps}</span>`:'')
+              +lex+sim;
+          }else{
+            wa.innerHTML='<span style="color:#666">No Woogles match found.</span>';
+          }
+          wa.style.display='block';
+          if(!document.getElementById('status').textContent.startsWith('Error'))
+            status.textContent='Done.';
         }
       }catch(e){}
     }
@@ -1564,6 +1586,7 @@ async function evalAllGemini(){
         const blob=await ir.blob();
         const form=new FormData();
         form.append('image',new File([blob],n+'.png',{type:'image/png'}));
+        form.append('skip_woogles','1');
         const resp=await fetch('/analyze-gemini',{method:'POST',body:form});
         const reader=resp.body.getReader(),dec=new TextDecoder();
         let buf='';
@@ -2018,7 +2041,8 @@ static std::map<std::string, std::string> parse_json_str_map(
 // ---------------------------------------------------------------------------
 static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                                    httplib::DataSink& sink,
-                                   bool is_memento = false) {
+                                   bool is_memento = false,
+                                   bool skip_woogles = false) {
     // Step 1: Run OpenCV pipeline for board detection
     {
         std::string msg = "{\"status\":\"Detecting board layout...\"}\n";
@@ -2288,11 +2312,15 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             "\\n  That score is the ON-TURN player's score."
             "\\n  The OTHER score box is the waiting player's score."
             "\\n  List ON-TURN player's score FIRST, waiting player SECOND."
+            "\\n- The PLAYER USERNAMES shown in the score boxes (e.g. \\\"cesar\\\", \\\"BestBot\\\")."
+            "\\n  player1 = on-turn player, player2 = waiting player."
             "\\n\\nReturn ONLY a JSON object with these fields:"
             "\\n{"
             "\\n  \\\"board\\\": [[...], ...],  // 15x15 array"
             "\\n  \\\"rack\\\": \\\"ABCDE?F\\\",  // current player rack (? = blank)"
-            "\\n  \\\"scores\\\": [241, 198]  // [ON-TURN player score, waiting player score]"
+            "\\n  \\\"scores\\\": [241, 198],  // [ON-TURN player score, waiting player score]"
+            "\\n  \\\"player1\\\": \\\"on_turn_username\\\",  // optional, if visible"
+            "\\n  \\\"player2\\\": \\\"waiting_username\\\"   // optional, if visible"
             "\\n}";
         prompt += "\\n\\nBoard array elements:"
             "\\n- Uppercase letter (e.g. \\\"A\\\") for regular tiles (purple or gold squares)"
@@ -2353,13 +2381,18 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
             "\\n  STEP 2 — Confirm: the ON-TURN player's score box usually has a GREEN background."
             "\\n  STEP 3 — Confirm: the rack tiles shown belong to the ON-TURN player."
             "\\nList the ON-TURN player's score FIRST, waiting player SECOND."
+            "\\n- The PLAYER USERNAMES from the player panels (the text labels showing each "
+            "player's Woogles username, e.g. \\\"cesar\\\", \\\"BestBot\\\")."
+            "\\n  player1 = on-turn player, player2 = waiting player."
             "\\n\\nReturn ONLY a JSON object with these fields:"
             "\\n{"
             "\\n  \\\"board\\\": [[...], ...],  // 15x15 array"
             "\\n  \\\"rack\\\": \\\"ABCDE?F\\\",  // current player rack (? = blank)"
             "\\n  \\\"lexicon\\\": \\\"NWL23\\\",  // lexicon name"
             "\\n  \\\"bag\\\": \\\"A E II O U B C D L N S TT X\\\",  // tile tracking text"
-            "\\n  \\\"scores\\\": [241, 198]  // [ON-TURN player score, waiting player score]"
+            "\\n  \\\"scores\\\": [241, 198],  // [ON-TURN player score, waiting player score]"
+            "\\n  \\\"player1\\\": \\\"on_turn_username\\\",  // optional, if visible"
+            "\\n  \\\"player2\\\": \\\"waiting_username\\\"   // optional, if visible"
             "\\n}";
         prompt += "\\n\\nBoard array elements:";
         if (is_light_mode) {
@@ -2443,8 +2476,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         return;
     }
 
-    // Extract rack, lexicon, and bag from the JSON response
+    // Extract rack, lexicon, bag, player names from the JSON response
     std::string gemini_rack, gemini_lexicon, gemini_bag;
+    std::string gemini_player1, gemini_player2;
     int gemini_score1 = 0, gemini_score2 = 0;
     {
         auto extract_str = [&](const char* key) -> std::string {
@@ -2461,6 +2495,8 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         gemini_rack = extract_str("rack");
         gemini_lexicon = extract_str("lexicon");
         gemini_bag = extract_str("bag");
+        gemini_player1 = extract_str("player1");
+        gemini_player2 = extract_str("player2");
 
         // Extract scores: find "scores" : [ N, N ]
         auto scores_pos = text.find("\"scores\"");
@@ -4103,10 +4139,83 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         }
         extra += "]";
     }
+    // Include player names in extra fields if available
+    if (!gemini_player1.empty())
+        extra += ",\"player1\":\"" + json_escape(gemini_player1) + "\"";
+    if (!gemini_player2.empty())
+        extra += ",\"player2\":\"" + json_escape(gemini_player2) + "\"";
     if (!extra.empty())
         final_json.insert(final_json.size() - 1, extra); // insert before }
     final_json += "\n";
     sink.write(final_json.data(), final_json.size());
+
+    // --- Woogles game lookup ---
+    // Run after emitting the CGP result so the user sees it immediately.
+    // Skipped during eval runs (skip_woogles=true) to avoid slowdown.
+    if (!skip_woogles && !dr.cgp.empty()) {
+        {
+            std::string s = "{\"status\":\"Looking up game in Woogles database...\"}\n";
+            sink.write(s.data(), s.size());
+        }
+        // Build JSON input for woogles_lookup.py
+        std::string lookup_input = "{\"cgp\":\"" + json_escape(dr.cgp) + "\"";
+        lookup_input += ",\"players\":[";
+        bool had_player = false;
+        if (!gemini_player1.empty()) {
+            lookup_input += "\"" + json_escape(gemini_player1) + "\"";
+            had_player = true;
+        }
+        if (!gemini_player2.empty()) {
+            if (had_player) lookup_input += ",";
+            lookup_input += "\"" + json_escape(gemini_player2) + "\"";
+        }
+        lookup_input += "]";
+        if (gemini_score1 != 0 || gemini_score2 != 0)
+            lookup_input += ",\"scores\":["
+                + std::to_string(gemini_score1) + ","
+                + std::to_string(gemini_score2) + "]";
+        lookup_input += "}";
+
+        // Write to a temp file to avoid shell-escaping issues
+        char tmp_buf[] = "/tmp/cgpbot_wlu_XXXXXX";
+        int tmpfd = mkstemp(tmp_buf);
+        if (tmpfd >= 0) {
+            const char* d = lookup_input.data();
+            size_t rem = lookup_input.size();
+            while (rem > 0) {
+                ssize_t n = ::write(tmpfd, d, rem);
+                if (n <= 0) break;
+                d += n; rem -= n;
+            }
+            ::close(tmpfd);
+
+            std::string cmd = "python3 testgen/scripts/woogles_lookup.py < ";
+            cmd += tmp_buf;
+            cmd += " 2>/dev/null";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            std::string result;
+            if (pipe) {
+                char buf[8192];
+                while (fgets(buf, sizeof(buf), pipe)) result += buf;
+                pclose(pipe);
+            }
+            std::remove(tmp_buf);
+
+            // Trim trailing whitespace
+            while (!result.empty() &&
+                   (result.back() == '\n' || result.back() == '\r' ||
+                    result.back() == ' '))
+                result.pop_back();
+
+            if (!result.empty()) {
+                std::string woogles_line = "{\"woogles\":" + result + "}\n";
+                sink.write(woogles_line.data(), woogles_line.size());
+            } else {
+                std::string woogles_line = "{\"woogles\":null}\n";
+                sink.write(woogles_line.data(), woogles_line.size());
+            }
+        }
+    }
     sink.done();
 }
 
@@ -4163,6 +4272,8 @@ int main(int argc, char* argv[]) {
 
         // Detect memento (server-rendered share image) from filename
         bool is_memento = file.filename.find("_memento") != std::string::npos;
+        // skip_woogles=true skips the Woogles lookup (used during eval runs)
+        bool skip_woogles = req.has_file("skip_woogles");
 
         // Store for test case saving
         {
@@ -4173,8 +4284,8 @@ int main(int argc, char* argv[]) {
         res.set_header("X-Content-Type-Options", "nosniff");
         res.set_chunked_content_provider(
             "application/x-ndjson",
-            [buf, is_memento](size_t /*offset*/, httplib::DataSink& sink) {
-                stream_analyze_gemini(*buf, sink, is_memento);
+            [buf, is_memento, skip_woogles](size_t /*offset*/, httplib::DataSink& sink) {
+                stream_analyze_gemini(*buf, sink, is_memento, skip_woogles);
                 return false;
             });
     });
