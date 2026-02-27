@@ -1542,7 +1542,7 @@ async function evalAllGemini(){
   catch(e){results.innerHTML='<div style="color:#f88">Error fetching test list.</div>';return;}
   if(!cases.length){results.innerHTML='<div style="color:#888">No test cases found.</div>';return;}
 
-  const TH=`<tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th style="color:#68a">Occ%</th><th style="color:#68a">Raw%</th><th style="color:#68a">Align%</th><th style="color:#68a">Trans%</th><th style="color:#68a">Retry%</th><th style="color:#68a">WC%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th></tr>`;
+  const TH=`<tr><th>Case</th><th>Cells</th><th>Correct</th><th>Wrong</th><th>Board%</th><th style="color:#68a">Occ%</th><th style="color:#68a">Raw%</th><th style="color:#68a">Align%</th><th style="color:#68a">Trans%</th><th style="color:#68a">Retry%</th><th style="color:#68a">WC%</th><th>Exp scores</th><th>Got scores</th><th>&#9654;</th><th>Game</th></tr>`;
   results.innerHTML=`<table class="test-results" id="eval-table">${TH}</table><div id="eval-running" style="color:#888;margin-top:6px"></div>`;
   const tbl=document.getElementById('eval-table');
   startEvalSpinner();
@@ -1576,7 +1576,8 @@ async function evalAllGemini(){
       +stCols
       +`<td id="ec-${n}-exps" style="font-family:monospace">${expScores?expScores[0]+' '+expScores[1]:'—'}</td>`
       +`<td id="ec-${n}-gots" style="font-family:monospace">${SP}</td>`
-      +`<td id="ec-${n}-scok">—</td></tr>`);
+      +`<td id="ec-${n}-scok">—</td>`
+      +`<td id="ec-${n}-game">${SP}</td></tr>`);
 
     // Stream NDJSON and update cells as stages arrive
     let gotCGP='',stageCGPs={};
@@ -1586,7 +1587,6 @@ async function evalAllGemini(){
         const blob=await ir.blob();
         const form=new FormData();
         form.append('image',new File([blob],n+'.png',{type:'image/png'}));
-        form.append('skip_woogles','1');
         const resp=await fetch('/analyze-gemini',{method:'POST',body:form});
         const reader=resp.body.getReader(),dec=new TextDecoder();
         let buf='';
@@ -1606,6 +1606,16 @@ async function evalAllGemini(){
                 stageCGPs[d.stage]=d.stage_cgp;
                 const m={realigned:'realigned',trans:'trans',retry:'retry',wc:'wc'};
                 if(m[d.stage])evalSetCell(n,m[d.stage],stageAccFromBoards(d.stage_cgp,expBoard));
+              }
+              if('woogles' in d){
+                const w=d.woogles;
+                const gc=document.getElementById(`ec-${n}-game`);
+                if(gc){
+                  if(w&&w.game_id){
+                    const url=`https://woogles.io/game/${w.game_id}?turn=${w.turn}`;
+                    gc.innerHTML=`<a href="${url}" target="_blank" style="color:#8cf">${w.game_id}&nbsp;t${w.turn}</a>`;
+                  }else{gc.textContent='—';}
+                }
               }
             }catch(e){}
           }
@@ -1640,7 +1650,7 @@ async function evalAllGemini(){
     // Clear any remaining spinners in stage cells
     EVAL_SCOLS.forEach(col=>{const el=document.getElementById(`ec-${n}-${col}`);if(el&&el.querySelector('.eval-spin'))el.textContent='—';});
     if(diffs.length)document.getElementById(`eval-row-${n}`)
-      .insertAdjacentHTML('afterend',`<tr><td colspan="14" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`);
+      .insertAdjacentHTML('afterend',`<tr><td colspan="15" style="color:#f88;font-family:'SF Mono',monospace;font-size:.7rem;padding:2px 8px">&nbsp;&nbsp;${diffs.join('  ')}</td></tr>`);
 
     // Scores
     let gotSc='—',scOk='—';
@@ -1671,7 +1681,7 @@ async function evalAllGemini(){
   document.getElementById('eval-running').textContent='';
   const totPct=totalCells?((totalCorrect/totalCells)*100).toFixed(1)+'%':'—';
   tbl.insertAdjacentHTML('beforeend',
-    `<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="6"></td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td></tr>`);
+    `<tr style="font-weight:bold;border-top:2px solid #555"><td>TOTAL</td><td>${totalCells}</td><td>${totalCorrect}</td><td style="color:${totalWrong?'#f88':'#4c4'}">${totalWrong}</td><td>${totPct}</td><td colspan="6"></td><td colspan="2" style="color:#ccc">${scoresCorrect}/${scoresTotal} scores ✓</td><td></td><td></td></tr>`);
 
   try{await fetch('/eval-save',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({total_cells:totalCells,correct:totalCorrect,
@@ -2034,6 +2044,61 @@ static std::map<std::string, std::string> parse_json_str_map(
         if (p < text.size() && text[p] == ',') p++;
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Run woogles_lookup.py in a subprocess. Returns raw JSON string or "null".
+// Thread-safe: uses mkstemp for the input temp file.
+// ---------------------------------------------------------------------------
+static std::string run_woogles_lookup(const std::string& cgp,
+                                       const std::string& player1,
+                                       const std::string& player2,
+                                       int score1, int score2) {
+    std::string lookup_input = "{\"cgp\":\"" + json_escape(cgp) + "\"";
+    lookup_input += ",\"players\":[";
+    bool had_player = false;
+    if (!player1.empty()) {
+        lookup_input += "\"" + json_escape(player1) + "\"";
+        had_player = true;
+    }
+    if (!player2.empty()) {
+        if (had_player) lookup_input += ",";
+        lookup_input += "\"" + json_escape(player2) + "\"";
+    }
+    lookup_input += "]";
+    if (score1 != 0 || score2 != 0)
+        lookup_input += ",\"scores\":["
+            + std::to_string(score1) + "," + std::to_string(score2) + "]";
+    lookup_input += "}";
+
+    char tmp_buf[] = "/tmp/cgpbot_wlu_XXXXXX";
+    int tmpfd = mkstemp(tmp_buf);
+    if (tmpfd < 0) return "null";
+    const char* d = lookup_input.data();
+    size_t rem = lookup_input.size();
+    while (rem > 0) {
+        ssize_t n = ::write(tmpfd, d, rem);
+        if (n <= 0) break;
+        d += n; rem -= n;
+    }
+    ::close(tmpfd);
+
+    std::string cmd = "python3 testgen/scripts/woogles_lookup.py < ";
+    cmd += tmp_buf;
+    cmd += " 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    std::string result;
+    if (pipe) {
+        char buf[8192];
+        while (fgets(buf, sizeof(buf), pipe)) result += buf;
+        pclose(pipe);
+    }
+    std::remove(tmp_buf);
+
+    while (!result.empty() &&
+           (result.back() == '\n' || result.back() == '\r' || result.back() == ' '))
+        result.pop_back();
+    return result.empty() ? "null" : result;
 }
 
 // ---------------------------------------------------------------------------
@@ -2522,6 +2587,21 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
         sink.write(err.data(), err.size());
         sink.done();
         return;
+    }
+
+    // Launch Woogles lookup asynchronously — runs concurrently with OCR corrections.
+    // We check the result before the expensive dict_requery step.
+    std::string woogles_json_result;
+    bool woogles_matched = false;
+    std::future<std::string> woogles_fut;
+    if (!skip_woogles) {
+        std::string wlu_cgp = cells_to_cgp(dr.cells);
+        std::string p1 = gemini_player1, p2 = gemini_player2;
+        int s1 = gemini_score1, s2 = gemini_score2;
+        woogles_fut = std::async(std::launch::async,
+            [wlu_cgp, p1, p2, s1, s2]() -> std::string {
+                return run_woogles_lookup(wlu_cgp, p1, p2, s1, s2);
+            });
     }
 
     // Join all word-crop OCR batch futures (launched in parallel with main OCR).
@@ -3334,9 +3414,65 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                + " lex " + gemini_lexicon + ";";
     }
 
+    // Check Woogles async result — if matched, apply golden data and skip Step 8.
+    if (woogles_fut.valid()) {
+        woogles_json_result = woogles_fut.get();
+        if (woogles_json_result != "null" && !woogles_json_result.empty()
+                && woogles_json_result.find("\"game_id\"") != std::string::npos) {
+            // Extract golden_cgp from result
+            std::string golden_cgp = json_extract_string(woogles_json_result, "golden_cgp");
+            if (!golden_cgp.empty()) {
+                woogles_matched = true;
+                // Apply golden board to dr.cells
+                auto board = parse_cgp_board(golden_cgp);
+                for (int r = 0; r < 15; r++)
+                    for (int c = 0; c < 15; c++) {
+                        char ch = board[r][c];
+                        if (ch == 0) {
+                            dr.cells[r][c].letter = 0;
+                            dr.cells[r][c].is_blank = false;
+                        } else {
+                            dr.cells[r][c].letter = ch;
+                            dr.cells[r][c].is_blank = std::islower(
+                                static_cast<unsigned char>(ch));
+                        }
+                        dr.cells[r][c].confidence = 1.0f;
+                    }
+                // Extract rack and scores from golden_cgp ("boardstr rack/ score1 score2 lex LEX;")
+                // The rack/score slash is the one AFTER the first space (following the board string).
+                auto space_pos = golden_cgp.find(' ');
+                if (space_pos != std::string::npos) {
+                    auto slash_pos2 = golden_cgp.find('/', space_pos);
+                    if (slash_pos2 != std::string::npos) {
+                        gemini_rack = golden_cgp.substr(space_pos + 1,
+                                                        slash_pos2 - space_pos - 1);
+                        int s1 = 0, s2 = 0;
+                        if (sscanf(golden_cgp.c_str() + slash_pos2, "/ %d %d", &s1, &s2) == 2) {
+                            gemini_score1 = s1;
+                            gemini_score2 = s2;
+                        }
+                    }
+                }
+                // Extract lexicon from golden_cgp
+                {
+                    auto lp = golden_cgp.find(" lex ");
+                    if (lp != std::string::npos) {
+                        std::string lex_part = golden_cgp.substr(lp + 5);
+                        auto sc = lex_part.find(';');
+                        if (sc != std::string::npos) lex_part = lex_part.substr(0, sc);
+                        if (!lex_part.empty()) gemini_lexicon = lex_part;
+                    }
+                }
+                dr.cgp = golden_cgp;
+                std::string msg = "{\"status\":\"Woogles match found — using golden data, skipping OCR refinement.\"}\n";
+                sink.write(msg.data(), msg.size());
+            }
+        }
+    }
+
     // Step 8: Dictionary validation — check all words against KWG
     std::string invalid_words_json;  // JSON array string for UI
-    {
+    if (!woogles_matched) {
         std::string lex = gemini_lexicon;
         if (lex.empty()) lex = "NWL23";  // default
         bool dict_ok = ensure_kwg_loaded(lex);
@@ -3954,8 +4090,9 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
 
     // --- Rack validation & auto-correction ---
     // Runs after word corrections so the warning reflects the final board state.
+    // Skipped when Woogles golden data already provides exact tile information.
     // full bag - board tiles - bag tiles = expected rack
-    {
+    if (!woogles_matched) {
         // Standard Scrabble tile distribution (100 tiles)
         int full_bag[27] = {}; // A-Z = 0-25, blank = 26
         auto set_bag = [&](char ch, int n) {
@@ -4086,6 +4223,56 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     }
 
 
+    // --- Woogles fallback: if early async lookup failed, retry with final board ---
+    // The async lookup ran on raw OCR which may have been inaccurate (e.g. mementos).
+    // The corrected board gives much better letter_accuracy for matching.
+    if (!skip_woogles && woogles_json_result == "null" && !dr.cgp.empty()) {
+        std::string s = "{\"status\":\"Woogles: retrying with corrected board...\"}\n";
+        sink.write(s.data(), s.size());
+        woogles_json_result = run_woogles_lookup(
+            cells_to_cgp(dr.cells),
+            gemini_player1, gemini_player2,
+            gemini_score1, gemini_score2);
+        // If fallback found a match, apply golden scores/rack/lexicon
+        if (woogles_json_result != "null"
+                && woogles_json_result.find("\"game_id\"") != std::string::npos) {
+            std::string golden_cgp = json_extract_string(woogles_json_result, "golden_cgp");
+            if (!golden_cgp.empty()) {
+                // Extract rack and scores — use the slash AFTER the first space,
+                // not the first slash (which is in the board rows).
+                auto sp = golden_cgp.find(' ');
+                if (sp != std::string::npos) {
+                    auto sl = golden_cgp.find('/', sp);
+                    if (sl != std::string::npos) {
+                        gemini_rack = golden_cgp.substr(sp + 1, sl - sp - 1);
+                        int s1 = 0, s2 = 0;
+                        if (sscanf(golden_cgp.c_str() + sl, "/ %d %d", &s1, &s2) == 2) {
+                            gemini_score1 = s1;
+                            gemini_score2 = s2;
+                        }
+                    }
+                }
+                // Extract lexicon
+                {
+                    auto lp = golden_cgp.find(" lex ");
+                    if (lp != std::string::npos) {
+                        std::string lx = golden_cgp.substr(lp + 5);
+                        auto sc = lx.find(';');
+                        if (sc != std::string::npos) lx = lx.substr(0, sc);
+                        if (!lx.empty()) gemini_lexicon = lx;
+                    }
+                }
+                // Rebuild dr.cgp with golden metadata and corrected OCR board
+                dr.cgp = cells_to_cgp(dr.cells) + " " + gemini_rack + "/ "
+                       + std::to_string(gemini_score1) + " "
+                       + std::to_string(gemini_score2)
+                       + " lex " + gemini_lexicon + ";";
+                std::string msg = "{\"status\":\"Woogles fallback match — golden scores/lexicon applied.\"}\n";
+                sink.write(msg.data(), msg.size());
+            }
+        }
+    }
+
     std::string final_json = make_json_response(dr);
     // Inject extra fields before the closing }
     std::string extra;
@@ -4149,72 +4336,10 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     final_json += "\n";
     sink.write(final_json.data(), final_json.size());
 
-    // --- Woogles game lookup ---
-    // Run after emitting the CGP result so the user sees it immediately.
-    // Skipped during eval runs (skip_woogles=true) to avoid slowdown.
-    if (!skip_woogles && !dr.cgp.empty()) {
-        {
-            std::string s = "{\"status\":\"Looking up game in Woogles database...\"}\n";
-            sink.write(s.data(), s.size());
-        }
-        // Build JSON input for woogles_lookup.py
-        std::string lookup_input = "{\"cgp\":\"" + json_escape(dr.cgp) + "\"";
-        lookup_input += ",\"players\":[";
-        bool had_player = false;
-        if (!gemini_player1.empty()) {
-            lookup_input += "\"" + json_escape(gemini_player1) + "\"";
-            had_player = true;
-        }
-        if (!gemini_player2.empty()) {
-            if (had_player) lookup_input += ",";
-            lookup_input += "\"" + json_escape(gemini_player2) + "\"";
-        }
-        lookup_input += "]";
-        if (gemini_score1 != 0 || gemini_score2 != 0)
-            lookup_input += ",\"scores\":["
-                + std::to_string(gemini_score1) + ","
-                + std::to_string(gemini_score2) + "]";
-        lookup_input += "}";
-
-        // Write to a temp file to avoid shell-escaping issues
-        char tmp_buf[] = "/tmp/cgpbot_wlu_XXXXXX";
-        int tmpfd = mkstemp(tmp_buf);
-        if (tmpfd >= 0) {
-            const char* d = lookup_input.data();
-            size_t rem = lookup_input.size();
-            while (rem > 0) {
-                ssize_t n = ::write(tmpfd, d, rem);
-                if (n <= 0) break;
-                d += n; rem -= n;
-            }
-            ::close(tmpfd);
-
-            std::string cmd = "python3 testgen/scripts/woogles_lookup.py < ";
-            cmd += tmp_buf;
-            cmd += " 2>/dev/null";
-            FILE* pipe = popen(cmd.c_str(), "r");
-            std::string result;
-            if (pipe) {
-                char buf[8192];
-                while (fgets(buf, sizeof(buf), pipe)) result += buf;
-                pclose(pipe);
-            }
-            std::remove(tmp_buf);
-
-            // Trim trailing whitespace
-            while (!result.empty() &&
-                   (result.back() == '\n' || result.back() == '\r' ||
-                    result.back() == ' '))
-                result.pop_back();
-
-            if (!result.empty()) {
-                std::string woogles_line = "{\"woogles\":" + result + "}\n";
-                sink.write(woogles_line.data(), woogles_line.size());
-            } else {
-                std::string woogles_line = "{\"woogles\":null}\n";
-                sink.write(woogles_line.data(), woogles_line.size());
-            }
-        }
+    // --- Emit Woogles result (computed async above, with fallback if needed) ---
+    if (!skip_woogles) {
+        std::string woogles_line = "{\"woogles\":" + woogles_json_result + "}\n";
+        sink.write(woogles_line.data(), woogles_line.size());
     }
     sink.done();
 }
