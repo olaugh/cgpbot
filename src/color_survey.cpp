@@ -54,11 +54,14 @@ static void parse_cgp_occupancy(const std::string& cgp, bool occ[15][15]) {
     }
 }
 
-enum Style { LIGHT_DESK, DARK_DESK, LIGHT_MOB, DARK_MOB, MEMENTO, ORIGINAL };
-static const char* STYLE_NAME[] = {"light_desk","dark_desk","light_mob","dark_mob","memento","original"};
+enum Style { LIGHT_DESK, DARK_DESK, LIGHT_MOB, DARK_MOB, MEMENTO, ORIGINAL, MAHOGANY_DESK, MAHOGANY_MOB };
+static const char* STYLE_NAME[] = {"light_desk","dark_desk","light_mob","dark_mob","memento","original","mahogany_desk","mahogany_mob"};
+static const int N_STYLES = 8;
 
 static Style classify_style(const std::string& name) {
     if (name.find("_memento") != std::string::npos) return MEMENTO;
+    if (name.find("_mahogany_desktop") != std::string::npos) return MAHOGANY_DESK;
+    if (name.find("_mahogany_mobile") != std::string::npos) return MAHOGANY_MOB;
     if (name.find("_light_desktop") != std::string::npos) return LIGHT_DESK;
     if (name.find("_dark_desktop") != std::string::npos) return DARK_DESK;
     if (name.find("_light_mobile") != std::string::npos) return LIGHT_MOB;
@@ -79,7 +82,7 @@ int main(int argc, char* argv[]) {
     std::string dir = argv[1];
 
     // [style][premium_type][tile=1/empty=0] -> samples
-    std::vector<Sample> data[6][6][2];
+    std::vector<Sample> data[N_STYLES][6][2];
     int n_files = 0;
 
     for (auto& entry : fs::directory_iterator(dir)) {
@@ -113,8 +116,10 @@ int main(int argc, char* argv[]) {
                 bool actual = gt_occ[r][c];
                 if (detected != actual) errors++;
             }
-        // Skip badly detected boards
-        if (errors > 15) {
+        // For unknown/new styles like mahogany, board detection is expected to fail;
+        // we still want samples, so use a much higher threshold.
+        int max_errors = (style == MAHOGANY_DESK || style == MAHOGANY_MOB) ? 200 : 15;
+        if (errors > max_errors) {
             std::fprintf(stderr, "  SKIP %s (occ errors=%d)\n", name.c_str(), errors);
             continue;
         }
@@ -165,7 +170,7 @@ int main(int argc, char* argv[]) {
     std::fprintf(stderr, "\n");
 
     // Print summary stats
-    for (int st = 0; st < 6; st++) {
+    for (int st = 0; st < N_STYLES; st++) {
         bool has_data = false;
         for (int p = 0; p < 6; p++)
             for (int t = 0; t < 2; t++)

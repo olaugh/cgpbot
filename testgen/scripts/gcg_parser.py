@@ -277,6 +277,37 @@ def parse_gcg(gcg_text: str) -> List[GameState]:
     return states
 
 
+def patch_forward_racks(states: List[GameState]) -> List[GameState]:
+    """
+    Patch each state's on-turn rack with the actual rack visible in the
+    screenshot.  After state[i], the on-turn player's rack is stale (last
+    set when they played their previous move).  Their real current rack is
+    revealed in their next GCG move line — i.e., the rack field of the next
+    state where that player is about to act.
+
+    Modifies states in-place and returns them.
+    """
+    n = len(states)
+    for i in range(n):
+        on_turn = states[i].on_turn
+        # Look ahead for the next move by on_turn player.
+        # That move's rack will be the on-turn player's pre-move rack,
+        # which equals their screen-visible rack at state[i].
+        for j in range(i + 1, n):
+            # When we find a state where on_turn just played (so the
+            # new on_turn has flipped away), that state's racks[on_turn]
+            # was set from the GCG line — it's the real rack.
+            if states[j].racks[on_turn] != states[i].racks[on_turn]:
+                states[i].racks[on_turn] = states[j].racks[on_turn]
+                break
+            # Also check: if states[j].on_turn != on_turn, it means
+            # on_turn just played at j — racks[on_turn] was set.
+            if states[j].on_turn != on_turn:
+                states[i].racks[on_turn] = states[j].racks[on_turn]
+                break
+    return states
+
+
 def states_to_test_cases(states: List[GameState], game_id: str):
     """
     Convert replay states to (name, cgp) pairs suitable for testdata/.

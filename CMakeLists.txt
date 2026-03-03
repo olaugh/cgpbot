@@ -34,7 +34,7 @@ FetchContent_MakeAvailable(httplib)
 
 # ── OpenCV (system) ──────────────────────────────────────────────────────────
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs dnn)
 
 # ── FreeType2 (for template rendering) ──────────────────────────────────────
 
@@ -51,9 +51,10 @@ add_library(board_lib STATIC src/board.cpp)
 target_include_directories(board_lib PUBLIC src ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(board_lib PUBLIC ${OpenCV_LIBS} PkgConfig::FREETYPE2)
 
-# Pass font path as compile-time define
+# Pass font path and model path as compile-time defines
 target_compile_definitions(board_lib PUBLIC
-    FONT_PATH="${CMAKE_SOURCE_DIR}/fonts/RobotoMono-Bold.ttf")
+    FONT_PATH="${CMAKE_SOURCE_DIR}/fonts/RobotoMono-Bold.ttf"
+    TILE_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/tile_model.onnx")
 
 if(TESSERACT_FOUND)
     target_compile_definitions(board_lib PUBLIC HAS_TESSERACT=1)
@@ -90,3 +91,18 @@ add_executable(test_gemini_parse tests/test_gemini_parse.cpp)
 target_include_directories(test_gemini_parse PRIVATE src ${OpenCV_INCLUDE_DIRS})
 target_compile_definitions(test_gemini_parse PRIVATE
     SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+add_executable(diag src/diag.cpp)
+target_link_libraries(diag PRIVATE board_lib)
+
+# ── Training data extraction ───────────────────────────────────────────────
+
+add_executable(extract_crops src/extract_crops.cpp)
+target_link_libraries(extract_crops PRIVATE board_lib)
+
+add_executable(eval_local src/eval_local.cpp)
+target_link_libraries(eval_local PRIVATE board_lib)
+
+# ── Rack HSV diagnostic ──────────────────────────────────────────────────
+add_executable(rack_diag /tmp/rack_diag.cpp)
+target_link_libraries(rack_diag PRIVATE board_lib)

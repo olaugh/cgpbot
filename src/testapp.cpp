@@ -260,8 +260,13 @@ static void load_dotenv() {
 // ---------------------------------------------------------------------------
 // Build JSON response from DebugResult.
 // ---------------------------------------------------------------------------
-static std::string make_json_response(const DebugResult& dr) {
+static std::string make_json_response(const DebugResult& dr,
+                                       const std::string& rack = "") {
     std::string json = "{\"cgp\":\"" + json_escape(dr.cgp) + "\"";
+
+    if (!rack.empty()) {
+        json += ",\"rack\":\"" + json_escape(rack) + "\"";
+    }
 
     // Per-cell detail array for the UI (letter, confidence, subscript, blank)
     json += ",\"cells\":[";
@@ -512,6 +517,13 @@ static std::array<std::array<char, 15>, 15> parse_cgp_board(const std::string& c
     return board;
 }
 
+// Rack tile struct (used by detect_rack_tiles, stream_analyze, run_tests_cli).
+struct RackTile {
+    cv::Rect rect;
+    std::vector<uint8_t> png;
+    bool is_blank;
+};
+
 // Forward declarations for run_tests_cli.
 static bool parse_board_rect_from_log(const std::string& log,
                                        int& bx, int& by, int& cell_sz,
@@ -519,6 +531,179 @@ static bool parse_board_rect_from_log(const std::string& log,
                                        int* board_h = nullptr);
 static bool detect_board_mode(const std::vector<uint8_t>& image_data,
                                int bx, int by, int cell_sz);
+static std::vector<RackTile> detect_rack_tiles(
+    const std::vector<uint8_t>& image_data,
+    int bx, int by, int cell_sz, bool is_light_mode);
+// Parse rack from CGP string. Rack is the token after the board rows:
+// "board_rows RACK/ scores lex ...;" → returns sorted rack string (e.g. "CEJOTX?")
+static std::string parse_cgp_rack(const std::string& cgp) {
+    // Find first space (end of board rows)
+    auto sp = cgp.find(' ');
+    if (sp == std::string::npos) return {};
+    // Rack runs from sp+1 to the next '/'
+    auto slash = cgp.find('/', sp + 1);
+    if (slash == std::string::npos) return {};
+    return cgp.substr(sp + 1, slash - sp - 1);
+}
+
+// Sort a rack string for comparison (order doesn't matter).
+static std::string sort_rack(const std::string& rack) {
+    std::string s = rack;
+    std::sort(s.begin(), s.end());
+    return s;
+}
+
+// Scrabble tile distribution (max count per letter in a standard game).
+static const int RACK_TILE_DIST[26] = {
+//  A  B  C  D  E  F  G  H  I  J  K  L  M  N  O  P  Q  R  S  T  U  V  W  X  Y  Z
+    9, 2, 2, 4,12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1
+};
+
+// Classify a rack tile: decode PNG, trim bottom 15%, center-crop to square,
+// classify with CNN.
+// Returns full CellResult (including top-5 candidates) for downstream
+// rack refinement.
+static CellResult classify_rack_tile_full(const RackTile& rt) {
+    CellResult cr = {};
+    if (rt.is_blank) {
+        cr.letter = '?';
+        cr.is_blank = true;
+        return cr;
+    }
+    cv::Mat raw(1, static_cast<int>(rt.png.size()), CV_8UC1,
+                const_cast<uint8_t*>(rt.png.data()));
+    cv::Mat crop = cv::imdecode(raw, cv::IMREAD_COLOR);
+    if (crop.empty()) { cr.letter = '?'; return cr; }
+
+    // Trim bottom ~15% to remove extra background below tile.
+    int trim_bot = crop.rows * 15 / 100;
+    int new_h = std::max(1, crop.rows - trim_bot);
+    // Center-crop to square aspect ratio (CNN expects 32x32).
+    int new_w = crop.cols;
+    int x_off = 0;
+    if (new_w > new_h) {
+        x_off = (new_w - new_h) / 2;
+        new_w = new_h;
+    }
+    cv::Rect letter_roi(x_off, 0, new_w, new_h);
+    letter_roi &= cv::Rect(0, 0, crop.cols, crop.rows);
+    cv::Mat letter_crop = crop(letter_roi);
+
+    cr = classify_single_tile(letter_crop);
+    // Normalize to uppercase
+    if (cr.letter >= 'a' && cr.letter <= 'z')
+        cr.letter = static_cast<char>(cr.letter - 32);
+    return cr;
+}
+
+// Convenience wrapper returning just the letter.
+static char classify_rack_tile(const RackTile& rt) {
+    CellResult cr = classify_rack_tile_full(rt);
+    char ch = cr.letter;
+    if (ch >= 'A' && ch <= 'Z') return ch;
+    return '?';
+}
+
+// Refine rack classification using remaining tile pool constraints.
+// Only UPPERCASE letters on the board consume regular tile copies; lowercase
+// letters are blanks played as that letter and do NOT reduce the regular pool.
+// We also account for potentially undetected blanks: if fewer than 2 blanks
+// are identified on the board (lowercase cells), the remaining could be hiding
+// among uppercase cells, adding slack to the remaining pool.
+static void refine_rack(CellResult rack_results[], int n_tiles,
+                        const CellResult board_cells[15][15]) {
+    if (n_tiles <= 0) return;
+
+    // Count REGULAR tiles on the board (uppercase only) and detected blanks.
+    int board_counts[26] = {};
+    int blanks_on_board = 0;
+    for (int r = 0; r < 15; r++)
+        for (int c = 0; c < 15; c++) {
+            char ch = board_cells[r][c].letter;
+            if (ch >= 'A' && ch <= 'Z')
+                board_counts[ch - 'A']++;
+            else if (ch >= 'a' && ch <= 'z')
+                blanks_on_board++;
+        }
+
+    // Count blanks in the rack
+    int blanks_in_rack = 0;
+    for (int i = 0; i < n_tiles; i++)
+        if (rack_results[i].letter == '?' || rack_results[i].is_blank)
+            blanks_in_rack++;
+
+    // Up to 2 blanks exist in the game. Some may be undetected among
+    // uppercase board cells, adding per-letter slack to the remaining pool.
+    int undetected_blanks = std::max(0, 2 - blanks_on_board - blanks_in_rack);
+
+    // Remaining pool per letter, accounting for blank slack.
+    // For letter L with board_counts[L] uppercase cells, up to
+    // min(board_counts[L], undetected_blanks) of those could be blanks,
+    // so the true remaining is at least:
+    //   TILE_DIST[L] - board_counts[L] + min(board_counts[L], undetected_blanks)
+    int remaining[26] = {};
+    for (int li = 0; li < 26; li++) {
+        int slack = std::min(board_counts[li], undetected_blanks);
+        remaining[li] = RACK_TILE_DIST[li] - board_counts[li] + slack;
+    }
+
+    // Iterative refinement: fix pool violations
+    for (int pass = 0; pass < 14; pass++) {
+        // Count rack letter assignments
+        int rack_counts[26] = {};
+        for (int i = 0; i < n_tiles; i++) {
+            char ch = rack_results[i].letter;
+            if (ch >= 'A' && ch <= 'Z')
+                rack_counts[ch - 'A']++;
+        }
+
+        // Find the worst violation: any letter where rack assigns more
+        // than the remaining pool allows
+        int worst_li = -1;
+        int worst_excess = 0;
+        for (int li = 0; li < 26; li++) {
+            int excess = rack_counts[li] - std::max(0, remaining[li]);
+            if (excess > worst_excess) {
+                worst_excess = excess;
+                worst_li = li;
+            }
+        }
+        if (worst_li < 0) break;  // no violations
+
+        // Find the weakest-confidence rack tile with this letter
+        int weakest_idx = -1;
+        float weakest_conf = 2.0f;
+        for (int i = 0; i < n_tiles; i++) {
+            if (rack_results[i].letter == 'A' + worst_li) {
+                if (rack_results[i].confidence < weakest_conf) {
+                    weakest_conf = rack_results[i].confidence;
+                    weakest_idx = i;
+                }
+            }
+        }
+        if (weakest_idx < 0) break;
+
+        // Reassign to the next-best candidate that has remaining copies
+        CellResult& cr = rack_results[weakest_idx];
+        bool reassigned = false;
+        for (int k = 1; k < 5; k++) {
+            char cand = cr.cand_letters[k];
+            if (cand < 'A' || cand > 'Z') continue;
+            int cli = cand - 'A';
+            if (cand == cr.letter) continue;
+            // Check if this candidate has remaining copies
+            int cand_used = rack_counts[cli];
+            if (cand_used < std::max(0, remaining[cli])) {
+                cr.letter = cand;
+                cr.confidence = cr.cand_scores[k];
+                reassigned = true;
+                break;
+            }
+        }
+        if (!reassigned) break;  // can't fix, stop
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Run all test cases from testdata/ directory (CLI mode).
 // ---------------------------------------------------------------------------
@@ -530,6 +715,8 @@ static int run_tests_cli() {
 
     int total_cases = 0, passed_cases = 0;
     int total_occ_expected = 0, total_occ_correct = 0, total_occ_false_pos = 0;
+    int rack_cases = 0, rack_perfect = 0;
+    int rack_total_tiles = 0, rack_correct_tiles = 0;
 
     std::vector<fs::directory_entry> entries;
     for (const auto& e : fs::directory_iterator("testdata"))
@@ -592,14 +779,72 @@ static int run_tests_cli() {
 
         double occ_pct = occ_expected > 0 ? (100.0 * occ_correct / occ_expected) : 100.0;
         int fn = occ_expected - occ_correct;
-        std::printf("%-20s occ %3d/%3d (%.0f%%) +%d fp -%d fn",
+        std::printf("%-45s occ %3d/%3d (%.0f%%) +%d fp -%d fn",
                     name.c_str(), occ_correct, occ_expected, occ_pct,
                     occ_false_pos, fn);
         if (!fp_cells.empty()) std::printf("  FP:[%s]", fp_cells.c_str());
         if (!fn_cells.empty()) std::printf("  FN:[%s]", fn_cells.c_str());
-        std::printf("\n");
 
         if (occ_correct == occ_expected && occ_false_pos == 0) passed_cases++;
+
+        // Rack detection + evaluation
+        std::string expected_rack = parse_cgp_rack(expected_cgp);
+        std::string got_rack;
+        if (dr.cell_size > 0 && !expected_rack.empty()) {
+            bool is_light = detect_board_mode(img_data,
+                dr.board_rect.x, dr.board_rect.y, dr.cell_size);
+            auto rack_tiles = detect_rack_tiles(img_data,
+                dr.board_rect.x, dr.board_rect.y, dr.cell_size, is_light);
+
+            int n_rt = static_cast<int>(rack_tiles.size());
+            CellResult rack_cr[7] = {};
+            for (int i = 0; i < n_rt && i < 7; i++)
+                rack_cr[i] = classify_rack_tile_full(rack_tiles[i]);
+            refine_rack(rack_cr, std::min(n_rt, 7), dr.cells);
+            for (int i = 0; i < n_rt && i < 7; i++) {
+                char ch = rack_cr[i].letter;
+                got_rack += (ch >= 'A' && ch <= 'Z') ? ch : '?';
+            }
+
+            // Compare: sort both for order-independent comparison
+            std::string exp_sorted = sort_rack(expected_rack);
+            std::string got_sorted = sort_rack(got_rack);
+
+            // Per-tile accuracy: compare sorted strings character by character
+            int n_exp = static_cast<int>(exp_sorted.size());
+            int n_got = static_cast<int>(got_sorted.size());
+            int tile_correct = 0;
+            // Use simple sorted-string matching
+            int ei = 0, gi = 0;
+            while (ei < n_exp && gi < n_got) {
+                if (exp_sorted[ei] == got_sorted[gi]) {
+                    tile_correct++;
+                    ei++; gi++;
+                } else if (exp_sorted[ei] < got_sorted[gi]) {
+                    ei++;
+                } else {
+                    gi++;
+                }
+            }
+
+            rack_cases++;
+            rack_total_tiles += n_exp;
+            rack_correct_tiles += tile_correct;
+            bool rack_ok = (exp_sorted == got_sorted);
+            if (rack_ok) rack_perfect++;
+
+            std::printf("  rack %d/%d %s",
+                        tile_correct, n_exp, rack_ok ? "OK" : "MISS");
+            if (!rack_ok) {
+                std::printf(" exp=%s got=%s", expected_rack.c_str(), got_rack.c_str());
+            }
+        } else if (expected_rack.empty()) {
+            std::printf("  rack (none)");
+        } else {
+            std::printf("  rack SKIP (no board)");
+        }
+        std::printf("\n");
+        fflush(stdout);
     }
 
     if (total_cases == 0) {
@@ -612,6 +857,14 @@ static int run_tests_cli() {
     std::printf("Occupancy: %d/%d (%.1f%%) +%d fp -%d fn\n",
                 total_occ_correct, total_occ_expected, occ_overall,
                 total_occ_false_pos, total_occ_expected - total_occ_correct);
+
+    if (rack_cases > 0) {
+        double rack_tile_pct = rack_total_tiles > 0
+            ? (100.0 * rack_correct_tiles / rack_total_tiles) : 0.0;
+        std::printf("Rack: %d/%d perfect, tiles %d/%d (%.1f%%)\n",
+                    rack_perfect, rack_cases,
+                    rack_correct_tiles, rack_total_tiles, rack_tile_pct);
+    }
 
     return (passed_cases == total_cases) ? 0 : 1;
 }
@@ -1713,6 +1966,9 @@ static std::string make_progress_line(const char* status,
     return json;
 }
 
+// cells_to_cgp from gemini_parse.h (included later for other uses too)
+#include "gemini_parse.h"
+
 // ---------------------------------------------------------------------------
 // Stream processing results as NDJSON (newline-delimited JSON).
 // ---------------------------------------------------------------------------
@@ -1725,8 +1981,61 @@ static void stream_analyze(const std::vector<uint8_t>& buf,
             sink.write(line.data(), line.size());
         });
 
-    // Final result line (includes cgp, cells, etc.)
-    std::string final_json = make_json_response(dr);
+    // Rack tile detection + local OCR
+    std::string rack_str;
+    if (dr.cell_size > 0) {
+        bool is_light = detect_board_mode(buf,
+            dr.board_rect.x, dr.board_rect.y, dr.cell_size);
+        auto rack_tiles = detect_rack_tiles(buf,
+            dr.board_rect.x, dr.board_rect.y, dr.cell_size, is_light);
+
+        {
+            int n_rt = static_cast<int>(rack_tiles.size());
+            CellResult rack_cr[7] = {};
+            for (int i = 0; i < n_rt && i < 7; i++)
+                rack_cr[i] = classify_rack_tile_full(rack_tiles[i]);
+            refine_rack(rack_cr, std::min(n_rt, 7), dr.cells);
+            for (int i = 0; i < n_rt && i < 7; i++) {
+                char ch = rack_cr[i].letter;
+                rack_str += (ch >= 'A' && ch <= 'Z') ? ch : '?';
+            }
+        }
+
+        // Annotate debug image with rack detections + letters
+        if (!rack_tiles.empty()) {
+            // Label each tile with its classified letter
+            if (!dr.debug_png.empty()) {
+                cv::Mat raw(1, static_cast<int>(dr.debug_png.size()), CV_8UC1,
+                            dr.debug_png.data());
+                cv::Mat img = cv::imdecode(raw, cv::IMREAD_COLOR);
+                if (!img.empty()) {
+                    for (size_t i = 0; i < rack_tiles.size(); i++) {
+                        const auto& rt = rack_tiles[i];
+                        cv::Scalar color = rt.is_blank
+                            ? cv::Scalar(255, 0, 255)
+                            : cv::Scalar(0, 255, 255);
+                        cv::rectangle(img, rt.rect, color, 2);
+                        if (i < rack_str.size()) {
+                            std::string lbl(1, rack_str[i]);
+                            cv::putText(img, lbl,
+                                cv::Point(rt.rect.x + 2, rt.rect.y - 4),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.7, color, 2);
+                        }
+                    }
+                    cv::imencode(".png", img, dr.debug_png);
+                }
+            }
+        }
+
+        // Rebuild CGP with rack
+        if (!rack_str.empty()) {
+            std::string board_part = cells_to_cgp(dr.cells);
+            dr.cgp = board_part + " " + rack_str + "/ 0/0 0 lex NWL23;";
+        }
+    }
+
+    // Final result line (includes cgp, cells, rack, etc.)
+    std::string final_json = make_json_response(dr, rack_str);
     final_json += "\n";
     sink.write(final_json.data(), final_json.size());
     sink.done();
@@ -1809,19 +2118,16 @@ static bool detect_board_mode(const std::vector<uint8_t>& image_data,
 // where subscript lives) give the background color without letter
 // interference, avoiding mis-detection of heavy letters like W/M.
 // ---------------------------------------------------------------------------
-// Detect rack tiles below the board by scanning for beige/tan rectangles.
-// Returns cropped images + bounding rects for each rack tile found.
+// Detect rack tiles below the board.
+// Strategy: create a foreground mask, find the main horizontal band of
+// foreground (the rack row), then use column-projection to locate individual
+// tile boundaries within that band. This handles the common case where
+// adjacent tiles merge into one wide contour.
 // ---------------------------------------------------------------------------
-struct RackTile {
-    cv::Rect rect;
-    std::vector<uint8_t> png;
-    bool is_blank;  // true if tile appears to have no letter (blank)
-};
-
 static std::vector<RackTile> detect_rack_tiles(
     const std::vector<uint8_t>& image_data,
     int bx, int by, int cell_sz,
-    bool is_light_mode = false)
+    bool is_light_mode)
 {
     std::vector<RackTile> tiles;
     cv::Mat raw(1, static_cast<int>(image_data.size()), CV_8UC1,
@@ -1829,75 +2135,256 @@ static std::vector<RackTile> detect_rack_tiles(
     cv::Mat img = cv::imdecode(raw, cv::IMREAD_COLOR);
     if (img.empty()) return tiles;
 
-    // Rack is below the board. Search from board bottom (small gap)
     int board_bottom = by + 15 * cell_sz;
-    int search_top = board_bottom + cell_sz / 4;  // start closer to board
-    int search_bottom = std::min(img.rows, board_bottom + 5 * cell_sz);
+    int search_top = board_bottom + cell_sz / 3;
+    // Rack is close to board — restrict to ~2 cells to avoid game history area
+    int search_bottom = std::min(img.rows, board_bottom + cell_sz * 5 / 2);
     if (search_top >= img.rows) return tiles;
 
-    // Convert to HSV for color detection
-    cv::Mat hsv;
-    cv::cvtColor(img, hsv, cv::COLOR_BGR2HSV);
-
-    // Create mask for tile color — beige in dark mode, blue/purple in light mode
-    cv::Mat beige_mask;
-    if (is_light_mode) {
-        cv::inRange(hsv, cv::Scalar(90, 30, 30), cv::Scalar(150, 255, 220), beige_mask);
-    } else {
-        cv::inRange(hsv, cv::Scalar(5, 10, 100), cv::Scalar(45, 200, 255), beige_mask);
-    }
-
-    // Only look in the rack search area
-    cv::Mat search_mask = cv::Mat::zeros(beige_mask.size(), beige_mask.type());
     int x_left = std::max(0, bx - cell_sz);
     int x_right = std::min(img.cols, bx + 15 * cell_sz + cell_sz);
     cv::Rect search_roi(x_left, search_top,
                          x_right - x_left,
                          search_bottom - search_top);
     search_roi &= cv::Rect(0, 0, img.cols, img.rows);
-    beige_mask(search_roi).copyTo(search_mask(search_roi));
+    if (search_roi.width <= 0 || search_roi.height <= 0) return tiles;
 
-    // Morphological close to fill gaps in tile detection
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
-    cv::morphologyEx(search_mask, search_mask, cv::MORPH_CLOSE, kernel);
+    cv::Mat region = img(search_roi);
+    cv::Mat hsv;
+    cv::cvtColor(region, hsv, cv::COLOR_BGR2HSV);
 
-    // Find contours
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(search_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    // Detect rack area background: sample corners of search region.
+    // The rack area background can differ from the board — e.g. mahogany has
+    // a dark board but light rack background.
+    cv::Mat v_chan;
+    cv::extractChannel(hsv, v_chan, 2);
+    int sample_sz = std::max(3, cell_sz / 4);
+    auto sample_mean_v = [&](int sx, int sy) {
+        cv::Rect sr(sx, sy,
+            std::min(sample_sz, v_chan.cols - sx),
+            std::min(sample_sz, v_chan.rows - sy));
+        sr &= cv::Rect(0, 0, v_chan.cols, v_chan.rows);
+        if (sr.width <= 0 || sr.height <= 0) return 128.0;
+        return cv::mean(v_chan(sr))[0];
+    };
+    double bg_v = std::min({sample_mean_v(0, 0),
+                            sample_mean_v(v_chan.cols - sample_sz, 0),
+                            sample_mean_v(0, v_chan.rows - sample_sz),
+                            sample_mean_v(v_chan.cols - sample_sz, v_chan.rows - sample_sz)});
+    bool rack_bg_is_light = (bg_v > 150);
 
-    // Filter by size — rack tiles should be roughly cell_sz x cell_sz
-    int min_dim = cell_sz / 2;
-    int max_dim = cell_sz * 2;
-    for (const auto& contour : contours) {
-        cv::Rect br = cv::boundingRect(contour);
-        if (br.width < min_dim || br.height < min_dim) continue;
-        if (br.width > max_dim || br.height > max_dim) continue;
+    // Build foreground mask based on actual rack background
+    cv::Mat mask;
+    if (rack_bg_is_light) {
+        // Light rack background: tiles are colored on white/cream.
+        // Use saturation to find colored pixels.
+        cv::Mat s_chan;
+        cv::extractChannel(hsv, s_chan, 1);
+        cv::threshold(s_chan, mask, 25, 255, cv::THRESH_BINARY);
+        // Exclude very dark pixels
+        cv::Mat not_dark;
+        cv::threshold(v_chan, not_dark, 50, 255, cv::THRESH_BINARY);
+        mask &= not_dark;
+    } else {
+        // Dark rack background: tiles are brighter than background.
+        int thresh = std::max(80, (int)(bg_v + 40));
+        cv::threshold(v_chan, mask, thresh, 255, cv::THRESH_BINARY);
+        // Also include saturated pixels (colored tiles on dark bg, e.g. green theme).
+        // Dark green tiles have V ≈ 50-80 (similar to bg) but S >> 0.
+        cv::Mat s_chan;
+        cv::extractChannel(hsv, s_chan, 1);
+        cv::Mat s_mask;
+        cv::threshold(s_chan, s_mask, 40, 255, cv::THRESH_BINARY);
+        cv::Mat v_above_bg;
+        cv::threshold(v_chan, v_above_bg, (int)(bg_v + 10), 255, cv::THRESH_BINARY);
+        s_mask &= v_above_bg;
+        mask |= s_mask;
+    }
 
-        // Check if tile has text (letter) or is blank
-        cv::Mat gray;
-        cv::cvtColor(img(br), gray, cv::COLOR_BGR2GRAY);
-        cv::Scalar gm, gs;
-        cv::meanStdDev(gray, gm, gs);
-        bool is_blank_tile = (gs[0] < 15); // very low variance = no letter
+    // Close to fill letter interiors (letters have holes)
+    int close_sz = std::max(3, cell_sz / 8);
+    cv::Mat k_close = cv::getStructuringElement(
+        cv::MORPH_RECT, cv::Size(close_sz, close_sz));
+    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, k_close);
 
-        // Crop with small padding
-        int p = 2;
-        int cx = std::max(0, br.x - p);
-        int cy = std::max(0, br.y - p);
-        int cw = std::min(br.width + 2*p, img.cols - cx);
-        int ch = std::min(br.height + 2*p, img.rows - cy);
-        cv::Mat crop = img(cv::Rect(cx, cy, cw, ch));
-        std::vector<uint8_t> png_buf;
-        cv::imencode(".png", crop, png_buf);
+    // Small open to remove specks
+    cv::Mat k_open = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, k_open);
 
-        tiles.push_back({cv::Rect(cx, cy, cw, ch), std::move(png_buf), is_blank_tile});
+    // Horizontal projection: sum of foreground per row → find the rack band
+    cv::Mat row_sum;
+    cv::reduce(mask, row_sum, 1, cv::REDUCE_SUM, CV_32S);
+
+    // Find the densest row band (rack y-position).
+    int best_band_y = -1;
+    double best_band_sum = 0;
+    int band_h = std::max(1, cell_sz * 3 / 4);
+    for (int y = 0; y <= mask.rows - band_h; y++) {
+        double sum = 0;
+        for (int dy = 0; dy < band_h; dy++)
+            sum += row_sum.at<int>(y + dy, 0);
+        if (sum > best_band_sum) {
+            best_band_sum = sum;
+            best_band_y = y;
+        }
+    }
+    if (best_band_y < 0 || best_band_sum == 0) return tiles;
+
+    // Expand the band slightly to capture full tile height
+    int band_top = std::max(0, best_band_y - cell_sz / 8);
+    int band_bot = std::min(mask.rows, best_band_y + band_h + cell_sz / 8);
+
+    // Column projection within the rack band: sum of foreground per column
+    cv::Mat band_mask = mask(cv::Rect(0, band_top, mask.cols, band_bot - band_top));
+    cv::Mat col_sum;
+    cv::reduce(band_mask, col_sum, 0, cv::REDUCE_SUM, CV_32S);
+
+    // Find tile columns: threshold the column projection to find "on" regions
+    // A column is "on" if its sum is at least 30% of band height
+    int col_thresh = (band_bot - band_top) * 255 * 3 / 10;
+    std::vector<std::pair<int,int>> segments;  // (x_start, x_end) of "on" regions
+    bool in_seg = false;
+    int seg_start = 0;
+    for (int x = 0; x < col_sum.cols; x++) {
+        int val = col_sum.at<int>(0, x);
+        if (val >= col_thresh) {
+            if (!in_seg) { seg_start = x; in_seg = true; }
+        } else {
+            if (in_seg) { segments.push_back({seg_start, x}); in_seg = false; }
+        }
+    }
+    if (in_seg) segments.push_back({seg_start, col_sum.cols});
+
+    // Process all segments: split wide ones into tile-sized pieces,
+    // keep individual tile-sized segments as-is.
+    struct TileRect { cv::Rect rect; };  // in full-image coords
+    std::vector<TileRect> candidates;
+
+    int abs_y = search_roi.y + band_top;
+    int abs_h = band_bot - band_top;
+
+    for (auto& [sx, ex] : segments) {
+        int seg_w = ex - sx;
+        if (seg_w < cell_sz / 3) continue;  // too narrow, skip
+
+        int abs_x = search_roi.x + sx;
+
+        if (seg_w <= cell_sz * 3 / 2) {
+            // Single tile or button
+            candidates.push_back({{abs_x, abs_y, seg_w, abs_h}});
+        } else {
+            // Multiple merged tiles — use local column-projection minima
+            // to find gaps between tiles within this segment.
+            int n_tiles_est = std::max(1, (seg_w + cell_sz / 3) / cell_sz);
+            if (n_tiles_est > 7) n_tiles_est = 7;
+
+            // Find local minima in column projection within segment
+            std::vector<int> split_points;  // x-offsets within segment to split
+            int min_gap = cell_sz / 4;      // minimum distance between splits
+            for (int x = min_gap; x < seg_w - min_gap; x++) {
+                int v = col_sum.at<int>(0, sx + x);
+                // Check if this is a local minimum in a window
+                bool is_min = true;
+                int win = std::max(3, cell_sz / 8);
+                for (int dx = -win; dx <= win && is_min; dx++) {
+                    int nx = sx + x + dx;
+                    if (nx >= 0 && nx < col_sum.cols) {
+                        if (col_sum.at<int>(0, nx) < v) is_min = false;
+                    }
+                }
+                if (is_min && v < col_thresh) {
+                    // Only split at sufficiently low minima
+                    if (split_points.empty() || x - split_points.back() >= min_gap)
+                        split_points.push_back(x);
+                }
+            }
+
+            // Use split points to create tile rects
+            if ((int)split_points.size() >= n_tiles_est - 1) {
+                // Good split — use the best n_tiles-1 split points
+                // (pick the deepest minima if too many)
+                if ((int)split_points.size() > n_tiles_est - 1) {
+                    // Sort by depth (lowest column value first)
+                    std::sort(split_points.begin(), split_points.end(),
+                        [&](int a, int b) {
+                            return col_sum.at<int>(0, sx + a) < col_sum.at<int>(0, sx + b);
+                        });
+                    split_points.resize(n_tiles_est - 1);
+                    std::sort(split_points.begin(), split_points.end());
+                }
+                int prev = 0;
+                for (int sp : split_points) {
+                    int tw = sp - prev;
+                    if (tw > 0) candidates.push_back({{abs_x + prev, abs_y, tw, abs_h}});
+                    prev = sp;
+                }
+                int tw = seg_w - prev;
+                if (tw > 0) candidates.push_back({{abs_x + prev, abs_y, tw, abs_h}});
+            } else {
+                // Fallback: equal-width splitting
+                int tile_w = seg_w / n_tiles_est;
+                for (int i = 0; i < n_tiles_est; i++) {
+                    int tx = abs_x + i * tile_w;
+                    int tw = (i < n_tiles_est - 1) ? tile_w : (abs_x + seg_w - tx);
+                    candidates.push_back({{tx, abs_y, tw, abs_h}});
+                }
+            }
+        }
+    }
+
+    if (candidates.empty()) return tiles;
+
+    // Drop button candidates: buttons are single-tile-sized segments at the
+    // far left and right edges, outside the central rack zone.
+    int board_center_x = bx + 7 * cell_sz + cell_sz / 2;
+    int rack_half = 5 * cell_sz;  // 7 tiles span ~7 cells; need margin for off-center racks
+    std::vector<TileRect> filtered;
+    for (auto& c : candidates) {
+        int cx = c.rect.x + c.rect.width / 2;
+        // Drop if far from center AND single-tile-sized
+        if (c.rect.width <= cell_sz * 3 / 2) {
+            if (std::abs(cx - board_center_x) > rack_half) continue;
+        }
+        filtered.push_back(c);
+    }
+
+    // Limit to 7 tiles max, prefer centrally located
+    if (filtered.size() > 7) {
+        std::sort(filtered.begin(), filtered.end(),
+                  [board_center_x](const TileRect& a, const TileRect& b) {
+                      int da = std::abs(a.rect.x + a.rect.width / 2 - board_center_x);
+                      int db = std::abs(b.rect.x + b.rect.width / 2 - board_center_x);
+                      return da < db;
+                  });
+        filtered.resize(7);
     }
 
     // Sort left to right
-    std::sort(tiles.begin(), tiles.end(),
-              [](const RackTile& a, const RackTile& b) {
+    std::sort(filtered.begin(), filtered.end(),
+              [](const TileRect& a, const TileRect& b) {
                   return a.rect.x < b.rect.x;
               });
+
+    // Convert to RackTile output
+    for (auto& c : filtered) {
+        cv::Rect r = c.rect & cv::Rect(0, 0, img.cols, img.rows);
+        cv::Mat gray;
+        cv::cvtColor(img(r), gray, cv::COLOR_BGR2GRAY);
+        cv::Scalar gm, gs;
+        cv::meanStdDev(gray, gm, gs);
+        bool is_blank_tile = (gs[0] < 15);
+
+        int p = 2;
+        int px = std::max(0, r.x - p);
+        int py = std::max(0, r.y - p);
+        int pw = std::min(r.width + 2 * p, img.cols - px);
+        int ph = std::min(r.height + 2 * p, img.rows - py);
+        cv::Mat crop = img(cv::Rect(px, py, pw, ph));
+        std::vector<uint8_t> png_buf;
+        cv::imencode(".png", crop, png_buf);
+
+        tiles.push_back({cv::Rect(px, py, pw, ph), std::move(png_buf), is_blank_tile});
+    }
 
     return tiles;
 }
@@ -2143,10 +2630,16 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                 + "-" + std::to_string(std::min(static_cast<int>(849), board_bottom + 6*cell_sz));
             rack_msg += "\"}\n";
             sink.write(rack_msg.data(), rack_msg.size());
-            // Report detected mode
+            // Report detected mode + board rect for UI overlay
             std::string mode_msg = std::string("{\"status\":\"Board mode: ") +
                 (is_light_mode ? "light" : "dark") +
-                (is_memento ? " (memento share image)" : "") + "\"}\n";
+                (is_memento ? " (memento share image)" : "") + "\""
+                + ",\"board_rect\":{\"x\":" + std::to_string(bx)
+                + ",\"y\":" + std::to_string(by)
+                + ",\"w\":" + std::to_string(board_w > 0 ? board_w : 15 * cell_sz)
+                + ",\"h\":" + std::to_string(15 * cell_sz)
+                + ",\"cell_sz\":" + std::to_string(cell_sz)
+                + "}}\n";
             sink.write(mode_msg.data(), mode_msg.size());
         }
     }
@@ -2950,19 +3443,92 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     // Stage snapshot: after word-crop OCR corrections
     { std::string s="{\"stage\":\"trans\",\"stage_cgp\":\""+json_escape(cells_to_cgp(dr.cells))+"\"}\n"; sink.write(s.data(),s.size()); }
 
+    // Step 4.5: Early Woogles check — if occupancy is locked, apply golden
+    // data now and skip the disputed-cell retry (which would let Gemini
+    // hallucinate phantom tiles from wood grain texture).
+    bool woogles_occupancy_locked = false;
+    if (woogles_fut.valid()) {
+        // The Python subprocess has been running concurrently with all the OCR
+        // correction steps.  Check if it's done; if not, wait briefly — it's
+        // cheaper than the Gemini retry call we'd otherwise make.
+        auto status = woogles_fut.wait_for(std::chrono::seconds(0));
+        if (status != std::future_status::ready)
+            status = woogles_fut.wait_for(std::chrono::seconds(5));
+        if (status == std::future_status::ready) {
+            woogles_json_result = woogles_fut.get();
+            if (woogles_json_result != "null" && !woogles_json_result.empty()
+                    && woogles_json_result.find("\"game_id\"") != std::string::npos) {
+                // Check occupancy_locked flag
+                woogles_occupancy_locked =
+                    woogles_json_result.find("\"occupancy_locked\": true") != std::string::npos
+                    || woogles_json_result.find("\"occupancy_locked\":true") != std::string::npos;
+                if (woogles_occupancy_locked) {
+                    std::string golden_cgp = json_extract_string(woogles_json_result, "golden_cgp");
+                    if (!golden_cgp.empty()) {
+                        woogles_matched = true;
+                        auto board = parse_cgp_board(golden_cgp);
+                        for (int r = 0; r < 15; r++)
+                            for (int c = 0; c < 15; c++) {
+                                char ch = board[r][c];
+                                if (ch == 0) {
+                                    dr.cells[r][c].letter = 0;
+                                    dr.cells[r][c].is_blank = false;
+                                } else {
+                                    dr.cells[r][c].letter = ch;
+                                    dr.cells[r][c].is_blank = std::islower(
+                                        static_cast<unsigned char>(ch));
+                                }
+                                dr.cells[r][c].confidence = 1.0f;
+                            }
+                        // Extract rack and scores
+                        auto space_pos = golden_cgp.find(' ');
+                        if (space_pos != std::string::npos) {
+                            auto slash_pos2 = golden_cgp.find('/', space_pos);
+                            if (slash_pos2 != std::string::npos) {
+                                gemini_rack = golden_cgp.substr(space_pos + 1,
+                                                                slash_pos2 - space_pos - 1);
+                                int s1 = 0, s2 = 0;
+                                if (sscanf(golden_cgp.c_str() + slash_pos2, "/ %d %d", &s1, &s2) == 2) {
+                                    gemini_score1 = s1;
+                                    gemini_score2 = s2;
+                                }
+                            }
+                        }
+                        // Extract lexicon
+                        {
+                            auto lp = golden_cgp.find(" lex ");
+                            if (lp != std::string::npos) {
+                                std::string lex_part = golden_cgp.substr(lp + 5);
+                                auto sc = lex_part.find(';');
+                                if (sc != std::string::npos) lex_part = lex_part.substr(0, sc);
+                                if (!lex_part.empty()) gemini_lexicon = lex_part;
+                            }
+                        }
+                        dr.cgp = golden_cgp;
+                        disputed.clear();  // no disputed cells to retry
+                        std::string msg = "{\"status\":\"Woogles occupancy locked — applied golden data, skipping retry.\"}\n";
+                        sink.write(msg.data(), msg.size());
+                    }
+                }
+            }
+        }
+    }
+
     // Step 5: Re-query Gemini for cells needing verification (crop + retry)
     // Two categories:
     //   (a) occupied cells Gemini missed
     //   (b) disputed cells (Gemini found letter, color says empty)
     std::vector<RetryCell> retry_cells;
-    if (have_opencv) {
+    if (have_opencv && !woogles_matched) {
         for (int r = 0; r < 15; r++)
             for (int c = 0; c < 15; c++)
                 if (get_occupied(r, c) && dr.cells[r][c].letter == 0)
                     retry_cells.push_back({r, c, false});
     }
-    for (const auto& d : disputed)
-        retry_cells.push_back({d.r, d.c, true});
+    if (!woogles_matched) {
+        for (const auto& d : disputed)
+            retry_cells.push_back({d.r, d.c, true});
+    }
 
     if (!retry_cells.empty() && have_opencv) {
         int n_missing = 0, n_disputed = 0;
@@ -3014,6 +3580,11 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
                     int sy = cell_img.rows * 6 / 8;
                     cell_img(cv::Rect(sx, sy, cell_img.cols - sx,
                                      cell_img.rows - sy)) = cv::Scalar(128, 128, 128);
+                    // For disputed cells (Gemini saw letter, color says empty),
+                    // blur to suppress wood grain texture that Gemini misreads
+                    // as phantom letters on empty premium squares.
+                    if (rc.is_disputed)
+                        cv::GaussianBlur(cell_img, cell_img, cv::Size(3, 3), 0);
                     std::vector<uint8_t> png_buf;
                     cv::imencode(".png", cell_img, png_buf);
                     retry_payload += ",{\"inlineData\":{\"mimeType\":\"image/png\","
@@ -3415,59 +3986,70 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
     }
 
     // Check Woogles async result — if matched, apply golden data and skip Step 8.
+    // The future may already have been consumed in the early check (Step 4.5).
     if (woogles_fut.valid()) {
         woogles_json_result = woogles_fut.get();
-        if (woogles_json_result != "null" && !woogles_json_result.empty()
-                && woogles_json_result.find("\"game_id\"") != std::string::npos) {
-            // Extract golden_cgp from result
-            std::string golden_cgp = json_extract_string(woogles_json_result, "golden_cgp");
-            if (!golden_cgp.empty()) {
-                woogles_matched = true;
-                // Apply golden board to dr.cells
-                auto board = parse_cgp_board(golden_cgp);
-                for (int r = 0; r < 15; r++)
-                    for (int c = 0; c < 15; c++) {
-                        char ch = board[r][c];
-                        if (ch == 0) {
-                            dr.cells[r][c].letter = 0;
-                            dr.cells[r][c].is_blank = false;
-                        } else {
-                            dr.cells[r][c].letter = ch;
-                            dr.cells[r][c].is_blank = std::islower(
-                                static_cast<unsigned char>(ch));
-                        }
-                        dr.cells[r][c].confidence = 1.0f;
+    }
+    if (!woogles_matched && woogles_json_result != "null" && !woogles_json_result.empty()
+            && woogles_json_result.find("\"game_id\"") != std::string::npos) {
+        // Extract golden_cgp from result
+        std::string golden_cgp = json_extract_string(woogles_json_result, "golden_cgp");
+        if (!golden_cgp.empty()) {
+            woogles_matched = true;
+            // Apply golden board to dr.cells
+            auto board = parse_cgp_board(golden_cgp);
+            for (int r = 0; r < 15; r++)
+                for (int c = 0; c < 15; c++) {
+                    char ch = board[r][c];
+                    if (ch == 0) {
+                        dr.cells[r][c].letter = 0;
+                        dr.cells[r][c].is_blank = false;
+                    } else {
+                        dr.cells[r][c].letter = ch;
+                        dr.cells[r][c].is_blank = std::islower(
+                            static_cast<unsigned char>(ch));
                     }
-                // Extract rack and scores from golden_cgp ("boardstr rack/ score1 score2 lex LEX;")
-                // The rack/score slash is the one AFTER the first space (following the board string).
-                auto space_pos = golden_cgp.find(' ');
-                if (space_pos != std::string::npos) {
-                    auto slash_pos2 = golden_cgp.find('/', space_pos);
-                    if (slash_pos2 != std::string::npos) {
-                        gemini_rack = golden_cgp.substr(space_pos + 1,
-                                                        slash_pos2 - space_pos - 1);
-                        int s1 = 0, s2 = 0;
-                        if (sscanf(golden_cgp.c_str() + slash_pos2, "/ %d %d", &s1, &s2) == 2) {
-                            gemini_score1 = s1;
-                            gemini_score2 = s2;
-                        }
+                    dr.cells[r][c].confidence = 1.0f;
+                }
+            // Extract rack and scores from golden_cgp ("boardstr rack/ score1 score2 lex LEX;")
+            // The rack/score slash is the one AFTER the first space (following the board string).
+            auto space_pos = golden_cgp.find(' ');
+            if (space_pos != std::string::npos) {
+                auto slash_pos2 = golden_cgp.find('/', space_pos);
+                if (slash_pos2 != std::string::npos) {
+                    gemini_rack = golden_cgp.substr(space_pos + 1,
+                                                    slash_pos2 - space_pos - 1);
+                    int s1 = 0, s2 = 0;
+                    if (sscanf(golden_cgp.c_str() + slash_pos2, "/ %d %d", &s1, &s2) == 2) {
+                        gemini_score1 = s1;
+                        gemini_score2 = s2;
                     }
                 }
-                // Extract lexicon from golden_cgp
-                {
-                    auto lp = golden_cgp.find(" lex ");
-                    if (lp != std::string::npos) {
-                        std::string lex_part = golden_cgp.substr(lp + 5);
-                        auto sc = lex_part.find(';');
-                        if (sc != std::string::npos) lex_part = lex_part.substr(0, sc);
-                        if (!lex_part.empty()) gemini_lexicon = lex_part;
-                    }
-                }
-                dr.cgp = golden_cgp;
-                std::string msg = "{\"status\":\"Woogles match found — using golden data, skipping OCR refinement.\"}\n";
-                sink.write(msg.data(), msg.size());
             }
+            // Extract lexicon from golden_cgp
+            {
+                auto lp = golden_cgp.find(" lex ");
+                if (lp != std::string::npos) {
+                    std::string lex_part = golden_cgp.substr(lp + 5);
+                    auto sc = lex_part.find(';');
+                    if (sc != std::string::npos) lex_part = lex_part.substr(0, sc);
+                    if (!lex_part.empty()) gemini_lexicon = lex_part;
+                }
+            }
+            dr.cgp = golden_cgp;
+            std::string msg = "{\"status\":\"Woogles match found — using golden data, skipping OCR refinement.\"}\n";
+            sink.write(msg.data(), msg.size());
         }
+    }
+
+    // Golden occupancy enforcement: if golden data was applied, re-serialize
+    // CGP from cells to ensure consistency (catches any tiles re-added by
+    // intermediate steps like word-crop OCR or connectivity bridge-fills).
+    if (woogles_matched) {
+        dr.cgp = cells_to_cgp(dr.cells) + " "
+               + (gemini_rack.empty() ? "" : gemini_rack) + "/ "
+               + std::to_string(gemini_score1) + " " + std::to_string(gemini_score2)
+               + " lex " + gemini_lexicon + ";";
     }
 
     // Step 8: Dictionary validation — check all words against KWG
@@ -4678,20 +5260,22 @@ th{background:#16213e;color:#888;font-size:.72rem;text-transform:uppercase}
 tr:hover td{background:#1a2540}
 .pass{color:#4c4}.fail{color:#f44}
 .ts{font-size:.72rem;color:#666}
-.case-boards{display:flex;gap:24px;flex-wrap:wrap;margin:16px 0 8px}
+.case-boards{display:flex;gap:20px;flex-wrap:wrap;margin:16px 0 8px;align-items:flex-start}
 .board-box{text-align:center}
-.board-lbl{font-size:.7rem;color:#888;margin-bottom:4px}
-.mini-board{display:grid;grid-template-columns:repeat(15,13px);grid-template-rows:repeat(15,13px);gap:1px;background:#222;border:1px solid #333;border-radius:3px}
-.mb{display:flex;align-items:center;justify-content:center;font-size:6px;font-weight:700;color:#111}
+.board-lbl{font-size:.75rem;color:#888;margin-bottom:6px;font-weight:600}
+.mini-board{display:grid;grid-template-columns:repeat(15,22px);grid-template-rows:repeat(15,22px);gap:1px;background:#222;border:1px solid #333;border-radius:4px}
+.mb{display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#111}
 .mb.tile{background:#f5deb3;color:#111}
-.mb.blank-tile{background:#c8b888;color:#555}
+.mb.blank-tile{background:#b8d8f0;color:#224}
 .mb.tw{background:#c0392b}.mb.dw{background:#e88b8b}.mb.tl{background:#2980b9}.mb.dl{background:#7ec8e3}
 .mb.center{background:#e88b8b}.mb.normal{background:#1b7a3d}
 .mb.wrong-exp{outline:2px solid #f44;outline-offset:-1px;z-index:1}
 .mb.wrong-got{outline:2px solid #f88;outline-offset:-1px;z-index:1}
-.case-section{background:#16213e;border-radius:8px;padding:16px;margin-bottom:16px;border:1px solid #2a2a4a}
-.case-title{font-size:.85rem;font-weight:600;margin-bottom:4px}
-.diff-text{font-size:.72rem;color:#f88;font-family:'SF Mono','Fira Code',monospace;margin-bottom:8px}
+.case-section{background:#16213e;border-radius:8px;padding:20px;margin-bottom:24px;border:1px solid #2a2a4a}
+.case-title{font-size:1rem;font-weight:600;margin-bottom:6px}
+.diff-text{font-size:.75rem;color:#f88;font-family:'SF Mono','Fira Code',monospace;margin-bottom:12px;line-height:1.6}
+.case-img{max-height:350px;border-radius:6px;border:1px solid #444}
+.debug-img{max-height:350px;border-radius:6px;border:1px solid #4c4}
 </style></head><body>
 <a href="/" class="back">&larr; Back to test bench</a>
 <h1>Gemini Eval Results</h1>
@@ -4777,9 +5361,11 @@ if(DATA){
       const pos=d.split(':')[0];expWrong.add(pos);gotWrong.add(pos);
     }
     h+=`<div class="case-section">
-      <div class="case-title">${c.name} &mdash; ${c.wrong} wrong cell${c.wrong>1?'s':''}</div>
+      <div class="case-title">${c.name} &mdash; ${c.wrong} wrong cell${c.wrong>1?'s':''} (${c.cells} total, ${(c.correct/c.cells*100).toFixed(1)}%)</div>
       <div class="diff-text">${(c.diffs||[]).join('&nbsp;&nbsp;')}</div>
       <div class="case-boards">
+        <div class="board-box"><div class="board-lbl">Screenshot</div><img src="/testdata-image/${c.name}" class="case-img"></div>
+        <div class="board-box"><div class="board-lbl">Board Detection</div><img src="/testdata-debug/${c.name}" class="debug-img" loading="lazy"></div>
         <div class="board-box"><div class="board-lbl">Expected</div>${renderMiniBoard(expBoard,expWrong,'wrong-exp')}</div>
         <div class="board-box"><div class="board-lbl">Got</div>${renderMiniBoard(gotBoard,gotWrong,'wrong-got')}</div>
       </div>
@@ -4841,6 +5427,29 @@ if(DATA){
         res.set_content(std::string(buf.begin(), buf.end()), mime);
     });
 
+    // GET /testdata-debug/:name -> run board detection and return debug PNG
+    svr.Get("/testdata-debug/(.*)", [](const httplib::Request& req, httplib::Response& res) {
+        std::string name = req.matches[1];
+        if (name.find('/') != std::string::npos || name.find("..") != std::string::npos) {
+            res.status = 400; return;
+        }
+        // Find the image file
+        std::string img_path;
+        for (auto& ext : std::vector<std::string>{".png", ".jpg", ".jpeg"}) {
+            std::string p = "testdata/" + name + ext;
+            if (fs::exists(p)) { img_path = p; break; }
+        }
+        if (img_path.empty()) { res.status = 404; return; }
+        // Read image
+        std::ifstream ifs(img_path, std::ios::binary);
+        std::vector<uint8_t> buf((std::istreambuf_iterator<char>(ifs)),
+                                  std::istreambuf_iterator<char>());
+        // Run board detection with debug output
+        DebugResult dr = process_board_image_debug(buf);
+        if (dr.debug_png.empty()) { res.status = 500; return; }
+        res.set_content(std::string(dr.debug_png.begin(), dr.debug_png.end()), "image/png");
+    });
+
     // GET /testdata-cgp/:name -> serve the expected CGP text
     svr.Get("/testdata-cgp/(.*)", [](const httplib::Request& req, httplib::Response& res) {
         std::string name = req.matches[1];
@@ -4853,6 +5462,315 @@ if(DATA){
         std::string cgp;
         std::getline(ifs, cgp);
         res.set_content(cgp, "text/plain");
+    });
+
+    // GET /unlabeled-list -> JSON array of names without .cgp files
+    svr.Get("/unlabeled-list", [](const httplib::Request&, httplib::Response& res) {
+        std::string json = "[";
+        bool first = true;
+        if (fs::exists("testdata")) {
+            std::vector<std::string> names;
+            for (const auto& e : fs::directory_iterator("testdata")) {
+                if (e.path().extension() == ".png") {
+                    std::string name = e.path().stem().string();
+                    std::string cgp_path = "testdata/" + name + ".cgp";
+                    if (!fs::exists(cgp_path))
+                        names.push_back(name);
+                }
+            }
+            std::sort(names.begin(), names.end());
+            for (const auto& n : names) {
+                if (!first) json += ",";
+                first = false;
+                json += "\"" + json_escape(n) + "\"";
+            }
+        }
+        json += "]";
+        res.set_content(json, "application/json");
+    });
+
+    // POST /save-label -> body: {"name":"...", "cgp":"..."}
+    svr.Post("/save-label", [](const httplib::Request& req, httplib::Response& res) {
+        std::string name = json_extract_string(req.body, "name");
+        std::string cgp  = json_extract_string(req.body, "cgp");
+        if (name.empty() || cgp.empty() ||
+                name.find('/') != std::string::npos ||
+                name.find("..") != std::string::npos) {
+            res.status = 400;
+            res.set_content(R"({"error":"bad request"})", "application/json");
+            return;
+        }
+        std::string path = "testdata/" + name + ".cgp";
+        std::ofstream ofs(path);
+        ofs << cgp << "\n";
+        res.set_content(R"({"ok":true})", "application/json");
+    });
+
+    // GET /label -> labeling UI for unlabeled screenshots
+    svr.Get("/label", [](const httplib::Request&, httplib::Response& res) {
+        static const char* LABEL_HTML = R"html(<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CGP Labeler</title>
+<style>
+body{margin:0;background:#1a1a2e;color:#ccc;font-family:'SF Mono',monospace;font-size:13px}
+#top{display:flex;align-items:center;gap:12px;padding:10px 16px;background:#111;border-bottom:1px solid #333}
+#top h2{margin:0;font-size:1rem;color:#8cf}
+#progress{color:#888;font-size:.85rem}
+#main{display:flex;gap:0;height:calc(100vh - 46px)}
+#left{flex:0 0 420px;padding:12px;overflow-y:auto;border-right:1px solid #333}
+#right{flex:1;padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto}
+#screenshot-wrap{position:relative;display:inline-block;line-height:0}
+#screenshot{max-width:100%;max-height:300px;object-fit:contain;border:1px solid #444;border-radius:4px}
+#overlay{position:absolute;top:0;left:0;pointer-events:none;border-radius:4px}
+#case-name{color:#8cf;font-size:.9rem;margin-bottom:6px}
+#cgp-input{width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #444;color:#eee;padding:8px;font-family:'SF Mono',monospace;font-size:.8rem;border-radius:4px;resize:vertical;min-height:60px}
+#cgp-input.changed{border-color:#f80}
+.btn{padding:7px 18px;border:none;border-radius:4px;cursor:pointer;font-family:inherit;font-size:.85rem;font-weight:600}
+#btn-accept{background:#2a6;color:#fff}
+#btn-skip{background:#444;color:#ccc}
+#btn-accept:hover{background:#3b7}
+#btn-skip:hover{background:#555}
+#board-wrap{background:#0d1117;border:1px solid #333;border-radius:4px;padding:8px;overflow:auto}
+table.board{border-collapse:collapse}
+table.board td{width:28px;height:28px;text-align:center;vertical-align:middle;font-size:11px;font-weight:700;border:1px solid #2a2a3a;position:relative;box-sizing:border-box}
+.TW{background:#b22}
+.DW{background:#d88}
+.TL{background:#26a}
+.DL{background:#8af}
+.star{background:#d88}
+.tile{background:#e8d5a0;color:#222;border-radius:2px;font-size:12px}
+.blank-tile{background:#b8d8f0;color:#224;border-radius:2px;font-size:12px}
+#woogles-info{font-size:.8rem;color:#8f8;min-height:18px}
+#status-line{font-size:.8rem;color:#888;min-height:18px}
+#done-msg{display:none;padding:40px;text-align:center;color:#8f8;font-size:1.2rem}
+</style>
+</head>
+<body>
+<div id="top">
+  <h2>CGP Labeler</h2>
+  <span id="progress"></span>
+  <span id="status-line"></span>
+</div>
+<div id="done-msg">All cases labeled!</div>
+<div id="main">
+  <div id="left">
+    <div id="case-name"></div>
+    <div id="screenshot-wrap">
+      <img id="screenshot" src="" alt="screenshot">
+      <canvas id="overlay"></canvas>
+    </div>
+  </div>
+  <div id="right">
+    <div id="board-wrap"><table class="board" id="board-table"></table></div>
+    <div id="woogles-info"></div>
+    <textarea id="cgp-input" rows="3" spellcheck="false"></textarea>
+    <div style="display:flex;gap:8px">
+      <button class="btn" id="btn-accept">Accept ✓</button>
+      <button class="btn" id="btn-skip">Skip →</button>
+    </div>
+  </div>
+</div>
+<script>
+const BOARD_BONUSES={
+  '0,0':'TW','0,7':'TW','0,14':'TW','7,0':'TW','7,14':'TW','14,0':'TW','14,7':'TW','14,14':'TW',
+  '1,1':'DW','2,2':'DW','3,3':'DW','4,4':'DW','1,13':'DW','2,12':'DW','3,11':'DW','4,10':'DW',
+  '10,4':'DW','11,3':'DW','12,2':'DW','13,1':'DW','10,10':'DW','11,11':'DW','12,12':'DW','13,13':'DW',
+  '7,7':'star',
+  '5,1':'TL','5,5':'TL','5,9':'TL','5,13':'TL','9,1':'TL','9,5':'TL','9,9':'TL','9,13':'TL',
+  '1,5':'TL','1,9':'TL','13,5':'TL','13,9':'TL',
+  '0,3':'DL','0,11':'DL','2,6':'DL','2,8':'DL','3,0':'DL','3,7':'DL','3,14':'DL',
+  '6,2':'DL','6,6':'DL','6,8':'DL','6,12':'DL','7,3':'DL','7,11':'DL',
+  '8,2':'DL','8,6':'DL','8,8':'DL','8,12':'DL','11,0':'DL','11,7':'DL','11,14':'DL',
+  '12,6':'DL','12,8':'DL','14,3':'DL','14,11':'DL',
+};
+function renderBoard(cgp){
+  const tbl=document.getElementById('board-table');
+  tbl.innerHTML='';
+  const boardStr=cgp.split(' ')[0];
+  const rows=boardStr.split('/');
+  const board=Array.from({length:15},()=>Array(15).fill(null));
+  for(let r=0;r<15&&r<rows.length;r++){
+    let c=0,i=0;
+    while(i<rows[r].length&&c<15){
+      const ch=rows[r][i];
+      if(ch>='0'&&ch<='9'){
+        let n=0;
+        while(i<rows[r].length&&rows[r][i]>='0'&&rows[r][i]<='9')n=n*10+(rows[r][i++].charCodeAt(0)-48);
+        c+=n;
+      }else{board[r][c++]=ch;i++;}
+    }
+  }
+  for(let r=0;r<15;r++){
+    const tr=document.createElement('tr');
+    for(let c=0;c<15;c++){
+      const td=document.createElement('td');
+      const key=r+','+c;
+      const ch=board[r][c];
+      if(ch){
+        const blank=ch===ch.toLowerCase()&&ch!==ch.toUpperCase()||ch===ch.toLowerCase()&&ch>='a'&&ch<='z';
+        td.className=blank?'blank-tile':'tile';
+        td.textContent=ch.toUpperCase();
+      }else{
+        const bonus=BOARD_BONUSES[key]||'';
+        if(bonus)td.className=bonus;
+        td.textContent=bonus==='star'?'★':bonus==='TW'?'TW':bonus==='DW'?'DW':bonus==='TL'?'TL':bonus==='DL'?'DL':'';
+        if(bonus)td.style.fontSize='8px';
+      }
+      tr.appendChild(td);
+    }
+    tbl.appendChild(tr);
+  }
+}
+
+let cases=[], idx=0, pendingRect=null;
+
+function drawOverlay(rect){
+  const img=document.getElementById('screenshot');
+  const canvas=document.getElementById('overlay');
+  if(!img.naturalWidth||!rect)return;
+  const scaleX=img.clientWidth/img.naturalWidth;
+  const scaleY=img.clientHeight/img.naturalHeight;
+  canvas.width=img.clientWidth;
+  canvas.height=img.clientHeight;
+  canvas.style.width=img.clientWidth+'px';
+  canvas.style.height=img.clientHeight+'px';
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle='#0f0';
+  ctx.lineWidth=2;
+  ctx.strokeRect(rect.x*scaleX, rect.y*scaleY, rect.w*scaleX, rect.h*scaleY);
+}
+
+async function loadCases(){
+  const r=await fetch('/unlabeled-list');
+  cases=await r.json();
+  if(!cases.length){
+    document.getElementById('main').style.display='none';
+    document.getElementById('done-msg').style.display='block';
+    return;
+  }
+  showCase(0);
+}
+
+function updateProgress(){
+  document.getElementById('progress').textContent=`${idx+1} / ${cases.length}`;
+}
+
+async function showCase(i){
+  if(i>=cases.length){
+    document.getElementById('main').style.display='none';
+    document.getElementById('done-msg').style.display='block';
+    return;
+  }
+  idx=i;
+  updateProgress();
+  const name=cases[i];
+  document.getElementById('case-name').textContent=name;
+  pendingRect=null;
+  const imgEl=document.getElementById('screenshot');
+  imgEl.onload=()=>{if(pendingRect)drawOverlay(pendingRect);};
+  imgEl.src='/testdata-image/'+encodeURIComponent(name);
+  const cvs=document.getElementById('overlay');
+  cvs.width=0; cvs.height=0;
+  document.getElementById('cgp-input').value='';
+  document.getElementById('cgp-input').className='';
+  document.getElementById('woogles-info').textContent='';
+  document.getElementById('board-table').innerHTML='';
+
+  // Stream analysis
+  const setStatus=s=>document.getElementById('status-line').textContent=s;
+  setStatus('Analyzing...');
+  try{
+    const ir=await fetch('/testdata-image/'+encodeURIComponent(name));
+    const blob=await ir.blob();
+    const form=new FormData();
+    const isMem=name.includes('_memento');
+    form.append('image',new File([blob],name+(isMem?'_memento':'')+'.png',{type:'image/png'}));
+    const resp=await fetch('/analyze-gemini',{method:'POST',body:form});
+    const reader=resp.body.getReader(),dec=new TextDecoder();
+    let buf='';
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      let nl;
+      while((nl=buf.indexOf('\n'))>=0){
+        const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);
+        if(!line)continue;
+        try{
+          const d=JSON.parse(line);
+          if(d.status)setStatus(d.status);
+          if(d.board_rect){pendingRect=d.board_rect;drawOverlay(pendingRect);}
+          if(d.cgp&&d.cells){
+            document.getElementById('cgp-input').value=d.cgp;
+            renderBoard(d.cgp);
+          }
+          if('woogles' in d){
+            const w=d.woogles;
+            if(w&&w.game_id){
+              const url=`https://woogles.io/game/${w.game_id}?turn=${w.turn}`;
+              document.getElementById('woogles-info').innerHTML=
+                `<a href="${url}" target="_blank" style="color:#8cf">${w.game_id} turn ${w.turn}</a>`
+                +` (sim ${(w.similarity*100).toFixed(0)}%)`
+                +(w.golden_cgp?` — <span style="color:#8f8">golden CGP available</span>`:'');
+              // Auto-fill golden CGP if available
+              if(w.golden_cgp){
+                document.getElementById('cgp-input').value=w.golden_cgp;
+                renderBoard(w.golden_cgp);
+              }
+            }else{
+              document.getElementById('woogles-info').textContent='No Woogles match.';
+            }
+          }
+        }catch(e){}
+      }
+    }
+    setStatus('Done.');
+  }catch(e){setStatus('Error: '+e);}
+}
+
+document.getElementById('cgp-input').addEventListener('input',function(){
+  this.className='changed';
+  try{renderBoard(this.value);}catch(e){}
+});
+
+document.getElementById('btn-accept').onclick=async function(){
+  const name=cases[idx];
+  const cgp=document.getElementById('cgp-input').value.trim();
+  if(!cgp){alert('No CGP to save.');return;}
+  const r=await fetch('/save-label',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,cgp})});
+  const j=await r.json();
+  if(j.ok){
+    document.getElementById('status-line').textContent=`Saved ${name}.cgp`;
+    // Remove from list and advance
+    cases.splice(idx,1);
+    if(cases.length===0){
+      document.getElementById('main').style.display='none';
+      document.getElementById('done-msg').style.display='block';
+    }else{
+      showCase(Math.min(idx,cases.length-1));
+    }
+  }else{alert('Save failed.');}
+};
+
+document.getElementById('btn-skip').onclick=function(){
+  showCase((idx+1)%cases.length);
+};
+
+document.addEventListener('keydown',function(e){
+  if(e.key==='Enter'&&(e.metaKey||e.ctrlKey))document.getElementById('btn-accept').click();
+  if(e.key==='ArrowRight'&&(e.metaKey||e.ctrlKey))document.getElementById('btn-skip').click();
+});
+
+loadCases();
+</script>
+</body>
+</html>)html";
+        res.set_content(LABEL_HTML, "text/html");
     });
 
     const char* port_env = std::getenv("PORT");

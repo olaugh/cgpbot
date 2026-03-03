@@ -11,6 +11,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/dnn.hpp>
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -104,12 +105,17 @@ static double score_premium(const cv::Mat& hsv, cv::Rect r,
                 bool is_corner = ((row == 0 || row == 14) &&
                                   (col == 0 || col == 14));
 
+                // Mahogany mobile: TW corners appear warm-white (S≈27, V≈229).
+                // Only penalize TW/center for being truly pure white (S<10),
+                // not warm-white mahogany squares (which legitimately have S 15-30).
+                bool pure_white = (s < 10 && val > 180);
+
                 if (prem == 0) {
                     if (white) score += 1.0;
                     else if (red || blue) score -= 2.0;
                 } else if (prem == 4 || prem == 5) {
                     if (red || pink) score += (is_corner ? 10.0 : 4.0);
-                    else if (white) score -= (is_corner ? 8.0 : 2.0);
+                    else if (pure_white) score -= (is_corner ? 8.0 : 2.0);
                 } else if (prem == 3) {
                     if (pink) score += 2.5;
                     else if (white) score -= 0.3;
@@ -132,20 +138,29 @@ static double score_premium(const cv::Mat& hsv, cv::Rect r,
                 //   TL:  H=102 S=225 V=146  (saturated blue)
                 //   DW:  H=178 S=128 V=169  (cyan/red)
                 //   TW:  H=178 S=176 V=107  (cyan/red)
+                // Mahogany mobile ground truth:
+                //   normal: H=8  S=124 V=69  (dark reddish-brown — looks red but is empty board)
+                //   DW:     H=4  S=114 V=123 (pinkish-red)
+                //   TW:     H=73 S=138 V=105 (teal/green!)
+                //   ctr:    H=5  S=148 V=88  (reddish)
                 bool dark_gray = (s < 20 && val >= 35 && val <= 75);
                 bool red    = ((h < 12 || h > 162) && s > 50 && val > 35);
                 bool pink   = ((h < 15 || h > 158) && s > 15 && s < 160 && val > 100);
                 bool blue   = (h >= 85 && h <= 130 && s > 35 && val > 35);
                 bool ltblue = (h >= 75 && h <= 125 && s > 10 && val > 100);
+                // Mahogany mobile TW squares appear teal (H≈73).
+                bool teal   = (h >= 60 && h <= 90 && s > 60 && val > 70 && val < 150);
 
                 bool is_corner = ((row == 0 || row == 14) &&
                                   (col == 0 || col == 14));
 
                 if (prem == 0) {
                     if (dark_gray) score += 1.0;
-                    else if (red || blue) score -= 2.0;
+                    // Only penalize BRIGHT misplaced red/blue (not dark reddish-brown
+                    // mahogany board cells, which have val≈69 and look red but are empty).
+                    else if ((red || blue) && val > 100) score -= 2.0;
                 } else if (prem == 4 || prem == 5) {  // TW or center
-                    if (red || pink) score += (is_corner ? 10.0 : 4.0);
+                    if (red || pink || teal) score += (is_corner ? 10.0 : 4.0);
                     else if (dark_gray) score -= (is_corner ? 8.0 : 2.0);
                 } else if (prem == 3) {  // DW
                     if (pink) score += 2.5;
@@ -441,17 +456,50 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
     cv::Rect best_rect(search.x, search.y, max_size, max_size);
     double best_score = -1e9;
 
-    for (int size = min_size; size <= max_size; size += coarse_size_step) {
+    // Flatten the full (size, dy) search space for even thread partitioning.
+    // Each work item is a (size, dy) pair; the inner dx loop runs per-item.
+    struct CoarseWork { int size, dy; };
+    std::vector<CoarseWork> coarse_work;
+    for (int size = min_size; size <= max_size; size += coarse_size_step)
         for (int dy = 0; dy <= max_y_offset && search.y + dy + size <= img.rows;
-             dy += coarse_y_step) {
-            for (int dx = 0; dx <= max_x_offset && search.x + dx + size <= img.cols;
-                 dx += coarse_x_step) {
-                cv::Rect trial(search.x + dx, search.y + dy, size, size);
-                double s = score_premium(hsv, trial, is_light);
-                if (s > best_score) {
-                    best_score = s;
-                    best_rect = trial;
+             dy += coarse_y_step)
+            coarse_work.push_back({size, dy});
+
+    {
+        int n_threads = std::max(1u, std::thread::hardware_concurrency());
+        struct ThreadResult { cv::Rect rect; double score; };
+        std::vector<ThreadResult> results(n_threads,
+            {best_rect, best_score});
+        std::vector<std::thread> threads(n_threads);
+
+        for (int t = 0; t < n_threads; t++) {
+            threads[t] = std::thread([&, t]() {
+                cv::Rect local_best = results[t].rect;
+                double local_score = results[t].score;
+                for (int wi = t; wi < static_cast<int>(coarse_work.size());
+                     wi += n_threads) {
+                    int size = coarse_work[wi].size;
+                    int dy = coarse_work[wi].dy;
+                    for (int dx = 0;
+                         dx <= max_x_offset && search.x + dx + size <= img.cols;
+                         dx += coarse_x_step) {
+                        cv::Rect trial(search.x + dx, search.y + dy,
+                                       size, size);
+                        double s = score_premium(hsv, trial, is_light);
+                        if (s > local_score) {
+                            local_score = s;
+                            local_best = trial;
+                        }
+                    }
                 }
+                results[t] = {local_best, local_score};
+            });
+        }
+        for (auto& th : threads) th.join();
+        for (int t = 0; t < n_threads; t++) {
+            if (results[t].score > best_score) {
+                best_score = results[t].score;
+                best_rect = results[t].rect;
             }
         }
     }
@@ -467,23 +515,56 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
     int fine_size = coarse_size_step * 2;
     int fine_size_step = std::max(1, coarse_size_step / 3);
 
+    // Flatten (size, dy) pairs for even thread partitioning.
+    struct FineWork { int size, dy; };
+    std::vector<FineWork> fine_work;
     cv::Rect coarse_best = best_rect;
     for (int size = coarse_best.width - fine_size;
          size <= coarse_best.width + fine_size;
          size += fine_size_step) {
         if (size < 50) continue;
-        for (int dy = -fine_pos; dy <= fine_pos; dy += fine_pos_step) {
-            for (int dx = -fine_pos; dx <= fine_pos; dx += fine_pos_step) {
-                int x = coarse_best.x + dx;
-                int y = coarse_best.y + dy;
-                if (x < 0 || y < 0 || x + size > img.cols || y + size > img.rows)
-                    continue;
-                cv::Rect trial(x, y, size, size);
-                double s = score_premium(hsv, trial, is_light);
-                if (s > best_score) {
-                    best_score = s;
-                    best_rect = trial;
+        for (int dy = -fine_pos; dy <= fine_pos; dy += fine_pos_step)
+            fine_work.push_back({size, dy});
+    }
+
+    {
+        int n_threads = std::max(1u, std::thread::hardware_concurrency());
+        struct ThreadResult { cv::Rect rect; double score; };
+        std::vector<ThreadResult> results(n_threads,
+            {best_rect, best_score});
+        std::vector<std::thread> threads(n_threads);
+
+        for (int t = 0; t < n_threads; t++) {
+            threads[t] = std::thread([&, t]() {
+                cv::Rect local_best = results[t].rect;
+                double local_score = results[t].score;
+                for (int wi = t; wi < static_cast<int>(fine_work.size());
+                     wi += n_threads) {
+                    int size = fine_work[wi].size;
+                    int dy = fine_work[wi].dy;
+                    for (int dx = -fine_pos; dx <= fine_pos;
+                         dx += fine_pos_step) {
+                        int x = coarse_best.x + dx;
+                        int y = coarse_best.y + dy;
+                        if (x < 0 || y < 0 ||
+                            x + size > img.cols || y + size > img.rows)
+                            continue;
+                        cv::Rect trial(x, y, size, size);
+                        double s = score_premium(hsv, trial, is_light);
+                        if (s > local_score) {
+                            local_score = s;
+                            local_best = trial;
+                        }
+                    }
                 }
+                results[t] = {local_best, local_score};
+            });
+        }
+        for (auto& th : threads) th.join();
+        for (int t = 0; t < n_threads; t++) {
+            if (results[t].score > best_score) {
+                best_score = results[t].score;
+                best_rect = results[t].rect;
             }
         }
     }
@@ -747,22 +828,32 @@ static bool is_tile(const cv::Mat& cell, bool is_light, int /*row*/, int /*col*/
     else
         gray = center;
 
+    // Suppress wood grain texture noise (mahogany boards) before measuring
+    // contrast.  Only blur when the center region is large enough that a 5x5
+    // kernel won't obliterate the printed letter.  For small desktop cells
+    // (center ~18px), skip the blur to avoid false negatives.
+    if (gray.cols >= 30 && gray.rows >= 30)
+        cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+
     cv::Scalar mean_val, stddev_val;
     cv::meanStdDev(gray, mean_val, stddev_val);
     double brightness = mean_val[0];
     double contrast = stddev_val[0];
 
-    // Ground truth from color_survey across all board styles:
-    //   Empty cells (including all premium types): contrast 0-5
-    //   Tiles (all styles, all premiums):          contrast 37+
+    // Ground truth from color_survey + blank tile analysis:
+    //   Empty cells (all themes, all premium types): contrast 0-5
+    //   Blank tiles (purple circle, white letter):   contrast 31+
+    //   Normal tiles (all styles):                   contrast 37+
     // Tiles always show a printed letter creating visible contrast.
     // Empty premium squares are solid-colored with near-zero contrast.
+    // Threshold set at 28 to catch low-contrast blank tiles (min seen: 31.8)
+    // while maintaining a safe margin above empties (max seen: ~5).
 
     // Reject very dark cells (outside board area or dark TW empties at bri=56)
     if (brightness < 50) return false;
 
     // Primary discriminator: contrast from printed letter
-    if (contrast >= 35) {
+    if (contrast >= 28) {
         // Reject light-mode UI overlays that create spurious contrast.
         if (center.channels() == 3 && is_light) {
             cv::Mat hsv;
@@ -1018,6 +1109,86 @@ static void compute_scores(const cv::Mat& cell, const TileTemplates& tmpl,
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CNN-based tile classification (replaces template matching when model available)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static const int CNN_INPUT_SIZE = 32;
+
+static cv::dnn::Net& get_tile_net() {
+    static cv::dnn::Net net;
+    static bool attempted = false;
+    if (!attempted) {
+        attempted = true;
+        const char* model_paths[] = {
+#ifdef TILE_MODEL_PATH
+            TILE_MODEL_PATH,
+#endif
+            "models/tile_model.onnx",
+            nullptr
+        };
+        for (int i = 0; model_paths[i]; i++) {
+            try {
+                net = cv::dnn::readNetFromONNX(model_paths[i]);
+                if (!net.empty()) break;
+            } catch (...) {}
+        }
+    }
+    return net;
+}
+
+static bool tile_net_available() {
+    return !get_tile_net().empty();
+}
+
+// Preprocess cell for CNN: must exactly match training/dataset.py preprocess().
+static cv::Mat preprocess_for_cnn(const cv::Mat& cell) {
+    cv::Mat resized;
+    cv::resize(cell, resized, cv::Size(CNN_INPUT_SIZE, CNN_INPUT_SIZE),
+               0, 0, cv::INTER_AREA);
+
+    cv::Mat gray;
+    if (resized.channels() == 3)
+        cv::cvtColor(resized, gray, cv::COLOR_BGR2GRAY);
+    else
+        gray = resized.clone();
+
+    // Polarity normalize: ensure light background
+    cv::Scalar m = cv::mean(gray);
+    if (m[0] < 128) cv::bitwise_not(gray, gray);
+
+    // Histogram equalization for cross-theme contrast normalization
+    cv::equalizeHist(gray, gray);
+
+    return gray;
+}
+
+// Compute scores using CNN.  Output is softmax probabilities in scores[26].
+static void compute_scores_cnn(const cv::Mat& cell, float scores[26]) {
+    cv::Mat gray = preprocess_for_cnn(cell);
+
+    // Convert to float [0,1] and create blob: 1x1x32x32
+    cv::Mat flt;
+    gray.convertTo(flt, CV_32F, 1.0 / 255.0);
+    cv::Mat blob = cv::dnn::blobFromImage(flt, 1.0, cv::Size(), cv::Scalar(),
+                                           false, false, CV_32F);
+
+    cv::dnn::Net& net = get_tile_net();
+    net.setInput(blob);
+    cv::Mat output = net.forward();  // 1x26 raw logits
+
+    // Softmax to get probabilities
+    const float* logits = output.ptr<float>(0);
+    float max_val = *std::max_element(logits, logits + 26);
+    float sum = 0;
+    for (int i = 0; i < 26; i++) {
+        scores[i] = std::exp(logits[i] - max_val);
+        sum += scores[i];
+    }
+    for (int i = 0; i < 26; i++)
+        scores[i] /= sum;
+}
+
 // Pick the best letter from scores and populate top-5 candidates.
 static void pick_best(const float scores[26], CellResult& cell) {
     // Sort indices by score descending
@@ -1039,6 +1210,53 @@ static void pick_best(const float scores[26], CellResult& cell) {
         cell.letter = '?';
         cell.confidence = std::max(0.0f, scores[idx[0]]);
     }
+}
+
+// Classify a single tile crop (e.g. a rack tile) into a CellResult.
+CellResult classify_single_tile(const cv::Mat& tile_image) {
+    CellResult cell = {};
+    if (tile_image.empty()) return cell;
+
+    // Check blank first
+    if (is_blank_tile(tile_image)) {
+        cell.letter = '?';
+        cell.is_blank = true;
+        return cell;
+    }
+
+    float scores[26] = {};
+    if (tile_net_available()) {
+        compute_scores_cnn(tile_image, scores);
+    } else {
+        compute_scores(tile_image, get_templates(), scores);
+    }
+    pick_best(scores, cell);
+    return cell;
+}
+
+// Classify with explicit method selection and optional score output.
+CellResult classify_single_tile_ex(const cv::Mat& tile_image, int method,
+                                    float* out_scores) {
+    CellResult cell = {};
+    if (tile_image.empty()) return cell;
+
+    if (is_blank_tile(tile_image)) {
+        cell.letter = '?';
+        cell.is_blank = true;
+        return cell;
+    }
+
+    float scores[26] = {};
+    if (method == 1 || (method == 0 && tile_net_available())) {
+        compute_scores_cnn(tile_image, scores);
+    } else {
+        compute_scores(tile_image, get_templates(), scores);
+    }
+    pick_best(scores, cell);
+    if (out_scores) {
+        for (int i = 0; i < 26; i++) out_scores[i] = scores[i];
+    }
+    return cell;
 }
 
 // Distribution-aware refinement: reassign letters that exceed tile limits.
@@ -1221,7 +1439,10 @@ static void classify_cells(const CellImages& cell_imgs,
             if (!is_tile(cell_imgs[r][c], is_light, r, c, log)) continue;
 
             tile_count++;
-            if (tmpl.valid) {
+            if (tile_net_available()) {
+                compute_scores_cnn(cell_imgs[r][c], all_scores[r][c]);
+                pick_best(all_scores[r][c], cells[r][c]);
+            } else if (tmpl.valid) {
                 compute_scores(cell_imgs[r][c], tmpl, all_scores[r][c]);
                 pick_best(all_scores[r][c], cells[r][c]);
             } else {
@@ -1239,7 +1460,8 @@ static void classify_cells(const CellImages& cell_imgs,
             if (cells[r][c].letter == '?') ocr_fail++;
         }
     }
-    log << "Classified: " << tile_count << " tiles, " << ocr_fail << " OCR failures\n";
+    log << "Classified: " << tile_count << " tiles, " << ocr_fail << " OCR failures"
+        << " (method=" << (tile_net_available() ? "CNN" : tmpl.valid ? "template" : "none") << ")\n";
 
     // Distribution-aware refinement
     if (tmpl.valid && tile_count > 0)
@@ -1392,24 +1614,58 @@ DebugResult process_board_image_debug(const std::vector<uint8_t>& image_data,
             int size_range = range;
             int size_step = std::max(1, size_range / 15);
 
-            double best_score = -1e9;
-            cv::Rect best_r = region.rect;
-
+            // Flatten (side, dy) pairs for even thread partitioning.
+            struct RetryWork { int side, dy; };
+            std::vector<RetryWork> retry_work;
             for (int ds = -size_range; ds <= size_range; ds += size_step) {
                 int side = region.rect.width + ds;
                 if (side < 100) continue;
-                for (int dy = -range; dy <= range; dy += step) {
-                    for (int dx = -range; dx <= range; dx += step) {
-                        int x = region.rect.x + dx;
-                        int y = region.rect.y + dy;
-                        if (x < 0 || y < 0 ||
-                            x + side > img.cols || y + side > img.rows) continue;
-                        cv::Rect trial(x, y, side, side);
-                        double s = score_premium(hsv, trial, is_light);
-                        if (s > best_score) {
-                            best_score = s;
-                            best_r = trial;
+                for (int dy = -range; dy <= range; dy += step)
+                    retry_work.push_back({side, dy});
+            }
+
+            double best_score = -1e9;
+            cv::Rect best_r = region.rect;
+
+            {
+                int n_threads = std::max(1u, std::thread::hardware_concurrency());
+                struct TR { cv::Rect rect; double score; };
+                std::vector<TR> results(n_threads, {best_r, best_score});
+                std::vector<std::thread> threads(n_threads);
+
+                for (int t = 0; t < n_threads; t++) {
+                    threads[t] = std::thread([&, t]() {
+                        cv::Rect local_best = results[t].rect;
+                        double local_score = results[t].score;
+                        for (int wi = t;
+                             wi < static_cast<int>(retry_work.size());
+                             wi += n_threads) {
+                            int side = retry_work[wi].side;
+                            int dy = retry_work[wi].dy;
+                            for (int dx = -range; dx <= range;
+                                 dx += step) {
+                                int x = region.rect.x + dx;
+                                int y = region.rect.y + dy;
+                                if (x < 0 || y < 0 ||
+                                    x + side > img.cols ||
+                                    y + side > img.rows) continue;
+                                cv::Rect trial(x, y, side, side);
+                                double s = score_premium(hsv, trial,
+                                                         is_light);
+                                if (s > local_score) {
+                                    local_score = s;
+                                    local_best = trial;
+                                }
+                            }
                         }
+                        results[t] = {local_best, local_score};
+                    });
+                }
+                for (auto& th : threads) th.join();
+                for (int t = 0; t < n_threads; t++) {
+                    if (results[t].score > best_score) {
+                        best_score = results[t].score;
+                        best_r = results[t].rect;
                     }
                 }
             }
@@ -1430,8 +1686,11 @@ DebugResult process_board_image_debug(const std::vector<uint8_t>& image_data,
         }
     }
 
-    // Copy cell results to DebugResult
+    // Copy cell results and board geometry to DebugResult
     std::memcpy(result.cells, cells, sizeof(cells));
+    result.board_rect = region.rect;
+    result.cell_size = region.cell_size;
+    result.is_light = region.is_light;
 
     // Stage 4: format CGP
     result.cgp = format_cgp(cells);
