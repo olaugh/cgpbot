@@ -48,7 +48,9 @@ using ProgressCallback = std::function<void(const char* status,
                                              const std::vector<uint8_t>& debug_png)>;
 
 // Classify a single tile crop image → CellResult (letter, confidence, etc.).
-CellResult classify_single_tile(const cv::Mat& tile_image);
+// Set check_blank=false for rack tiles where the board-cell blank heuristic
+// (bottom-right quadrant stddev) gives false positives.
+CellResult classify_single_tile(const cv::Mat& tile_image, bool check_blank = true);
 
 // Classify with explicit method selection and optional score output.
 // method: 0 = auto (CNN if available, else templates), 1 = CNN only, 2 = templates only

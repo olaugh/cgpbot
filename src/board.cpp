@@ -879,20 +879,39 @@ static bool is_tile(const cv::Mat& cell, bool is_light, int /*row*/, int /*col*/
 }
 
 static bool is_blank_tile(const cv::Mat& cell) {
+    // Check bottom-right quadrant (where the subscript digit would be).
+    // Blank tiles have no subscript, so this area is uniform.
     int qx = cell.cols / 2, qy = cell.rows / 2;
     int qw = cell.cols - qx, qh = cell.rows - qy;
     if (qw <= 0 || qh <= 0) return false;
     cv::Mat quad = cell(cv::Rect(qx, qy, qw, qh));
 
-    cv::Mat gray;
+    cv::Mat gray_quad;
     if (quad.channels() == 3)
-        cv::cvtColor(quad, gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(quad, gray_quad, cv::COLOR_BGR2GRAY);
     else
-        gray = quad;
+        gray_quad = quad;
 
-    cv::Scalar mean, stddev;
-    cv::meanStdDev(gray, mean, stddev);
-    return stddev[0] < 12;
+    cv::Scalar mean_q, stddev_q;
+    cv::meanStdDev(gray_quad, mean_q, stddev_q);
+    if (stddev_q[0] >= 12) return false;  // quadrant has texture → not blank
+
+    // Secondary check: the center region must also be uniform.
+    // A lettered tile has letter strokes in the center; a blank tile is smooth.
+    // This prevents false positives when a mis-aligned crop puts uniform
+    // background in the bottom-right quadrant of a lettered tile.
+    int cx = cell.cols / 4, cy = cell.rows / 4;
+    int cw = cell.cols / 2, ch = cell.rows / 2;
+    if (cw <= 0 || ch <= 0) return stddev_q[0] < 12;
+    cv::Mat center = cell(cv::Rect(cx, cy, cw, ch));
+    cv::Mat gray_center;
+    if (center.channels() == 3)
+        cv::cvtColor(center, gray_center, cv::COLOR_BGR2GRAY);
+    else
+        gray_center = center;
+    cv::Scalar mean_c, stddev_c;
+    cv::meanStdDev(gray_center, mean_c, stddev_c);
+    return stddev_c[0] < 15;
 }
 
 // Scrabble point values → valid letter sets
@@ -1213,12 +1232,12 @@ static void pick_best(const float scores[26], CellResult& cell) {
 }
 
 // Classify a single tile crop (e.g. a rack tile) into a CellResult.
-CellResult classify_single_tile(const cv::Mat& tile_image) {
+CellResult classify_single_tile(const cv::Mat& tile_image, bool check_blank) {
     CellResult cell = {};
     if (tile_image.empty()) return cell;
 
-    // Check blank first
-    if (is_blank_tile(tile_image)) {
+    // Check blank first (skip for rack tiles where the heuristic false-positives)
+    if (check_blank && is_blank_tile(tile_image)) {
         cell.letter = '?';
         cell.is_blank = true;
         return cell;

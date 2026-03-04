@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -575,7 +576,8 @@ static CellResult classify_rack_tile_full(const RackTile& rt) {
     cv::Mat crop = cv::imdecode(raw, cv::IMREAD_COLOR);
     if (crop.empty()) { cr.letter = '?'; return cr; }
 
-    // Trim bottom ~15% to remove extra background below tile.
+    // Trim bottom 15% — removes the point-value subscript at bottom-right
+    // of each Scrabble tile, which would confuse the CNN.
     int trim_bot = crop.rows * 15 / 100;
     int new_h = std::max(1, crop.rows - trim_bot);
     // Center-crop to square aspect ratio (CNN expects 32x32).
@@ -704,6 +706,104 @@ static void refine_rack(CellResult rack_results[], int n_tiles,
     }
 }
 
+// Alphagram tiebreaker: Woogles displays rack tiles in alphabetical order
+// (left to right). When the top-2 CNN candidates are close in confidence,
+// prefer the one that maintains sorted order.
+static void alphagram_tiebreak(CellResult rack_results[], int n_tiles) {
+    if (n_tiles <= 1) return;
+
+    auto sortedness = [&]() {
+        int ok = 0;
+        for (int i = 0; i + 1 < n_tiles; i++) {
+            char a = rack_results[i].letter;
+            char b = rack_results[i + 1].letter;
+            if (a == '?' || b == '?') { ok++; continue; }
+            if (a <= b) ok++;
+        }
+        return ok;
+    };
+
+    int base_score = sortedness();
+    if (base_score == n_tiles - 1) return;  // already sorted
+
+    // Pass 1: conservative — only swap when confidence < 0.92 and gap < 0.15
+    for (int i = 0; i < n_tiles; i++) {
+        CellResult& cr = rack_results[i];
+        if (cr.letter == '?' || cr.is_blank) continue;
+        if (cr.confidence > 0.92f) continue;
+        for (int k = 0; k < 5; k++) {
+            char cand = cr.cand_letters[k];
+            float score = cr.cand_scores[k];
+            if (cand < 'A' || cand > 'Z') continue;
+            if (cand == cr.letter) continue;
+            if (cr.confidence - score > 0.15f) break;
+
+            char orig = cr.letter;
+            float orig_conf = cr.confidence;
+            cr.letter = cand;
+            cr.confidence = score;
+            int new_score = sortedness();
+            if (new_score > base_score) {
+                std::fprintf(stderr, "  alphagram: tile %d: %c(%.2f)->%c(%.2f) sort %d->%d\n",
+                             i, orig, orig_conf, cand, score, base_score, new_score);
+                base_score = new_score;
+                break;
+            } else {
+                cr.letter = orig;
+                cr.confidence = orig_conf;
+            }
+        }
+    }
+
+    if (base_score == n_tiles - 1) return;  // already sorted after pass 1
+
+    // Pass 2: sort-violation override — when a tile directly causes a sort
+    // violation with its neighbor AND a top-5 candidate fixes it, allow the
+    // swap even with higher confidence (up to 0.98) and wider gap.
+    // Woogles always displays rack in alphabetical order, so sort violations
+    // are strong evidence of misclassification.
+    for (int i = 0; i < n_tiles; i++) {
+        CellResult& cr = rack_results[i];
+        if (cr.letter == '?' || cr.is_blank) continue;
+        if (cr.confidence > 0.98f) continue;  // very confident, don't touch
+
+        // Check if this tile participates in a sort violation
+        bool has_violation = false;
+        if (i > 0) {
+            char prev = rack_results[i - 1].letter;
+            if (prev != '?' && prev > cr.letter) has_violation = true;
+        }
+        if (i + 1 < n_tiles) {
+            char next = rack_results[i + 1].letter;
+            if (next != '?' && cr.letter > next) has_violation = true;
+        }
+        if (!has_violation) continue;
+
+        for (int k = 0; k < 5; k++) {
+            char cand = cr.cand_letters[k];
+            float score = cr.cand_scores[k];
+            if (cand < 'A' || cand > 'Z') continue;
+            if (cand == cr.letter) continue;
+            if (score < 0.01f) break;  // candidate too weak
+
+            char orig = cr.letter;
+            float orig_conf = cr.confidence;
+            cr.letter = cand;
+            cr.confidence = score;
+            int new_score = sortedness();
+            if (new_score > base_score) {
+                std::fprintf(stderr, "  alphagram-v2: tile %d: %c(%.2f)->%c(%.2f) sort %d->%d\n",
+                             i, orig, orig_conf, cand, score, base_score, new_score);
+                base_score = new_score;
+                break;
+            } else {
+                cr.letter = orig;
+                cr.confidence = orig_conf;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Run all test cases from testdata/ directory (CLI mode).
 // ---------------------------------------------------------------------------
@@ -801,6 +901,7 @@ static int run_tests_cli() {
             for (int i = 0; i < n_rt && i < 7; i++)
                 rack_cr[i] = classify_rack_tile_full(rack_tiles[i]);
             refine_rack(rack_cr, std::min(n_rt, 7), dr.cells);
+            alphagram_tiebreak(rack_cr, std::min(n_rt, 7));
             for (int i = 0; i < n_rt && i < 7; i++) {
                 char ch = rack_cr[i].letter;
                 got_rack += (ch >= 'A' && ch <= 'Z') ? ch : '?';
@@ -836,7 +937,17 @@ static int run_tests_cli() {
             std::printf("  rack %d/%d %s",
                         tile_correct, n_exp, rack_ok ? "OK" : "MISS");
             if (!rack_ok) {
-                std::printf(" exp=%s got=%s", expected_rack.c_str(), got_rack.c_str());
+                std::printf(" exp=%s got=%s\n", expected_rack.c_str(), got_rack.c_str());
+                for (int ti = 0; ti < n_rt && ti < 7; ti++) {
+                    const CellResult& cr = rack_cr[ti];
+                    std::printf("    tile[%d] = '%c' conf=%.3f  cands:",
+                                ti, cr.letter, cr.confidence);
+                    for (int k = 0; k < 5; k++) {
+                        if (cr.cand_letters[k] >= 'A' && cr.cand_letters[k] <= 'Z')
+                            std::printf(" %c(%.3f)", cr.cand_letters[k], cr.cand_scores[k]);
+                    }
+                    std::printf("\n");
+                }
             }
         } else if (expected_rack.empty()) {
             std::printf("  rack (none)");
@@ -1995,6 +2106,7 @@ static void stream_analyze(const std::vector<uint8_t>& buf,
             for (int i = 0; i < n_rt && i < 7; i++)
                 rack_cr[i] = classify_rack_tile_full(rack_tiles[i]);
             refine_rack(rack_cr, std::min(n_rt, 7), dr.cells);
+            alphagram_tiebreak(rack_cr, std::min(n_rt, 7));
             for (int i = 0; i < n_rt && i < 7; i++) {
                 char ch = rack_cr[i].letter;
                 rack_str += (ch >= 'A' && ch <= 'Z') ? ch : '?';
@@ -2334,6 +2446,25 @@ static std::vector<RackTile> detect_rack_tiles(
 
     if (candidates.empty()) return tiles;
 
+    // Filter by fill ratio: real tiles fill most of their bounding box with
+    // foreground pixels; UI buttons/icons (shuffle, arrows) are sparse.
+    {
+        std::vector<TileRect> fill_ok;
+        for (auto& c : candidates) {
+            int mx = c.rect.x - search_roi.x;
+            int my = c.rect.y - search_roi.y;
+            cv::Rect mr(mx, my, c.rect.width, c.rect.height);
+            mr &= cv::Rect(0, 0, mask.cols, mask.rows);
+            if (mr.width <= 0 || mr.height <= 0) continue;
+            int fg = cv::countNonZero(mask(mr));
+            float ratio = float(fg) / float(mr.width * mr.height);
+            if (ratio < 0.25f) continue;  // too sparse, likely a button/icon
+            fill_ok.push_back(c);
+        }
+        candidates = fill_ok;
+    }
+    if (candidates.empty()) return tiles;
+
     // Drop button candidates: buttons are single-tile-sized segments at the
     // far left and right edges, outside the central rack zone.
     int board_center_x = bx + 7 * cell_sz + cell_sz / 2;
@@ -2365,14 +2496,61 @@ static std::vector<RackTile> detect_rack_tiles(
                   return a.rect.x < b.rect.x;
               });
 
+    // Gap-based clustering: keep the largest group of adjacent tiles.
+    // Real rack tiles are touching/near-touching; UI buttons are isolated.
+    // Only filter when there's a clear winner (a cluster strictly larger than
+    // all others). When all candidates are equally spaced, keep them all.
+    if (filtered.size() > 2) {
+        int max_gap = cell_sz * 3 / 4;
+        struct Cluster { int start; int len; };
+        std::vector<Cluster> clusters;
+        int cur_start = 0, cur_len = 1;
+        for (int i = 1; i < (int)filtered.size(); i++) {
+            int gap = filtered[i].rect.x - (filtered[i-1].rect.x + filtered[i-1].rect.width);
+            if (gap <= max_gap) {
+                cur_len++;
+            } else {
+                clusters.push_back({cur_start, cur_len});
+                cur_start = i;
+                cur_len = 1;
+            }
+        }
+        clusters.push_back({cur_start, cur_len});
+        // Find the largest cluster; only filter if it's strictly the biggest
+        if (clusters.size() > 1) {
+            std::sort(clusters.begin(), clusters.end(),
+                      [](const Cluster& a, const Cluster& b) { return a.len > b.len; });
+            if (clusters[0].len > clusters[1].len) {
+                // Clear winner — keep only the largest cluster
+                int bs = clusters[0].start, bl = clusters[0].len;
+                std::vector<TileRect> clustered(filtered.begin() + bs,
+                                                filtered.begin() + bs + bl);
+                filtered = clustered;
+            } else if (clusters[0].len == 1) {
+                // All candidates are isolated (no adjacent tiles).
+                // Keep only the most centrally-located one.
+                auto& best = *std::min_element(filtered.begin(), filtered.end(),
+                    [board_center_x](const TileRect& a, const TileRect& b) {
+                        int da = std::abs(a.rect.x + a.rect.width / 2 - board_center_x);
+                        int db = std::abs(b.rect.x + b.rect.width / 2 - board_center_x);
+                        return da < db;
+                    });
+                filtered = {best};
+            }
+        }
+    }
+
+    // (Tile rects from HSV masking used as-is; no geometric adjustment.)
+
     // Convert to RackTile output
     for (auto& c : filtered) {
         cv::Rect r = c.rect & cv::Rect(0, 0, img.cols, img.rows);
-        cv::Mat gray;
-        cv::cvtColor(img(r), gray, cv::COLOR_BGR2GRAY);
+        if (r.width <= 0 || r.height <= 0) continue;
+        cv::Mat gray_tile;
+        cv::cvtColor(img(r), gray_tile, cv::COLOR_BGR2GRAY);
         cv::Scalar gm, gs;
-        cv::meanStdDev(gray, gm, gs);
-        bool is_blank_tile = (gs[0] < 15);
+        cv::meanStdDev(gray_tile, gm, gs);
+        bool is_blank_tile = (gs[0] < 8);
 
         int p = 2;
         int px = std::max(0, r.x - p);
@@ -4927,6 +5105,324 @@ static void stream_analyze_gemini(const std::vector<uint8_t>& buf,
 }
 
 // ---------------------------------------------------------------------------
+// Generate rack diagnostic HTML page showing all failures.
+// ---------------------------------------------------------------------------
+static int generate_rack_diag() {
+    if (!fs::exists("testdata")) {
+        std::cout << "No testdata/ directory found.\n";
+        return 1;
+    }
+
+    struct TileDiag {
+        std::string crop_b64;   // base64 PNG of tile crop
+        char expected;           // 0 if no per-position expected
+        char got;
+        float confidence;
+        char cand_letters[5];
+        float cand_scores[5];
+    };
+    struct CaseDiag {
+        std::string name;
+        std::string annotated_b64;  // full image with board rect + tile rects
+        std::string expected_rack;
+        std::string got_rack;
+        int tile_correct;
+        int tile_total;
+        std::vector<TileDiag> tiles;
+        int n_detected;             // how many tiles detected
+    };
+
+    std::vector<CaseDiag> failures;
+    int total_cases = 0, rack_cases = 0, rack_perfect = 0;
+    int rack_total_tiles = 0, rack_correct_tiles = 0;
+
+    std::vector<fs::directory_entry> entries;
+    for (const auto& e : fs::directory_iterator("testdata"))
+        if (e.path().extension() == ".cgp") entries.push_back(e);
+    std::sort(entries.begin(), entries.end());
+
+    for (const auto& entry : entries) {
+        std::string name = entry.path().stem().string();
+        std::string img_path;
+        for (const char* ext : {".png", ".jpg", ".jpeg"}) {
+            std::string p = "testdata/" + name + ext;
+            if (fs::exists(p)) { img_path = p; break; }
+        }
+        if (img_path.empty()) continue;
+
+        std::string expected_cgp;
+        {
+            std::ifstream ifs(entry.path());
+            std::getline(ifs, expected_cgp);
+        }
+
+        std::vector<uint8_t> img_data;
+        {
+            std::ifstream ifs(img_path, std::ios::binary);
+            img_data.assign(std::istreambuf_iterator<char>(ifs),
+                            std::istreambuf_iterator<char>());
+        }
+
+        DebugResult dr = process_board_image_debug(img_data);
+
+        std::string expected_rack = parse_cgp_rack(expected_cgp);
+        if (dr.cell_size <= 0 || expected_rack.empty()) {
+            total_cases++;
+            continue;
+        }
+
+        bool is_light = detect_board_mode(img_data,
+            dr.board_rect.x, dr.board_rect.y, dr.cell_size);
+        auto rack_tiles = detect_rack_tiles(img_data,
+            dr.board_rect.x, dr.board_rect.y, dr.cell_size, is_light);
+
+        int n_rt = static_cast<int>(rack_tiles.size());
+        CellResult rack_cr[7] = {};
+        for (int i = 0; i < n_rt && i < 7; i++)
+            rack_cr[i] = classify_rack_tile_full(rack_tiles[i]);
+        refine_rack(rack_cr, std::min(n_rt, 7), dr.cells);
+        alphagram_tiebreak(rack_cr, std::min(n_rt, 7));
+
+        std::string got_rack;
+        for (int i = 0; i < n_rt && i < 7; i++) {
+            char ch = rack_cr[i].letter;
+            got_rack += (ch >= 'A' && ch <= 'Z') ? ch : '?';
+        }
+
+        std::string exp_sorted = sort_rack(expected_rack);
+        std::string got_sorted = sort_rack(got_rack);
+
+        int tile_correct = 0;
+        {
+            int ei = 0, gi = 0;
+            while (ei < (int)exp_sorted.size() && gi < (int)got_sorted.size()) {
+                if (exp_sorted[ei] == got_sorted[gi]) {
+                    tile_correct++; ei++; gi++;
+                } else if (exp_sorted[ei] < got_sorted[gi]) ei++;
+                else gi++;
+            }
+        }
+
+        total_cases++;
+        rack_cases++;
+        rack_total_tiles += (int)exp_sorted.size();
+        rack_correct_tiles += tile_correct;
+        bool rack_ok = (exp_sorted == got_sorted);
+        if (rack_ok) rack_perfect++;
+
+        std::printf("%-45s rack %d/%d %s",
+                    name.c_str(), tile_correct, (int)exp_sorted.size(),
+                    rack_ok ? "OK" : "MISS");
+        if (!rack_ok)
+            std::printf(" exp=%s got=%s", expected_rack.c_str(), got_rack.c_str());
+        std::printf("\n");
+        fflush(stdout);
+
+        if (rack_ok) continue;  // Only collect failures
+
+        // Build annotated image: decode, draw board rect + rack tile rects
+        cv::Mat raw_mat(1, static_cast<int>(img_data.size()), CV_8UC1,
+                        img_data.data());
+        cv::Mat img = cv::imdecode(raw_mat, cv::IMREAD_COLOR);
+        if (img.empty()) continue;
+
+        // Draw board rect in green
+        cv::Rect br = dr.board_rect;
+        cv::rectangle(img, br, cv::Scalar(0, 200, 0), 2);
+
+        // Draw each rack tile rect
+        for (int i = 0; i < n_rt && i < 7; i++) {
+            char got_ch = (i < (int)got_rack.size()) ? got_rack[i] : '?';
+            // Color: green if tile matches something in expected, red otherwise
+            cv::Scalar color(0, 255, 255);  // yellow default
+            cv::rectangle(img, rack_tiles[i].rect, color, 2);
+
+            // Label with recognized letter
+            std::string label(1, got_ch);
+            int baseline = 0;
+            cv::Size tsz = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX,
+                                           0.7, 2, &baseline);
+            cv::Point tpos(rack_tiles[i].rect.x,
+                           rack_tiles[i].rect.y - 4);
+            if (tpos.y - tsz.height < 0)
+                tpos.y = rack_tiles[i].rect.y + rack_tiles[i].rect.height + tsz.height + 4;
+            cv::putText(img, label, tpos, cv::FONT_HERSHEY_SIMPLEX,
+                        0.7, cv::Scalar(0, 255, 255), 2);
+        }
+
+        // Encode annotated image
+        std::vector<uint8_t> ann_png;
+        cv::imencode(".png", img, ann_png);
+
+        CaseDiag cd;
+        cd.name = name;
+        cd.annotated_b64 = base64_encode(ann_png);
+        cd.expected_rack = expected_rack;
+        cd.got_rack = got_rack;
+        cd.tile_correct = tile_correct;
+        cd.tile_total = (int)exp_sorted.size();
+        cd.n_detected = n_rt;
+
+        // Extract individual tile crops
+        for (int i = 0; i < n_rt && i < 7; i++) {
+            TileDiag td;
+            td.got = (i < (int)got_rack.size()) ? got_rack[i] : '?';
+            td.expected = 0;
+            td.confidence = rack_cr[i].confidence;
+            for (int k = 0; k < 5; k++) {
+                td.cand_letters[k] = rack_cr[i].cand_letters[k];
+                td.cand_scores[k] = rack_cr[i].cand_scores[k];
+            }
+            // Encode tile crop as base64
+            if (!rack_tiles[i].png.empty()) {
+                td.crop_b64 = base64_encode(rack_tiles[i].png);
+            }
+            cd.tiles.push_back(td);
+        }
+
+        failures.push_back(std::move(cd));
+    }
+
+    // Print summary
+    double rack_tile_pct = rack_total_tiles > 0
+        ? (100.0 * rack_correct_tiles / rack_total_tiles) : 0.0;
+    std::printf("\n%d rack cases, %d perfect, tiles %d/%d (%.1f%%)\n",
+                rack_cases, rack_perfect,
+                rack_correct_tiles, rack_total_tiles, rack_tile_pct);
+    std::printf("%d failures to diagnose\n", (int)failures.size());
+
+    // Generate HTML
+    std::ofstream html("rack_diag.html");
+    html << R"(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rack Recognition Failures</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:#1a1a2e;color:#e0e0e0;padding:24px;
+}
+h1{font-size:1.5rem;margin-bottom:8px;color:#fff}
+.summary{font-size:.9rem;color:#aaa;margin-bottom:24px}
+.summary b{color:#fff}
+.case{background:#16213e;border-radius:12px;padding:20px;margin-bottom:20px;border:1px solid #2a2a4a}
+.case-header{display:flex;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap}
+.case-name{font-size:1rem;font-weight:600;color:#58a6ff}
+.rack-compare{font-family:'SF Mono','Fira Code',monospace;font-size:.85rem}
+.rack-compare .label{color:#888;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em}
+.rack-compare .val{margin-left:4px}
+.expected{color:#4c4}
+.got{color:#f88}
+.match-count{color:#aaa;font-size:.8rem}
+.case-body{display:flex;gap:20px;flex-wrap:wrap}
+.annotated-img{max-width:480px;max-height:500px;border-radius:8px;flex-shrink:0}
+.tiles-panel{flex:1;min-width:300px}
+.tiles-grid{display:flex;flex-wrap:wrap;gap:12px}
+.tile-card{background:#1a1a2e;border-radius:8px;padding:10px;border:1px solid #333;text-align:center;min-width:80px}
+.tile-card.wrong{border-color:#f44}
+.tile-card.right{border-color:#4c4}
+.tile-crop{width:64px;height:64px;object-fit:contain;image-rendering:pixelated;border-radius:4px;background:#222}
+.tile-label{font-family:'SF Mono',monospace;font-size:1.1rem;font-weight:700;margin-top:6px}
+.tile-conf{font-size:.65rem;color:#888;margin-top:2px}
+.candidates{font-size:.6rem;color:#666;margin-top:4px;line-height:1.4}
+.candidates span{display:inline-block;margin-right:4px}
+.nav{position:sticky;top:0;background:#1a1a2e;padding:12px 0;z-index:10;border-bottom:1px solid #2a2a4a;margin-bottom:16px;display:flex;gap:8px;flex-wrap:wrap}
+.nav a{color:#58a6ff;text-decoration:none;font-size:.75rem;padding:4px 8px;border-radius:4px;background:#16213e;border:1px solid #2a2a4a}
+.nav a:hover{background:#1e2d50}
+.sorted{font-size:.75rem;color:#666;margin-top:2px}
+</style>
+</head>
+<body>
+<h1>Rack Recognition Failures</h1>
+<div class="summary">
+)";
+    html << "<b>" << rack_perfect << "/" << rack_cases << "</b> perfect racks, "
+         << "<b>" << rack_correct_tiles << "/" << rack_total_tiles << "</b> tiles ("
+         << std::fixed << std::setprecision(1) << rack_tile_pct << "%), "
+         << "<b>" << failures.size() << "</b> failures shown"
+         << "</div>\n";
+
+    // Navigation
+    html << "<div class=\"nav\">\n";
+    for (size_t i = 0; i < failures.size(); i++) {
+        html << "<a href=\"#case-" << i << "\">" << failures[i].name << "</a>\n";
+    }
+    html << "</div>\n";
+
+    // Each failure case
+    for (size_t i = 0; i < failures.size(); i++) {
+        const auto& cd = failures[i];
+        std::string exp_sorted = sort_rack(cd.expected_rack);
+        std::string got_sorted = sort_rack(cd.got_rack);
+
+        html << "<div class=\"case\" id=\"case-" << i << "\">\n";
+        html << "<div class=\"case-header\">\n";
+        html << "  <span class=\"case-name\">" << cd.name << "</span>\n";
+        html << "  <span class=\"rack-compare\">"
+             << "<span class=\"label\">expected:</span>"
+             << "<span class=\"val expected\">" << cd.expected_rack << "</span>"
+             << " <span class=\"sorted\">(" << exp_sorted << ")</span>"
+             << "</span>\n";
+        html << "  <span class=\"rack-compare\">"
+             << "<span class=\"label\">got:</span>"
+             << "<span class=\"val got\">" << cd.got_rack << "</span>"
+             << " <span class=\"sorted\">(" << got_sorted << ")</span>"
+             << "</span>\n";
+        html << "  <span class=\"match-count\">" << cd.tile_correct
+             << "/" << cd.tile_total << " tiles, "
+             << cd.n_detected << " detected</span>\n";
+        html << "</div>\n";
+
+        html << "<div class=\"case-body\">\n";
+        html << "  <img class=\"annotated-img\" src=\"data:image/png;base64,"
+             << cd.annotated_b64 << "\" />\n";
+
+        html << "  <div class=\"tiles-panel\">\n";
+        html << "    <div class=\"tiles-grid\">\n";
+        for (size_t t = 0; t < cd.tiles.size(); t++) {
+            const auto& td = cd.tiles[t];
+            // Check if this tile's letter is correct (simple positional check not
+            // meaningful since order varies; just show them all)
+            html << "      <div class=\"tile-card\">\n";
+            if (!td.crop_b64.empty()) {
+                html << "        <img class=\"tile-crop\" src=\"data:image/png;base64,"
+                     << td.crop_b64 << "\" />\n";
+            }
+            html << "        <div class=\"tile-label\">" << td.got << "</div>\n";
+            html << "        <div class=\"tile-conf\">"
+                 << std::fixed << std::setprecision(3) << td.confidence << "</div>\n";
+            html << "        <div class=\"candidates\">";
+            for (int k = 0; k < 5; k++) {
+                if (td.cand_letters[k] >= 'A' && td.cand_letters[k] <= 'Z') {
+                    html << "<span>" << td.cand_letters[k] << ":"
+                         << std::fixed << std::setprecision(2)
+                         << td.cand_scores[k] << "</span>";
+                } else if (td.cand_letters[k] >= 'a' && td.cand_letters[k] <= 'z') {
+                    html << "<span>" << (char)(td.cand_letters[k] - 32) << ":"
+                         << std::fixed << std::setprecision(2)
+                         << td.cand_scores[k] << "</span>";
+                }
+            }
+            html << "</div>\n";
+            html << "      </div>\n";
+        }
+        html << "    </div>\n";
+        html << "  </div>\n";
+
+        html << "</div>\n";  // case-body
+        html << "</div>\n";  // case
+    }
+
+    html << "</body>\n</html>\n";
+    html.close();
+
+    std::printf("Wrote rack_diag.html (%d failures)\n", (int)failures.size());
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
     load_dotenv();
@@ -4934,6 +5430,11 @@ int main(int argc, char* argv[]) {
     // CLI test mode
     if (argc > 1 && std::string(argv[1]) == "--test") {
         return run_tests_cli();
+    }
+
+    // Rack diagnostic mode
+    if (argc > 1 && std::string(argv[1]) == "--rack-diag") {
+        return generate_rack_diag();
     }
 
     httplib::Server svr;
