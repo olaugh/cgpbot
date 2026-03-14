@@ -577,9 +577,9 @@ static CellResult classify_rack_tile_full(const RackTile& rt) {
     if (crop.empty()) { cr.letter = '?'; return cr; }
 
     // Trim bottom 15% — removes the point-value subscript at bottom-right
-    // of each Scrabble tile, which would confuse the CNN.
     int trim_bot = crop.rows * 15 / 100;
     int new_h = std::max(1, crop.rows - trim_bot);
+
     // Center-crop to square aspect ratio (CNN expects 32x32).
     int new_w = crop.cols;
     int x_off = 0;
@@ -807,6 +807,8 @@ static void alphagram_tiebreak(CellResult rack_results[], int n_tiles) {
 // ---------------------------------------------------------------------------
 // Run all test cases from testdata/ directory (CLI mode).
 // ---------------------------------------------------------------------------
+static std::string g_test_filter;
+
 static int run_tests_cli() {
     if (!fs::exists("testdata")) {
         std::cout << "No testdata/ directory found.\n";
@@ -825,6 +827,8 @@ static int run_tests_cli() {
 
     for (const auto& entry : entries) {
         std::string name = entry.path().stem().string();
+        if (!g_test_filter.empty() && name.find(g_test_filter) == std::string::npos)
+            continue;
         std::string img_path;
         for (const char* ext : {".png", ".jpg", ".jpeg"}) {
             std::string p = "testdata/" + name + ext;
@@ -2540,17 +2544,180 @@ static std::vector<RackTile> detect_rack_tiles(
         }
     }
 
-    // (Tile rects from HSV masking used as-is; no geometric adjustment.)
+    // Ensure detected tiles are at least cell_sz*3/4 wide.
+    // On dark themes, HSV masking can under-detect tile edges,
+    // producing crops too narrow for reliable CNN classification.
+    {
+        int min_w = cell_sz * 3 / 4;
+        for (auto& c : filtered) {
+            if (c.rect.width < min_w) {
+                int cx = c.rect.x + c.rect.width / 2;
+                c.rect.x = cx - min_w / 2;
+                c.rect.width = min_w;
+                // Clamp to image
+                if (c.rect.x < 0) c.rect.x = 0;
+                if (c.rect.x + c.rect.width > img.cols)
+                    c.rect.x = img.cols - c.rect.width;
+            }
+        }
+    }
 
-    // Convert to RackTile output
-    for (auto& c : filtered) {
-        cv::Rect r = c.rect & cv::Rect(0, 0, img.cols, img.rows);
+    // --- Dimension sweep: try alternative crop dimensions to rescue ---
+    // --- low-confidence tiles.  Only accept if no regression.        ---
+
+    // Helper: apply same trim+center-crop as classify_rack_tile_full.
+    auto prep_and_classify = [](const cv::Mat& crop) -> CellResult {
+        int trim_bot = crop.rows * 15 / 100;
+        int nh = std::max(1, crop.rows - trim_bot);
+        int nw = crop.cols;
+        int xo = 0;
+        if (nw > nh) { xo = (nw - nh) / 2; nw = nh; }
+        cv::Rect roi(xo, 0, nw, nh);
+        roi &= cv::Rect(0, 0, crop.cols, crop.rows);
+        return classify_single_tile(crop(roi), false);
+    };
+
+    // Step 1: Evaluate baseline (original detected rects + trim+center-crop).
+    int n_tiles = (int)filtered.size();
+    std::vector<int> x_centers(n_tiles);
+    std::vector<bool> is_blank(n_tiles, false);
+    std::vector<float> baseline_conf(n_tiles, 1.0f);
+    std::vector<char> baseline_letter(n_tiles, '?');
+    float baseline_min_conf = 1.0f;
+
+    for (int i = 0; i < n_tiles; i++) {
+        cv::Rect r = filtered[i].rect & cv::Rect(0, 0, img.cols, img.rows);
+        x_centers[i] = r.x + r.width / 2;
         if (r.width <= 0 || r.height <= 0) continue;
-        cv::Mat gray_tile;
-        cv::cvtColor(img(r), gray_tile, cv::COLOR_BGR2GRAY);
+        cv::Mat gt;
+        cv::cvtColor(img(r), gt, cv::COLOR_BGR2GRAY);
         cv::Scalar gm, gs;
-        cv::meanStdDev(gray_tile, gm, gs);
-        bool is_blank_tile = (gs[0] < 8);
+        cv::meanStdDev(gt, gm, gs);
+        is_blank[i] = (gs[0] < 8);
+        if (!is_blank[i]) {
+            // Apply same trim+center-crop as classify_rack_tile_full,
+            // with check_blank=true to catch blanks missed by stddev.
+            int tb = r.height * 15 / 100;
+            int bh = std::max(1, r.height - tb);
+            int bw = r.width, bx = 0;
+            if (bw > bh) { bx = (bw - bh) / 2; bw = bh; }
+            cv::Rect broi(r.x + bx, r.y, bw, bh);
+            broi &= cv::Rect(0, 0, img.cols, img.rows);
+            CellResult cr = classify_single_tile(img(broi), true);
+            if (cr.is_blank) {
+                is_blank[i] = true;
+            } else {
+                baseline_conf[i] = cr.confidence;
+                baseline_letter[i] = cr.letter;
+                if (cr.confidence < baseline_min_conf)
+                    baseline_min_conf = cr.confidence;
+            }
+        }
+    }
+
+    // Step 2: Only sweep if baseline has a weak tile (conf < 0.95).
+    int y_mid = search_roi.y + (band_top + band_bot) / 2;
+    bool use_sweep = false;
+    int best_w = 0, best_h = 0, best_ymid = 0;
+
+    if (baseline_min_conf < 0.95f) {
+        // Compute average segment width from detected tiles.
+        int avg_seg_w = abs_h;
+        {
+            int sum_w = 0;
+            for (int i = 0; i < n_tiles; i++)
+                sum_w += filtered[i].rect.width;
+            if (n_tiles > 0) avg_seg_w = sum_w / n_tiles;
+        }
+
+        // Sweep score: sum of log(conf) — heavily penalizes weak tiles.
+        // Only accept if EVERY tile that was above 0.9 in baseline stays
+        // above 0.85 in the sweep.
+        auto evaluate_combo = [&](int sw, int sh, int sy) -> float {
+            float sum_log = 0;
+            for (int i = 0; i < n_tiles; i++) {
+                if (is_blank[i]) continue;
+                cv::Rect r(x_centers[i] - sw / 2, sy - sh / 2, sw, sh);
+                r &= cv::Rect(0, 0, img.cols, img.rows);
+                if (r.width < sw * 3 / 4 || r.height < sh * 3 / 4)
+                    return -1e9f;
+                // Mask fill check
+                int mx = r.x - search_roi.x;
+                int my = r.y - search_roi.y;
+                cv::Rect mr(mx, my, r.width, r.height);
+                mr &= cv::Rect(0, 0, mask.cols, mask.rows);
+                if (mr.width <= 0 || mr.height <= 0) return -1e9f;
+                int fg = cv::countNonZero(mask(mr));
+                float fill = float(fg) / float(mr.width * mr.height);
+                if (fill < 0.20f) return -1e9f;
+
+                CellResult cr = prep_and_classify(img(r));
+                // Lock in well-classified tiles: if baseline was confident
+                // about a letter, sweep must produce the SAME letter.
+                if (baseline_conf[i] >= 0.90f && cr.letter != baseline_letter[i])
+                    return -1e9f;
+                sum_log += std::log(std::max(cr.confidence, 0.01f));
+            }
+            return sum_log;
+        };
+
+        int coarse_step = std::max(2, cell_sz / 5);
+        int fine_step = std::max(1, cell_sz / 10);
+        float best_score = -1e9f;
+        best_w = avg_seg_w; best_h = abs_h; best_ymid = y_mid;
+
+        int w_lo = avg_seg_w * 4 / 5, w_hi = avg_seg_w * 6 / 5;
+        int h_lo = abs_h * 4 / 5, h_hi = abs_h * 6 / 5;
+        int dy_range = std::max(1, cell_sz / 6);
+
+        // Phase 1: coarse sweep
+        for (int sw = w_lo; sw <= w_hi; sw += coarse_step) {
+            for (int sh = h_lo; sh <= h_hi; sh += coarse_step) {
+                for (int dy = -dy_range; dy <= dy_range; dy += coarse_step) {
+                    float sc = evaluate_combo(sw, sh, y_mid + dy);
+                    if (sc > best_score) {
+                        best_score = sc;
+                        best_w = sw; best_h = sh; best_ymid = y_mid + dy;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: fine refinement
+        int fw0 = best_w, fh0 = best_h, fy0 = best_ymid;
+        for (int sw = fw0 - coarse_step; sw <= fw0 + coarse_step; sw += fine_step) {
+            for (int sh = fh0 - coarse_step; sh <= fh0 + coarse_step; sh += fine_step) {
+                for (int dy = fy0 - coarse_step; dy <= fy0 + coarse_step; dy += fine_step) {
+                    if (sw <= 0 || sh <= 0) continue;
+                    float sc = evaluate_combo(sw, sh, dy);
+                    if (sc > best_score) {
+                        best_score = sc; best_w = sw; best_h = sh; best_ymid = dy;
+                    }
+                }
+            }
+        }
+
+        // Compute baseline sum_log for comparison.
+        float baseline_sum_log = 0;
+        for (int i = 0; i < n_tiles; i++) {
+            if (!is_blank[i])
+                baseline_sum_log += std::log(std::max(baseline_conf[i], 0.01f));
+        }
+        use_sweep = (best_score > baseline_sum_log);
+    }
+
+    // Output tiles using either sweep or baseline dimensions.
+    // Blank tiles always use the original detected rect (sweep skips blanks).
+    for (int i = 0; i < n_tiles; i++) {
+        cv::Rect r = (use_sweep && !is_blank[i])
+            ? cv::Rect(x_centers[i] - best_w / 2, best_ymid - best_h / 2,
+                       best_w, best_h)
+            : filtered[i].rect;
+        r &= cv::Rect(0, 0, img.cols, img.rows);
+        if (r.width <= 0 || r.height <= 0) continue;
+
+        // Use pre-computed blank status from the original rect.
+        bool is_blank_tile = is_blank[i];
 
         int p = 2;
         int px = std::max(0, r.x - p);
@@ -5427,14 +5594,44 @@ h1{font-size:1.5rem;margin-bottom:8px;color:#fff}
 int main(int argc, char* argv[]) {
     load_dotenv();
 
-    // CLI test mode
+    // CLI test mode: --test [filter]
     if (argc > 1 && std::string(argv[1]) == "--test") {
+        if (argc > 2) g_test_filter = argv[2];
         return run_tests_cli();
     }
 
     // Rack diagnostic mode
     if (argc > 1 && std::string(argv[1]) == "--rack-diag") {
         return generate_rack_diag();
+    }
+
+    // Debug PNG mode: --debug-png <name> <outfile>
+    // Runs pipeline on testdata/<name>.{png,jpg} and writes debug overlay PNG.
+    if (argc > 3 && std::string(argv[1]) == "--debug-png") {
+        std::string name = argv[2];
+        std::string outfile = argv[3];
+        std::string img_path;
+        for (const char* ext : {".png", ".jpg", ".jpeg"}) {
+            std::string p = "testdata/" + name + ext;
+            if (fs::exists(p)) { img_path = p; break; }
+        }
+        if (img_path.empty()) {
+            std::cerr << "No image found for " << name << "\n";
+            return 1;
+        }
+        std::ifstream ifs(img_path, std::ios::binary);
+        std::vector<uint8_t> buf((std::istreambuf_iterator<char>(ifs)),
+                                  std::istreambuf_iterator<char>());
+        DebugResult dr = process_board_image_debug(buf);
+        if (dr.debug_png.empty()) {
+            std::cerr << "Pipeline failed for " << name << "\n";
+            return 1;
+        }
+        std::ofstream ofs(outfile, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(dr.debug_png.data()),
+                  static_cast<std::streamsize>(dr.debug_png.size()));
+        std::cout << "Wrote " << dr.debug_png.size() << " bytes to " << outfile << "\n";
+        return 0;
     }
 
     httplib::Server svr;

@@ -347,6 +347,11 @@ static cv::Rect find_board_gridlines(const cv::Mat& gray, cv::Rect search,
     return cv::Rect(best_ox, best_oy, board_size, board_size);
 }
 
+// Forward declarations for label-anchored refinement (defined after CNN section)
+static bool label_net_available();
+static double score_column_labels(const cv::Mat& img, cv::Rect board_rect);
+static double score_row_labels(const cv::Mat& img, cv::Rect board_rect);
+
 static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log) {
     // ── Step 1: Contour to get approximate search area ──────────────────
     cv::Mat gray;
@@ -726,6 +731,221 @@ static BoardRegion find_board_region(const cv::Mat& img, std::ostringstream& log
         best_rect = cv::Rect(best_ox, best_oy, gl_size, gl_size);
     }
 
+    // ── Step 4c: Drop-shadow boundary refinement (light mode) ──────────
+    // In light mode, drop shadows can cause edge/Sobel detection to
+    // overestimate the board size.  Inside the board, each column/row has
+    // high brightness variance (white cells ~255, gridlines ~70, tiles
+    // ~160).  In the shadow zone and page background, brightness is
+    // uniform per column/row (shadow gradient or flat white).  Find the
+    // board extent by scanning outward from center and detecting where
+    // V-range drops to near zero for 3+ consecutive positions.
+    if (is_light) {
+        double cell = best_rect.width / 15.0;
+        int gl_margin = std::max(2, static_cast<int>(cell * 0.05));
+        int search_ext = static_cast<int>(cell * 1.5);
+
+        // Sample area: central 70% avoids edge cells that might be
+        // fully covered by tiles or cropped.
+        int sm = static_cast<int>(cell * 2);
+        int sy0 = best_rect.y + sm, sy1 = best_rect.y + best_rect.height - sm;
+        int sx0 = best_rect.x + sm, sx1 = best_rect.x + best_rect.width - sm;
+
+        // Brightness range in a vertical strip (for left/right edges)
+        auto v_range_col = [&](int x) -> int {
+            if (x < 0 || x >= gray.cols) return 0;
+            uint8_t mn = 255, mx = 0;
+            for (int y = sy0; y < sy1; y += 2) {
+                if (y < 0 || y >= gray.rows) continue;
+                uint8_t v = gray.at<uint8_t>(y, x);
+                mn = std::min(mn, v); mx = std::max(mx, v);
+            }
+            return mx - mn;
+        };
+
+        // Brightness range in a horizontal strip (for top/bottom edges)
+        auto v_range_row = [&](int y) -> int {
+            if (y < 0 || y >= gray.rows) return 0;
+            const uint8_t* rp = gray.ptr<uint8_t>(y);
+            uint8_t mn = 255, mx = 0;
+            for (int x = sx0; x < sx1; x += 2) {
+                if (x < 0 || x >= gray.cols) continue;
+                mn = std::min(mn, rp[x]); mx = std::max(mx, rp[x]);
+            }
+            return mx - mn;
+        };
+
+        int range_thresh = 30;
+        // Require 3+ consecutive low-range positions to confirm shadow
+        // (internal gridlines are 1-2px wide, won't trigger this).
+        int confirm = 3;
+        int cx = best_rect.x + best_rect.width / 2;
+        int cy = best_rect.y + best_rect.height / 2;
+
+        // For each direction: scan outward from center, track the last
+        // column/row with high V-range ("board content").  When we pass
+        // confirm+2 consecutive low-range positions after the last
+        // high-range one, we've exited the board.
+        auto find_edge = [&](auto range_fn, int start, int limit, int step)
+            -> std::pair<int, bool> {
+            int last_high = start;
+            for (int pos = start; pos != limit; pos += step) {
+                if (range_fn(pos) >= range_thresh) {
+                    last_high = pos;
+                } else if (std::abs(pos - last_high) > confirm + 2) {
+                    return {last_high, true};
+                }
+            }
+            return {last_high, false};
+        };
+
+        auto [rh, r_found] = find_edge(v_range_col, cx,
+            best_rect.x + best_rect.width + search_ext, 1);
+        auto [lh, l_found] = find_edge(v_range_col, cx,
+            best_rect.x - search_ext, -1);
+        auto [bh, b_found] = find_edge(v_range_row, cy,
+            best_rect.y + best_rect.height + search_ext, 1);
+        auto [th, t_found] = find_edge(v_range_row, cy,
+            best_rect.y - search_ext, -1);
+
+        // Board extent = last high-range position + gridline margin.
+        // Only allow SHRINKING — shadow causes over-estimation, so trim
+        // inward but never expand (background V-range can be high too).
+        int cur_right  = best_rect.x + best_rect.width;
+        int cur_left   = best_rect.x;
+        int cur_bottom = best_rect.y + best_rect.height;
+        int cur_top    = best_rect.y;
+
+        int new_right  = r_found ? std::min(rh + gl_margin + 1, cur_right)
+                                 : cur_right;
+        int new_left   = l_found ? std::max(lh - gl_margin, cur_left)
+                                 : cur_left;
+        int new_bottom = b_found ? std::min(bh + gl_margin + 1, cur_bottom)
+                                 : cur_bottom;
+        int new_top    = t_found ? std::max(th - gl_margin, cur_top)
+                                 : cur_top;
+
+        int new_w = new_right - new_left;
+        int new_h = new_bottom - new_top;
+
+        // Force square: average width/height, split difference
+        int new_size = (new_w + new_h) / 2;
+        new_left  -= (new_size - new_w) / 2;
+        new_top   -= (new_size - new_h) / 2;
+
+        cv::Rect color_rect(new_left, new_top, new_size, new_size);
+        color_rect &= cv::Rect(0, 0, gray.cols, gray.rows);
+
+        if (std::abs(color_rect.width - best_rect.width) < cell * 1.5 &&
+            std::abs(color_rect.height - best_rect.height) < cell * 1.5 &&
+            std::abs(color_rect.x - best_rect.x) < cell * 1.5 &&
+            std::abs(color_rect.y - best_rect.y) < cell * 1.5) {
+            log << "Shadow refine: last_high L=" << lh << " T=" << th
+                << " R=" << rh << " B=" << bh
+                << " → rect " << color_rect.x << "," << color_rect.y
+                << " " << color_rect.width << "x" << color_rect.height
+                << " (was " << best_rect.x << "," << best_rect.y
+                << " " << best_rect.width << "x" << best_rect.height << ")\n";
+            best_rect = color_rect;
+        } else {
+            log << "Shadow refine: skipped (too large), would be "
+                << color_rect.x << "," << color_rect.y
+                << " " << color_rect.width << "x" << color_rect.height << "\n";
+        }
+    }
+
+    // ── Step 4d: Label-anchored grid refinement ─────────────────────────
+    // Use column/row label CNN to verify and correct grid alignment.
+    // Labels (A-O above, 1-15 left) provide absolute position anchors.
+    // Skipped when label model is unavailable (falls through gracefully)
+    // or when labels are absent (memento theme — score stays below threshold).
+    if (label_net_available()) {
+        int cs = best_rect.width / 15;
+        int coarse_step = 4;
+
+        // --- X-axis refinement using column labels ---
+        double best_col_score = score_column_labels(img, best_rect);
+        int best_dx = 0;
+
+        // Early termination: if current position is near-perfect, skip search
+        if (best_col_score < 13.0) {
+            // Coarse search: ±cell_size at 4px steps
+            for (int dx = -cs; dx <= cs; dx += coarse_step) {
+                if (dx == 0) continue;
+                cv::Rect shifted = best_rect;
+                shifted.x += dx;
+                if (shifted.x < 0 || shifted.x + shifted.width > img.cols) continue;
+                double s = score_column_labels(img, shifted);
+                if (s > best_col_score) {
+                    best_col_score = s;
+                    best_dx = dx;
+                }
+            }
+            // Fine search: best ±4px at 1px steps
+            if (best_dx != 0 || best_col_score < 13.0) {
+                int center = best_dx;
+                for (int dx = center - coarse_step; dx <= center + coarse_step; dx++) {
+                    if (dx == best_dx) continue;
+                    cv::Rect shifted = best_rect;
+                    shifted.x += dx;
+                    if (shifted.x < 0 || shifted.x + shifted.width > img.cols) continue;
+                    double s = score_column_labels(img, shifted);
+                    if (s > best_col_score) {
+                        best_col_score = s;
+                        best_dx = dx;
+                    }
+                }
+            }
+        }
+
+        // --- Y-axis refinement using row labels ---
+        double best_row_score = score_row_labels(img, best_rect);
+        int best_dy = 0;
+
+        if (best_row_score < 13.0) {
+            for (int dy = -cs; dy <= cs; dy += coarse_step) {
+                if (dy == 0) continue;
+                cv::Rect shifted = best_rect;
+                shifted.y += dy;
+                if (shifted.y < 0 || shifted.y + shifted.height > img.rows) continue;
+                double s = score_row_labels(img, shifted);
+                if (s > best_row_score) {
+                    best_row_score = s;
+                    best_dy = dy;
+                }
+            }
+            if (best_dy != 0 || best_row_score < 13.0) {
+                int center = best_dy;
+                for (int dy = center - coarse_step; dy <= center + coarse_step; dy++) {
+                    if (dy == best_dy) continue;
+                    cv::Rect shifted = best_rect;
+                    shifted.y += dy;
+                    if (shifted.y < 0 || shifted.y + shifted.height > img.rows) continue;
+                    double s = score_row_labels(img, shifted);
+                    if (s > best_row_score) {
+                        best_row_score = s;
+                        best_dy = dy;
+                    }
+                }
+            }
+        }
+
+        // Apply correction only if labels were actually detected (avg P > 0.3)
+        double avg_col = best_col_score / 15.0;
+        double avg_row = best_row_score / 15.0;
+        log << "Label refine: col_score=" << best_col_score
+            << " (avg=" << avg_col << ") row_score=" << best_row_score
+            << " (avg=" << avg_row << ") dx=" << best_dx << " dy=" << best_dy << "\n";
+
+        if (avg_col > 0.3 && best_dx != 0) {
+            best_rect.x += best_dx;
+            log << "  Applied column label correction: dx=" << best_dx << "\n";
+        }
+        if (avg_row > 0.3 && best_dy != 0) {
+            best_rect.y += best_dy;
+            log << "  Applied row label correction: dy=" << best_dy << "\n";
+        }
+    }
+
     int cell_size = best_rect.width / 15;
     log << "Final: rect=" << best_rect.x << "," << best_rect.y
         << " " << best_rect.width << "x" << best_rect.height
@@ -813,6 +1033,7 @@ static bool is_tile(const cv::Mat& cell, bool is_light, int /*row*/, int /*col*/
             ch += m[0]; cs += m[1]; cv_val += m[2];
         }
         ch /= 4; cs /= 4; cv_val /= 4;
+        // Pink/red premium (DW/TW): average of all 4 corners
         bool corner_is_premium = ((ch < 12 || ch > 155) && cs > 25 && cv_val > 160);
         if (corner_is_premium) return false;
     }
@@ -865,6 +1086,14 @@ static bool is_tile(const cv::Mat& cell, bool is_light, int /*row*/, int /*col*/
             // much darker (V~120) than empty premium squares (V~246).
             bool is_pink = ((h < 12 || h > 155) && s > 25 && v > 160);
             if (is_pink) return false;
+            // Blue: empty DL/TL premium squares with JPEG-artifact contrast.
+            // The crabcat phantom (empty DL, JPEG): H≈99, S≈62, V≈214,
+            // contrast≈47.  Real tiles have contrast > 55 from clear letters.
+            // Only apply the blue check for low-contrast blue cells to avoid
+            // catching purple tiles whose HSV averages into the blue range
+            // when white text pixels pull H down from ≈131 to ≈85-110.
+            bool is_blue = (h >= 85 && h <= 120 && s > 30 && v > 200);
+            if (is_blue && contrast < 55) return false;
             // Gray overlay: toasts and exchange-notification popups covering
             // the board are nearly desaturated (S<35) and very bright (V>200).
             // (More aggressive S thresholds risk catching blank tiles whose HSV
@@ -1132,7 +1361,7 @@ static void compute_scores(const cv::Mat& cell, const TileTemplates& tmpl,
 // CNN-based tile classification (replaces template matching when model available)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static const int CNN_INPUT_SIZE = 32;
+static const int CNN_INPUT_SIZE = 48;
 
 static cv::dnn::Net& get_tile_net() {
     static cv::dnn::Net net;
@@ -1208,6 +1437,47 @@ static void compute_scores_cnn(const cv::Mat& cell, float scores[26]) {
         scores[i] /= sum;
 }
 
+// Batched CNN inference: classify multiple tile images in a single forward pass.
+// Each entry in `images` is a BGR cell crop. Results are written to `out_scores`,
+// which must point to an array of at least n*26 floats (row-major, 26 per image).
+static void compute_scores_cnn_batch(const std::vector<cv::Mat>& images,
+                                      float* out_scores) {
+    int n = static_cast<int>(images.size());
+    if (n == 0) return;
+
+    // Preprocess all images into float mats
+    std::vector<cv::Mat> float_imgs;
+    float_imgs.reserve(n);
+    for (int i = 0; i < n; i++) {
+        cv::Mat gray = preprocess_for_cnn(images[i]);
+        cv::Mat flt;
+        gray.convertTo(flt, CV_32F, 1.0 / 255.0);
+        float_imgs.push_back(flt);
+    }
+
+    // Create Nx1x32x32 batch blob
+    cv::Mat blob = cv::dnn::blobFromImages(float_imgs, 1.0, cv::Size(),
+                                            cv::Scalar(), false, false, CV_32F);
+
+    cv::dnn::Net& net = get_tile_net();
+    net.setInput(blob);
+    cv::Mat output = net.forward();  // Nx26 raw logits
+
+    // Apply softmax per row
+    for (int i = 0; i < n; i++) {
+        const float* logits = output.ptr<float>(i);
+        float* scores = out_scores + i * 26;
+        float max_val = *std::max_element(logits, logits + 26);
+        float sum = 0;
+        for (int j = 0; j < 26; j++) {
+            scores[j] = std::exp(logits[j] - max_val);
+            sum += scores[j];
+        }
+        for (int j = 0; j < 26; j++)
+            scores[j] /= sum;
+    }
+}
+
 // Pick the best letter from scores and populate top-5 candidates.
 static void pick_best(const float scores[26], CellResult& cell) {
     // Sort indices by score descending
@@ -1229,6 +1499,148 @@ static void pick_best(const float scores[26], CellResult& cell) {
         cell.letter = '?';
         cell.confidence = std::max(0.0f, scores[idx[0]]);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Label CNN: column/row label recognition for grid alignment verification
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static const int NUM_LABEL_CLASSES = 30;  // A-O (0-14) + 1-15 (15-29)
+
+static cv::dnn::Net& get_label_net() {
+    static cv::dnn::Net net;
+    static bool attempted = false;
+    if (!attempted) {
+        attempted = true;
+        const char* model_paths[] = {
+#ifdef LABEL_MODEL_PATH
+            LABEL_MODEL_PATH,
+#endif
+            "models/label_model.onnx",
+            nullptr
+        };
+        for (int i = 0; model_paths[i]; i++) {
+            try {
+                net = cv::dnn::readNetFromONNX(model_paths[i]);
+                if (!net.empty()) break;
+            } catch (...) {}
+        }
+    }
+    return net;
+}
+
+static bool label_net_available() {
+    return !get_label_net().empty();
+}
+
+// Run batched label CNN inference on a vector of crops.
+// Returns softmax probabilities in out_scores (n * NUM_LABEL_CLASSES floats).
+static void compute_label_scores_batch(const std::vector<cv::Mat>& images,
+                                        float* out_scores) {
+    int n = static_cast<int>(images.size());
+    if (n == 0) return;
+
+    std::vector<cv::Mat> float_imgs;
+    float_imgs.reserve(n);
+    for (int i = 0; i < n; i++) {
+        cv::Mat gray = preprocess_for_cnn(images[i]);
+        cv::Mat flt;
+        gray.convertTo(flt, CV_32F, 1.0 / 255.0);
+        float_imgs.push_back(flt);
+    }
+
+    cv::Mat blob = cv::dnn::blobFromImages(float_imgs, 1.0, cv::Size(),
+                                            cv::Scalar(), false, false, CV_32F);
+
+    cv::dnn::Net& net = get_label_net();
+    net.setInput(blob);
+    cv::Mat output = net.forward();  // Nx30 raw logits
+
+    for (int i = 0; i < n; i++) {
+        const float* logits = output.ptr<float>(i);
+        float* scores = out_scores + i * NUM_LABEL_CLASSES;
+        float max_val = *std::max_element(logits, logits + NUM_LABEL_CLASSES);
+        float sum = 0;
+        for (int j = 0; j < NUM_LABEL_CLASSES; j++) {
+            scores[j] = std::exp(logits[j] - max_val);
+            sum += scores[j];
+        }
+        for (int j = 0; j < NUM_LABEL_CLASSES; j++)
+            scores[j] /= sum;
+    }
+}
+
+// Score how well column labels A-O match at a given board rect position.
+// Extracts 15 column label crops from above the board, runs batched inference.
+// Returns sum of P(correct_column_class | crop) for columns 0-14.
+static double score_column_labels(const cv::Mat& img, cv::Rect board_rect) {
+    double cw = static_cast<double>(board_rect.width) / 15.0;
+    double ch = static_cast<double>(board_rect.height) / 15.0;
+    double crop_size = 0.8 * std::min(cw, ch);
+    int crop_px = std::max(8, static_cast<int>(crop_size));
+
+    std::vector<cv::Mat> crops;
+    crops.reserve(15);
+    for (int c = 0; c < 15; c++) {
+        double cx = board_rect.x + (c + 0.5) * cw;
+        double cy = board_rect.y - 0.4 * ch;
+        int x0 = static_cast<int>(cx - crop_px / 2.0);
+        int y0 = static_cast<int>(cy - crop_px / 2.0);
+        int x1 = x0 + crop_px;
+        int y1 = y0 + crop_px;
+        x0 = std::max(0, x0);
+        y0 = std::max(0, y0);
+        x1 = std::min(img.cols, x1);
+        y1 = std::min(img.rows, y1);
+        if (x1 - x0 < 4 || y1 - y0 < 4) return 0.0;
+        crops.push_back(img(cv::Rect(x0, y0, x1 - x0, y1 - y0)));
+    }
+
+    float scores[15 * NUM_LABEL_CLASSES];
+    compute_label_scores_batch(crops, scores);
+
+    double total = 0;
+    for (int c = 0; c < 15; c++) {
+        // Column c should be class c (A=0, B=1, ..., O=14)
+        total += scores[c * NUM_LABEL_CLASSES + c];
+    }
+    return total;
+}
+
+// Score how well row labels 1-15 match at a given board rect position.
+// Returns sum of P(correct_row_class | crop) for rows 0-14.
+static double score_row_labels(const cv::Mat& img, cv::Rect board_rect) {
+    double cw = static_cast<double>(board_rect.width) / 15.0;
+    double ch = static_cast<double>(board_rect.height) / 15.0;
+    double crop_size = 0.8 * std::min(cw, ch);
+    int crop_px = std::max(8, static_cast<int>(crop_size));
+
+    std::vector<cv::Mat> crops;
+    crops.reserve(15);
+    for (int r = 0; r < 15; r++) {
+        double cx = board_rect.x - 0.5 * cw;
+        double cy = board_rect.y + (r + 0.5) * ch;
+        int x0 = static_cast<int>(cx - crop_px / 2.0);
+        int y0 = static_cast<int>(cy - crop_px / 2.0);
+        int x1 = x0 + crop_px;
+        int y1 = y0 + crop_px;
+        x0 = std::max(0, x0);
+        y0 = std::max(0, y0);
+        x1 = std::min(img.cols, x1);
+        y1 = std::min(img.rows, y1);
+        if (x1 - x0 < 4 || y1 - y0 < 4) return 0.0;
+        crops.push_back(img(cv::Rect(x0, y0, x1 - x0, y1 - y0)));
+    }
+
+    float scores[15 * NUM_LABEL_CLASSES];
+    compute_label_scores_batch(crops, scores);
+
+    double total = 0;
+    for (int r = 0; r < 15; r++) {
+        // Row r should be class (15 + r) (1=15, 2=16, ..., 15=29)
+        total += scores[r * NUM_LABEL_CLASSES + (15 + r)];
+    }
+    return total;
 }
 
 // Classify a single tile crop (e.g. a rack tile) into a CellResult.
@@ -1428,7 +1840,11 @@ static void classify_cells(const CellImages& cell_imgs,
     static float all_scores[15][15][26];
     std::memset(all_scores, 0, sizeof(all_scores));
 
-    int tile_count = 0, ocr_fail = 0;
+    // Pass 1: detect which cells are tiles (occupancy), collect images for batch CNN
+    struct TileRef { int r, c; };
+    std::vector<TileRef> tile_refs;
+    std::vector<cv::Mat> tile_images;
+
     for (int r = 0; r < 15; r++) {
         for (int c = 0; c < 15; c++) {
             // Diagnostic: log HSV for every cell in light mode
@@ -1457,28 +1873,284 @@ static void classify_cells(const CellImages& cell_imgs,
             }
             if (!is_tile(cell_imgs[r][c], is_light, r, c, log)) continue;
 
-            tile_count++;
-            if (tile_net_available()) {
-                compute_scores_cnn(cell_imgs[r][c], all_scores[r][c]);
-                pick_best(all_scores[r][c], cells[r][c]);
-            } else if (tmpl.valid) {
-                compute_scores(cell_imgs[r][c], tmpl, all_scores[r][c]);
-                pick_best(all_scores[r][c], cells[r][c]);
-            } else {
-                cells[r][c].letter = '?';
-            }
-
-            // Blank tile detection
-            if (cells[r][c].letter != '?' && cells[r][c].letter != 0 &&
-                is_blank_tile(cell_imgs[r][c])) {
-                cells[r][c].is_blank = true;
-                cells[r][c].letter = static_cast<char>(
-                    std::tolower(static_cast<unsigned char>(cells[r][c].letter)));
-            }
-
-            if (cells[r][c].letter == '?') ocr_fail++;
+            tile_refs.push_back({r, c});
+            tile_images.push_back(cell_imgs[r][c]);
         }
     }
+
+    // Pass 1b: board-color calibration + false-positive filter.
+    // Determine what each premium square type looks like from clearly-empty
+    // cells, then reject detections whose corners still match the empty
+    // reference (tooltip overlays, JPEG-artifact phantoms, etc.).
+    {
+        // Helper: average BGR of the 4 corner patches (1/5-cell size).
+        auto corner_bgr = [](const cv::Mat& cell) -> cv::Scalar {
+            int kw = std::max(1, cell.cols / 5);
+            int kh = std::max(1, cell.rows / 5);
+            cv::Rect patches[4] = {
+                {0,              0,              kw, kh},
+                {cell.cols - kw, 0,              kw, kh},
+                {0,              cell.rows - kh, kw, kh},
+                {cell.cols - kw, cell.rows - kh, kw, kh},
+            };
+            cv::Scalar sum(0, 0, 0);
+            for (auto& p : patches) {
+                cv::Scalar m = cv::mean(cell(p));
+                sum[0] += m[0]; sum[1] += m[1]; sum[2] += m[2];
+            }
+            return cv::Scalar(sum[0]/4, sum[1]/4, sum[2]/4);
+        };
+
+        // Calibrate: for each premium type (0-5), average corner BGR from
+        // clearly-empty cells (contrast < 8).  These establish what each
+        // square type looks like without a tile.
+        cv::Scalar empty_ref[6] = {};
+        int empty_count[6] = {};
+
+        for (int r = 0; r < 15; r++) {
+            for (int c = 0; c < 15; c++) {
+                const cv::Mat& cell = cell_imgs[r][c];
+                if (cell.empty() || cell.channels() != 3) continue;
+
+                // Quick center contrast check
+                int cx = cell.cols / 5, cy = cell.rows / 5;
+                int cw = cell.cols * 3 / 5, ch = cell.rows * 3 / 5;
+                if (cw <= 0 || ch <= 0) continue;
+                cv::Mat ctr = cell(cv::Rect(cx, cy, cw, ch));
+                cv::Mat gray;
+                cv::cvtColor(ctr, gray, cv::COLOR_BGR2GRAY);
+                cv::Scalar gm, gs;
+                cv::meanStdDev(gray, gm, gs);
+                if (gs[0] > 8) continue;  // not clearly empty
+
+                int p = PREMIUM[r][c];
+                cv::Scalar bgr = corner_bgr(cell);
+                empty_ref[p][0] += bgr[0];
+                empty_ref[p][1] += bgr[1];
+                empty_ref[p][2] += bgr[2];
+                empty_count[p]++;
+            }
+        }
+
+        // Finalize averages
+        for (int p = 0; p < 6; p++) {
+            if (empty_count[p] >= 2) {
+                empty_ref[p][0] /= empty_count[p];
+                empty_ref[p][1] /= empty_count[p];
+                empty_ref[p][2] /= empty_count[p];
+            }
+        }
+
+        log << "Board palette calibrated:";
+        for (int p = 0; p < 6; p++) {
+            if (empty_count[p] >= 2) {
+                log << " " << p << "=(" << (int)empty_ref[p][0] << ","
+                    << (int)empty_ref[p][1] << "," << (int)empty_ref[p][2]
+                    << ")x" << empty_count[p];
+            }
+        }
+        log << "\n";
+
+        // Filter: reject detections whose corners match the empty reference
+        // for their board position's premium type.
+        std::vector<TileRef> kept_refs;
+        std::vector<cv::Mat> kept_imgs;
+
+        for (size_t i = 0; i < tile_refs.size(); i++) {
+            int r = tile_refs[i].r, c = tile_refs[i].c;
+            const cv::Mat& cell = tile_images[i];
+            int p = PREMIUM[r][c];
+
+            if (cell.channels() != 3 || empty_count[p] < 2) {
+                kept_refs.push_back(tile_refs[i]);
+                kept_imgs.push_back(tile_images[i]);
+                continue;
+            }
+
+            cv::Scalar bgr = corner_bgr(cell);
+            double corner_dist = std::max({std::abs(bgr[0] - empty_ref[p][0]),
+                                           std::abs(bgr[1] - empty_ref[p][1]),
+                                           std::abs(bgr[2] - empty_ref[p][2])});
+
+            if (corner_dist > 25) {
+                // Corners clearly differ from empty — usually a real tile.
+                // Tooltip phantoms that escape here are caught later by the
+                // post-CNN tooltip filter (Pass 2b) using confidence + Laplacian.
+                kept_refs.push_back(tile_refs[i]);
+                kept_imgs.push_back(tile_images[i]);
+                continue;
+            }
+
+            // Corners match empty reference.  Could be:
+            //   (a) tooltip phantom (premium square + text overlay)
+            //   (b) real tile whose corners bleed through to premium
+            //
+            // Distinguish by checking for a tile EDGE in the border
+            // region.  Real tiles are rounded rectangles inset from the
+            // cell boundary — the transition from tile to premium creates
+            // strong edges.  Tooltip phantoms have no tile shape, so the
+            // border is uniform premium color with low gradient.
+            cv::Mat gray_cell;
+            cv::cvtColor(cell, gray_cell, cv::COLOR_BGR2GRAY);
+            cv::Mat grad_x, grad_y;
+            cv::Sobel(gray_cell, grad_x, CV_16S, 1, 0, 3);
+            cv::Sobel(gray_cell, grad_y, CV_16S, 0, 1, 3);
+            cv::Mat abs_gx, abs_gy, grad;
+            cv::convertScaleAbs(grad_x, abs_gx);
+            cv::convertScaleAbs(grad_y, abs_gy);
+            cv::addWeighted(abs_gx, 0.5, abs_gy, 0.5, 0, grad);
+
+            // Border ring: outer 1/4, excluding inner 1/2
+            int bx = cell.cols / 4, by = cell.rows / 4;
+            cv::Mat mask = cv::Mat::ones(cell.rows, cell.cols, CV_8U);
+            if (bx > 0 && by > 0 && cell.cols - 2*bx > 0 && cell.rows - 2*by > 0)
+                mask(cv::Rect(bx, by, cell.cols - 2*bx, cell.rows - 2*by)) = 0;
+            double border_grad = cv::mean(grad, mask)[0];
+
+            // Two-tier rejection:
+            // 1) bgrad <= 10: definitely phantom (no tile edge visible)
+            // 2) bgrad 10-20: borderline — also check center color.
+            //    Phantoms have center ≈ premium; real tiles differ.
+            // 3) bgrad > 20: definitely real tile (clear tile edge)
+            bool reject = false;
+            if (border_grad <= 10.0) {
+                reject = true;
+            } else if (border_grad <= 20.0) {
+                int cx = cell.cols / 4, cy = cell.rows / 4;
+                int cw = cell.cols / 2, ch = cell.rows / 2;
+                cv::Scalar ctr = cv::mean(cell(cv::Rect(cx, cy, cw, ch)));
+                double cdist = std::max({std::abs(ctr[0] - empty_ref[p][0]),
+                                         std::abs(ctr[1] - empty_ref[p][1]),
+                                         std::abs(ctr[2] - empty_ref[p][2])});
+                reject = (cdist < 40);
+            }
+
+            if (!reject) {
+                kept_refs.push_back(tile_refs[i]);
+                kept_imgs.push_back(tile_images[i]);
+            } else {
+                log << "  Board-color filter rejected ["
+                    << r+1 << "," << (char)('A'+c) << "] prem=" << p
+                    << " cdist=" << (int)corner_dist
+                    << " bgrad=" << (int)border_grad << "\n";
+            }
+        }
+
+        if (kept_refs.size() < tile_refs.size()) {
+            log << "Board-color filter: removed " << (tile_refs.size() - kept_refs.size())
+                << " phantom(s), kept " << kept_refs.size() << "/" << tile_refs.size() << "\n";
+        }
+        tile_refs = std::move(kept_refs);
+        tile_images = std::move(kept_imgs);
+    }
+
+    int tile_count = static_cast<int>(tile_refs.size());
+    int ocr_fail = 0;
+
+    // Pass 2: classify all tiles
+    if (tile_count > 0 && tile_net_available()) {
+        // Batched CNN inference — single forward pass for all tiles
+        std::vector<float> batch_scores(tile_count * 26);
+        compute_scores_cnn_batch(tile_images, batch_scores.data());
+        for (int i = 0; i < tile_count; i++) {
+            int r = tile_refs[i].r, c = tile_refs[i].c;
+            std::memcpy(all_scores[r][c], &batch_scores[i * 26], 26 * sizeof(float));
+            pick_best(all_scores[r][c], cells[r][c]);
+        }
+    } else if (tile_count > 0 && tmpl.valid) {
+        for (int i = 0; i < tile_count; i++) {
+            int r = tile_refs[i].r, c = tile_refs[i].c;
+            compute_scores(tile_images[i], tmpl, all_scores[r][c]);
+            pick_best(all_scores[r][c], cells[r][c]);
+        }
+    } else {
+        for (int i = 0; i < tile_count; i++) {
+            int r = tile_refs[i].r, c = tile_refs[i].c;
+            cells[r][c].letter = '?';
+        }
+    }
+
+    // Pass 2b: reject tooltip phantoms on premium squares.
+    // Tooltip overlays on empty premium squares can fool is_tile() (high
+    // contrast from overlay text) and survive the board-color filter
+    // (corner colors shifted beyond the empty reference by the overlay).
+    // Three signals distinguish phantoms from real tiles:
+    //   1. CNN confidence: real tiles get conf ≈ 1.0; phantoms often lower
+    //   2. Laplacian variance in the subscript region: tooltip text creates
+    //      more high-frequency content than a tile's small subscript digit
+    //   3. Score ratio (top1/top2 softmax): real tiles have ratios in the
+    //      billions; phantoms max ~7000 (10-million-fold gap)
+    int tooltip_rejected = 0;
+    for (int i = 0; i < tile_count; i++) {
+        int r = tile_refs[i].r, c = tile_refs[i].c;
+        if (cells[r][c].letter == 0 || cells[r][c].letter == '?') continue;
+        int p = PREMIUM[r][c];
+        if (p == 0) continue;
+        const cv::Mat& cell = tile_images[i];
+        if (cell.cols < 20 || cell.rows < 20) continue;
+
+        float conf = cells[r][c].confidence;
+
+        // Laplacian energy in bottom-right subscript region (60-90% x, 60-90% y)
+        int sx = cell.cols * 60 / 100;
+        int sy = cell.rows * 60 / 100;
+        int sw = cell.cols * 30 / 100;
+        int sh = cell.rows * 30 / 100;
+        if (sw < 4 || sh < 4) continue;
+
+        cv::Mat sub = cell(cv::Rect(sx, sy, sw, sh));
+        cv::Mat sg;
+        if (sub.channels() == 3) cv::cvtColor(sub, sg, cv::COLOR_BGR2GRAY);
+        else sg = sub;
+        cv::Mat lapl;
+        cv::Laplacian(sg, lapl, CV_16S, 3);
+        cv::Scalar lm, ls;
+        cv::meanStdDev(lapl, lm, ls);
+        double lapl_var = ls[0] * ls[0];
+
+        // Score ratio: how much more confident is top-1 vs top-2?
+        float top2 = cells[r][c].cand_scores[1];
+        double score_ratio = (top2 > 0) ? (double)conf / top2 : 1e15;
+
+        bool reject = false;
+        if (conf < 0.95 && lapl_var > 50000) {
+            reject = true;
+        } else if (conf < 0.999 && lapl_var > 100000) {
+            reject = true;
+        } else if (conf < 0.9998 && lapl_var > 200000) {
+            reject = true;
+        } else if (score_ratio < 8000.0 && lapl_var > 150000) {
+            reject = true;
+        }
+
+        if (reject) {
+            log << "  Tooltip filter rejected ["
+                << r+1 << "," << (char)('A'+c) << "] prem=" << p
+                << " let=" << cells[r][c].letter
+                << " conf=" << (int)(conf * 1000) / 1000.0
+                << " lvar=" << (int)lapl_var << "\n";
+            cells[r][c].letter = 0;
+            cells[r][c].confidence = 0;
+            cells[r][c].is_blank = false;
+            tooltip_rejected++;
+        }
+    }
+    if (tooltip_rejected > 0) {
+        log << "Tooltip filter: removed " << tooltip_rejected << " phantom(s)\n";
+    }
+
+    // Pass 3: blank tile detection and OCR failure count
+    for (int i = 0; i < tile_count; i++) {
+        int r = tile_refs[i].r, c = tile_refs[i].c;
+        if (cells[r][c].letter != '?' && cells[r][c].letter != 0 &&
+            is_blank_tile(tile_images[i])) {
+            cells[r][c].is_blank = true;
+            cells[r][c].letter = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(cells[r][c].letter)));
+        }
+        if (cells[r][c].letter == '?') ocr_fail++;
+    }
+
     log << "Classified: " << tile_count << " tiles, " << ocr_fail << " OCR failures"
         << " (method=" << (tile_net_available() ? "CNN" : tmpl.valid ? "template" : "none") << ")\n";
 

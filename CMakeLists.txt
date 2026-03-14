@@ -54,7 +54,8 @@ target_link_libraries(board_lib PUBLIC ${OpenCV_LIBS} PkgConfig::FREETYPE2)
 # Pass font path and model path as compile-time defines
 target_compile_definitions(board_lib PUBLIC
     FONT_PATH="${CMAKE_SOURCE_DIR}/fonts/RobotoMono-Bold.ttf"
-    TILE_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/tile_model.onnx")
+    TILE_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/tile_model.onnx"
+    LABEL_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/label_model.onnx")
 
 if(TESSERACT_FOUND)
     target_compile_definitions(board_lib PUBLIC HAS_TESSERACT=1)
@@ -99,6 +100,9 @@ target_link_libraries(diag PRIVATE board_lib)
 
 add_executable(extract_crops src/extract_crops.cpp)
 target_link_libraries(extract_crops PRIVATE board_lib)
+
+add_executable(extract_label_crops src/extract_label_crops.cpp)
+target_link_libraries(extract_label_crops PRIVATE board_lib)
 
 add_executable(eval_local src/eval_local.cpp)
 target_link_libraries(eval_local PRIVATE board_lib)
