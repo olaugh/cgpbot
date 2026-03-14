@@ -5,6 +5,7 @@
 // Usage: eval_local <testdata_dir> [--html <output.html>]
 //   --html: generate a self-contained HTML debug page for non-perfect cases
 #include "board.h"
+#include "rack.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -101,6 +102,13 @@ struct FailCase {
     std::string got_cgp;
     int tiles, correct, occ_err;
     double ms;
+    // Rack debug info
+    std::string rack_expected;
+    std::string rack_got;
+    int rack_n_tiles = 0;
+    CellResult rack_cr[7] = {};
+    std::vector<std::vector<uint8_t>> rack_tile_pngs;
+    bool rack_fail = false;
 };
 
 static void html_escape(std::ostream& out, const std::string& s) {
@@ -384,6 +392,49 @@ document.addEventListener('DOMContentLoaded', function() {
 
         out << "</div>\n"; // close layout
 
+        // Rack debug section for rack failures
+        if (fc.rack_fail) {
+            out << "<div style=\"margin-top:12px\">\n";
+            out << "<div class=\"img-label\">Rack: expected=<b>"
+                << fc.rack_expected << "</b> got=<b>"
+                << fc.rack_got << "</b></div>\n";
+            out << "<div style=\"display:flex;gap:8px;margin-top:6px;flex-wrap:wrap\">\n";
+            std::string exp_sorted = sort_rack(fc.rack_expected);
+            std::string got_sorted = sort_rack(fc.rack_got);
+            for (int ti = 0; ti < fc.rack_n_tiles; ti++) {
+                char got_ch = fc.rack_cr[ti].letter;
+                std::string border = "2px solid #f44";
+                out << "<div style=\"text-align:center;border:" << border
+                    << ";border-radius:4px;padding:4px;background:#1a1a1a\">\n";
+                if (ti < (int)fc.rack_tile_pngs.size() && !fc.rack_tile_pngs[ti].empty()) {
+                    out << "<img src=\"data:image/png;base64,"
+                        << base64_encode(fc.rack_tile_pngs[ti])
+                        << "\" style=\"max-width:48px;max-height:48px;display:block;"
+                        << "margin:0 auto 4px\">\n";
+                }
+                out << "<div style=\"font-weight:bold;color:"
+                    << (fc.rack_cr[ti].is_blank ? "#a8f" : "#ff8")
+                    << "\">" << got_ch << "</div>\n";
+                out << "<div style=\"font-size:.7rem;color:#888\">"
+                    << static_cast<int>(fc.rack_cr[ti].confidence * 100)
+                    << "%</div>\n";
+                // Top-5 candidates
+                out << "<div style=\"font-size:.65rem;color:#666\">";
+                for (int k = 0; k < 5; k++) {
+                    char cl = fc.rack_cr[ti].cand_letters[k];
+                    if (cl < 'A' || cl > 'Z') break;
+                    if (k > 0) out << " ";
+                    out << cl << "("
+                        << static_cast<int>(fc.rack_cr[ti].cand_scores[k] * 100)
+                        << ")";
+                }
+                out << "</div>\n";
+                out << "</div>\n";
+            }
+            out << "</div>\n"; // close flex container
+            out << "</div>\n"; // close rack section
+        }
+
         // Collapsible log
         out << "<div class=\"log-section\">\n";
         out << "<span class=\"log-toggle\" onclick=\""
@@ -429,6 +480,12 @@ int main(int argc, char* argv[]) {
     int per_letter_total[26] = {};
     int per_letter_correct[26] = {};
 
+    // Rack stats
+    int rack_cases = 0, rack_perfect = 0;
+    int rack_total_tiles = 0, rack_correct_tiles = 0;
+    int rack_per_letter_total[26] = {};
+    int rack_per_letter_correct[26] = {};
+
     std::vector<FailCase> fail_cases;
 
     std::vector<std::string> files;
@@ -441,9 +498,9 @@ int main(int argc, char* argv[]) {
     }
     std::sort(files.begin(), files.end());
 
-    std::printf("%-50s %5s %5s %5s %5s %7s %7s\n",
-                "Case", "Tiles", "Cor", "Wrong", "Occ", "Acc%", "ms");
-    std::printf("%s\n", std::string(90, '-').c_str());
+    std::printf("%-50s %5s %5s %5s %5s %7s %7s  %s\n",
+                "Case", "Tiles", "Cor", "Wrong", "Occ", "Acc%", "ms", "Rack");
+    std::printf("%s\n", std::string(96, '-').c_str());
 
     for (auto& path : files) {
         std::string name = fs::path(path).stem().string();
@@ -495,11 +552,94 @@ int main(int argc, char* argv[]) {
         int wrong = tiles - correct;
         double pct = tiles > 0 ? 100.0 * correct / tiles : 100.0;
 
-        std::printf("%-50s %5d %5d %5d %5d %6.1f%% %6.0f\n",
+        // Rack detection + evaluation
+        std::string expected_rack = parse_cgp_rack(cgp_line);
+        std::string got_rack;
+        int rack_tile_correct = 0;
+        int rack_n_exp = 0;
+        bool rack_ok = true;
+        bool has_rack = false;
+        int rack_n_rt = 0;
+        CellResult rack_cr[7] = {};
+        std::vector<RackTile> rack_tiles_vec;
+
+        if (dr.cell_size > 0 && !expected_rack.empty()) {
+            has_rack = true;
+            bool is_light = detect_board_mode(imgdata,
+                dr.board_rect.x, dr.board_rect.y, dr.cell_size);
+            rack_tiles_vec = detect_rack_tiles(imgdata,
+                dr.board_rect.x, dr.board_rect.y, dr.cell_size, is_light);
+
+            rack_n_rt = static_cast<int>(rack_tiles_vec.size());
+            for (int i = 0; i < rack_n_rt && i < 7; i++)
+                rack_cr[i] = classify_rack_tile_full(rack_tiles_vec[i]);
+            refine_rack(rack_cr, std::min(rack_n_rt, 7), dr.cells);
+            alphagram_tiebreak(rack_cr, std::min(rack_n_rt, 7));
+            for (int i = 0; i < rack_n_rt && i < 7; i++) {
+                char ch = rack_cr[i].letter;
+                got_rack += (ch >= 'A' && ch <= 'Z') ? ch : '?';
+            }
+
+            std::string exp_sorted = sort_rack(expected_rack);
+            std::string got_sorted = sort_rack(got_rack);
+
+            rack_n_exp = static_cast<int>(exp_sorted.size());
+            int n_got = static_cast<int>(got_sorted.size());
+            int ei = 0, gi = 0;
+            while (ei < rack_n_exp && gi < n_got) {
+                if (exp_sorted[ei] == got_sorted[gi]) {
+                    rack_tile_correct++;
+                    ei++; gi++;
+                } else if (exp_sorted[ei] < got_sorted[gi]) {
+                    ei++;
+                } else {
+                    gi++;
+                }
+            }
+
+            rack_ok = (exp_sorted == got_sorted);
+            rack_cases++;
+            rack_total_tiles += rack_n_exp;
+            rack_correct_tiles += rack_tile_correct;
+            if (rack_ok) rack_perfect++;
+
+            // Per-letter rack accuracy
+            for (char ch : exp_sorted) {
+                if (ch >= 'A' && ch <= 'Z') rack_per_letter_total[ch - 'A']++;
+                else if (ch == '?') {} // blanks not tracked per-letter
+            }
+            // Count correct matches per-letter
+            ei = 0; gi = 0;
+            while (ei < rack_n_exp && gi < n_got) {
+                if (exp_sorted[ei] == got_sorted[gi]) {
+                    if (exp_sorted[ei] >= 'A' && exp_sorted[ei] <= 'Z')
+                        rack_per_letter_correct[exp_sorted[ei] - 'A']++;
+                    ei++; gi++;
+                } else if (exp_sorted[ei] < got_sorted[gi]) {
+                    ei++;
+                } else {
+                    gi++;
+                }
+            }
+        }
+
+        // Print line with rack info
+        std::printf("%-50s %5d %5d %5d %5d %6.1f%% %6.0f",
                     name.c_str(), tiles, correct, wrong, occ_err, pct, ms);
+        if (has_rack) {
+            std::printf("  %d/%d%s", rack_tile_correct, rack_n_exp,
+                        rack_ok ? "" : " MISS");
+        } else if (expected_rack.empty()) {
+            std::printf("  -");
+        } else {
+            std::printf("  SKIP");
+        }
+        std::printf("\n");
 
         // Collect failing case for HTML report
-        if (!html_path.empty() && (wrong > 0 || occ_err > 0)) {
+        bool board_fail = (wrong > 0 || occ_err > 0);
+        bool rack_fail = (has_rack && !rack_ok);
+        if (!html_path.empty() && (board_fail || rack_fail)) {
             FailCase fc;
             fc.name = name;
             fc.orig_png = imgdata;
@@ -512,6 +652,17 @@ int main(int argc, char* argv[]) {
             fc.correct = correct;
             fc.occ_err = occ_err;
             fc.ms = ms;
+            if (rack_fail) {
+                fc.rack_fail = true;
+                fc.rack_expected = expected_rack;
+                fc.rack_got = got_rack;
+                fc.rack_n_tiles = std::min(rack_n_rt, 7);
+                std::memcpy(fc.rack_cr, rack_cr, sizeof(rack_cr));
+                for (int i = 0; i < fc.rack_n_tiles; i++)
+                    fc.rack_tile_pngs.push_back(
+                        i < (int)rack_tiles_vec.size() ? rack_tiles_vec[i].png
+                                                       : std::vector<uint8_t>{});
+            }
             fail_cases.push_back(std::move(fc));
         }
 
@@ -522,19 +673,39 @@ int main(int argc, char* argv[]) {
         n_files++;
     }
 
-    std::printf("%s\n", std::string(90, '=').c_str());
+    std::printf("%s\n", std::string(96, '=').c_str());
     double total_pct = total_tiles > 0 ? 100.0 * total_correct / total_tiles : 0;
-    std::printf("Total: %d files, %d/%d tiles correct (%.2f%%), %d occ errors\n",
+    std::printf("Total: %d files, %d/%d tiles correct (%.2f%%), %d occ errors",
                 n_files, total_correct, total_tiles, total_pct, total_occ_errors);
+    if (rack_cases > 0) {
+        double rack_pct = rack_total_tiles > 0
+            ? (100.0 * rack_correct_tiles / rack_total_tiles) : 0;
+        std::printf(" | Rack: %d/%d tiles, %d/%d perfect (%.1f%%)",
+                    rack_correct_tiles, rack_total_tiles,
+                    rack_perfect, rack_cases, rack_pct);
+    }
+    std::printf("\n");
     std::printf("Perfect cases: %d/%d\n", perfect_cases, n_files);
     std::printf("Total time: %.0fms (%.1fms/case)\n", total_ms, total_ms / n_files);
 
-    std::printf("\nPer-letter accuracy:\n");
+    std::printf("\nPer-letter board accuracy:\n");
     for (int i = 0; i < 26; i++) {
         if (per_letter_total[i] > 0) {
             double acc = 100.0 * per_letter_correct[i] / per_letter_total[i];
             std::printf("  %c: %d/%d = %.1f%%\n",
                         'A' + i, per_letter_correct[i], per_letter_total[i], acc);
+        }
+    }
+
+    if (rack_cases > 0) {
+        std::printf("\nPer-letter rack accuracy:\n");
+        for (int i = 0; i < 26; i++) {
+            if (rack_per_letter_total[i] > 0) {
+                double acc = 100.0 * rack_per_letter_correct[i] / rack_per_letter_total[i];
+                std::printf("  %c: %d/%d = %.1f%%\n",
+                            'A' + i, rack_per_letter_correct[i],
+                            rack_per_letter_total[i], acc);
+            }
         }
     }
 

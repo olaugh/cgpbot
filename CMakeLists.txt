@@ -47,7 +47,7 @@ pkg_check_modules(TESSERACT IMPORTED_TARGET tesseract lept)
 
 # ── Board processing library (shared) ────────────────────────────────────────
 
-add_library(board_lib STATIC src/board.cpp)
+add_library(board_lib STATIC src/board.cpp src/rack.cpp)
 target_include_directories(board_lib PUBLIC src ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(board_lib PUBLIC ${OpenCV_LIBS} PkgConfig::FREETYPE2)
 
