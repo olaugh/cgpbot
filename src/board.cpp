@@ -1972,7 +1972,7 @@ static void classify_cells(const CellImages& cell_imgs,
                                            std::abs(bgr[1] - empty_ref[p][1]),
                                            std::abs(bgr[2] - empty_ref[p][2])});
 
-            if (corner_dist > 25) {
+            if (corner_dist > 20) {
                 // Corners clearly differ from empty — usually a real tile.
                 // Tooltip phantoms that escape here are caught later by the
                 // post-CNN tooltip filter (Pass 2b) using confidence + Laplacian.
