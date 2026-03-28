@@ -41,6 +41,7 @@ class GameState:
     scores: List[int] = field(default_factory=lambda: [0, 0])
     turn: int = 0  # 0-indexed
     on_turn: int = 0  # 0 or 1, which player is on turn
+    is_event: bool = False  # True for phony withdrawals and other non-turn events
     players: List[str] = field(default_factory=lambda: ["Player1", "Player2"])
     lexicon: str = ""
     game_id: str = ""
@@ -228,7 +229,9 @@ def parse_gcg(gcg_text: str) -> List[GameState]:
                 remove_word(state.board, pw, pr, pc, ph)
                 pending_phony = None
             # Player stays on turn (same player replays)
-            states.append(state.copy())
+            ev = state.copy()
+            ev.is_event = True
+            states.append(ev)
             continue
 
         # Clear pending phony (previous move wasn't challenged)
@@ -244,13 +247,17 @@ def parse_gcg(gcg_text: str) -> List[GameState]:
         if coord in ("(challenge)", "(time)") or not coord[0].isalnum():
             # Special event: challenge bonus, time penalty, etc.
             state.scores[pidx] = total
-            states.append(state.copy())
+            ev = state.copy()
+            ev.is_event = True
+            states.append(ev)
             continue
 
         if word.startswith("(") and word.endswith(")"):
             # End-of-game rack subtraction: opponent's remaining tiles
             state.scores[pidx] = total
-            states.append(state.copy())
+            ev = state.copy()
+            ev.is_event = True
+            states.append(ev)
             continue
 
         # Regular play or pass
@@ -308,6 +315,21 @@ def patch_forward_racks(states: List[GameState]) -> List[GameState]:
     return states
 
 
+def move_index_map(states: List[GameState]) -> List[int]:
+    """
+    Build a mapping from Woogles move number to parser state index.
+    Woogles ?turn=N shows the board after N-1 actual moves, skipping
+    phony withdrawals, challenge bonuses, and other non-turn events.
+    Returns a list where result[move_number] = parser_state_index.
+    move_number 0 = empty board (state[0]).
+    """
+    mapping = [0]  # move 0 = state[0] (empty board)
+    for i in range(1, len(states)):
+        if not states[i].is_event:
+            mapping.append(i)
+    return mapping
+
+
 def states_to_test_cases(states: List[GameState], game_id: str):
     """
     Convert replay states to (name, cgp) pairs suitable for testdata/.
@@ -341,7 +363,8 @@ if __name__ == "__main__":
 
     states = parse_gcg(gcg_text)
     patch_forward_racks(states)
-    print(f"Replayed {len(states)-1} moves")
+    mmap = move_index_map(states)
+    print(f"Replayed {len(states)-1} events, {len(mmap)-1} moves")
 
     if target_turn is not None:
         s = states[target_turn]
