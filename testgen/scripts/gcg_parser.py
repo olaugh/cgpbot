@@ -340,6 +340,7 @@ if __name__ == "__main__":
         gcg_text = f.read()
 
     states = parse_gcg(gcg_text)
+    patch_forward_racks(states)
     print(f"Replayed {len(states)-1} moves")
 
     if target_turn is not None:
