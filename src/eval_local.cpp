@@ -12,6 +12,8 @@
 #include <iomanip>
 #include <cstring>
 #include <chrono>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace fs = std::filesystem;
 
@@ -109,6 +111,17 @@ struct FailCase {
     CellResult rack_cr[7] = {};
     std::vector<std::vector<uint8_t>> rack_tile_pngs;
     bool rack_fail = false;
+};
+
+struct RackCase {
+    std::string name;
+    std::string rack_expected;
+    std::string rack_got;
+    bool rack_ok;
+    int n_tiles;
+    CellResult rack_cr[7];
+    std::vector<std::vector<uint8_t>> tile_pngs;
+    std::vector<uint8_t> rack_region_png;  // cropped rack region with bounding boxes
 };
 
 static void html_escape(std::ostream& out, const std::string& s) {
@@ -454,19 +467,231 @@ document.addEventListener('DOMContentLoaded', function() {
                  path.c_str(), cases.size());
 }
 
+// ── Rack-focused HTML report ────────────────────────────────────────────────
+
+static std::vector<uint8_t> make_rack_region_image(
+    const std::vector<uint8_t>& image_data,
+    int bx, int by, int cell_sz,
+    const std::vector<RackTile>& rack_tiles)
+{
+    cv::Mat raw(1, static_cast<int>(image_data.size()), CV_8UC1,
+                const_cast<uint8_t*>(image_data.data()));
+    cv::Mat img = cv::imdecode(raw, cv::IMREAD_COLOR);
+    if (img.empty()) return {};
+
+    // Rack region: from top of board bottom row to ~2.5 cell sizes below board
+    int board_bottom = by + 15 * cell_sz;
+    int y0 = std::max(0, board_bottom - cell_sz / 2);
+    int y1 = std::min(img.rows, board_bottom + cell_sz * 3);
+    int x0 = std::max(0, bx - cell_sz);
+    int x1 = std::min(img.cols, bx + 16 * cell_sz);
+    cv::Mat crop = img(cv::Range(y0, y1), cv::Range(x0, x1)).clone();
+
+    // Draw bounding boxes (offset by crop origin)
+    for (const auto& rt : rack_tiles) {
+        cv::Rect r = rt.rect;
+        r.x -= x0;
+        r.y -= y0;
+        cv::Scalar color = rt.is_blank
+            ? cv::Scalar(255, 0, 255)   // magenta for blanks
+            : cv::Scalar(0, 255, 255);  // cyan for normal
+        cv::rectangle(crop, r, color, 2);
+    }
+
+    std::vector<uint8_t> out;
+    cv::imencode(".png", crop, out);
+    return out;
+}
+
+static void write_rack_html_report(const std::string& path,
+                                    const std::vector<RackCase>& cases,
+                                    int rack_correct_tiles, int rack_total_tiles,
+                                    int rack_perfect, int rack_cases) {
+    std::ofstream out(path);
+    if (!out) {
+        std::fprintf(stderr, "Cannot write rack HTML to %s\n", path.c_str());
+        return;
+    }
+
+    int n_wrong = 0;
+    for (auto& rc : cases) if (!rc.rack_ok) n_wrong++;
+
+    out << R"(<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Rack Evaluation</title>
+<style>
+* { box-sizing: border-box; }
+body { background: #111; color: #ccc; font-family: 'SF Mono', 'Fira Code', monospace;
+       font-size: 13px; margin: 0; padding: 16px; }
+h1 { color: #eee; font-size: 1.2rem; margin-bottom: 4px; }
+.summary { color: #888; margin-bottom: 12px; font-size: .85rem; }
+.filters { margin-bottom: 16px; display: flex; gap: 8px; align-items: center; }
+.filters label { color: #aaa; font-size: .85rem; cursor: pointer; }
+.filters input[type="radio"] { margin-right: 2px; }
+.filter-btn { padding: 4px 14px; border-radius: 4px; border: 1px solid #444;
+              background: #222; color: #ccc; cursor: pointer; font-size: .85rem; }
+.filter-btn:hover { background: #333; }
+.filter-btn.active { background: #335; border-color: #77f; color: #aaf; }
+.case { background: #1a1a1a; border: 1px solid #333; border-radius: 6px;
+        padding: 12px; margin-bottom: 16px; }
+.case.correct { border-left: 3px solid #4a4; }
+.case.wrong { border-left: 3px solid #a44; }
+.case-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.case-title { color: #7af; font-weight: bold; }
+.case-rack { font-size: .85rem; }
+.rack-exp { color: #888; }
+.rack-got { font-weight: bold; }
+.rack-got.ok { color: #8f8; }
+.rack-got.miss { color: #f88; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 3px;
+         font-size: .75rem; font-weight: bold; }
+.badge.ok { background: #1a3a1a; color: #6d6; border: 1px solid #3a3; }
+.badge.miss { background: #3a1a1a; color: #f88; border: 1px solid #a33; }
+.rack-content { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.rack-region { flex: 0 0 auto; }
+.rack-region img { max-width: 500px; max-height: 200px; border: 1px solid #333;
+                   border-radius: 4px; display: block; }
+.tiles-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.tile-card { text-align: center; border: 1px solid #444; border-radius: 4px;
+             padding: 4px; background: #222; min-width: 60px; }
+.tile-card.tile-ok { border-color: #4a4; }
+.tile-card.tile-miss { border-color: #a44; }
+.tile-card img { width: 48px; height: 48px; display: block; margin: 0 auto 4px;
+                 image-rendering: pixelated; border-radius: 2px; }
+.tile-letter { font-weight: bold; font-size: 1.1rem; }
+.tile-letter.blank { color: #a8f; }
+.tile-conf { font-size: .7rem; color: #888; }
+.tile-cands { font-size: .65rem; color: #666; margin-top: 2px; }
+.tile-cands b { color: #aaa; }
+.no-tiles { color: #666; font-style: italic; font-size: .85rem; }
+</style>
+</head>
+<body>
+)";
+
+    out << "<h1>Rack Evaluation</h1>\n";
+    out << "<div class=\"summary\">"
+        << rack_correct_tiles << "/" << rack_total_tiles << " tiles correct ("
+        << std::fixed << std::setprecision(1)
+        << (rack_total_tiles > 0 ? 100.0 * rack_correct_tiles / rack_total_tiles : 0)
+        << "%), " << rack_perfect << "/" << rack_cases << " racks perfect, "
+        << n_wrong << " failures</div>\n";
+
+    // Filter buttons
+    int n_correct = static_cast<int>(cases.size()) - n_wrong;
+    out << "<div class=\"filters\">\n"
+        << "  <span style=\"color:#888;font-size:.85rem\">Show:</span>\n"
+        << "  <button class=\"filter-btn active\" onclick=\"filterCases('all',this)\">All ("
+        << cases.size() << ")</button>\n"
+        << "  <button class=\"filter-btn\" onclick=\"filterCases('wrong',this)\">Wrong ("
+        << n_wrong << ")</button>\n"
+        << "  <button class=\"filter-btn\" onclick=\"filterCases('correct',this)\">Correct ("
+        << n_correct << ")</button>\n"
+        << "</div>\n"
+        << "<script>\n"
+        << "function filterCases(mode, btn) {\n"
+        << "  document.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });\n"
+        << "  btn.classList.add('active');\n"
+        << "  document.querySelectorAll('.case').forEach(function(c) {\n"
+        << "    if (mode === 'all') c.style.display = '';\n"
+        << "    else if (mode === 'wrong') c.style.display = c.classList.contains('wrong') ? '' : 'none';\n"
+        << "    else if (mode === 'correct') c.style.display = c.classList.contains('correct') ? '' : 'none';\n"
+        << "  });\n"
+        << "}\n"
+        << "</script>\n";
+
+    for (auto& rc : cases) {
+        std::string cls = rc.rack_ok ? "correct" : "wrong";
+        out << "<div class=\"case " << cls << "\">\n";
+
+        // Header
+        out << "<div class=\"case-header\">\n";
+        out << "<span class=\"case-title\">" << rc.name << "</span>\n";
+        out << "<span class=\"badge " << (rc.rack_ok ? "ok" : "miss") << "\">"
+            << (rc.rack_ok ? "OK" : "MISS") << "</span>\n";
+        out << "<span class=\"case-rack\">"
+            << "<span class=\"rack-exp\">exp=<b>" << rc.rack_expected << "</b></span> "
+            << "<span class=\"rack-got " << (rc.rack_ok ? "ok" : "miss")
+            << "\">got=<b>" << rc.rack_got << "</b></span>"
+            << "</span>\n";
+        out << "</div>\n"; // case-header
+
+        out << "<div class=\"rack-content\">\n";
+
+        // Rack region image with bounding boxes
+        if (!rc.rack_region_png.empty()) {
+            out << "<div class=\"rack-region\">\n";
+            out << "<img src=\"data:image/png;base64,"
+                << base64_encode(rc.rack_region_png) << "\">\n";
+            out << "</div>\n";
+        }
+
+        // Individual tile cards
+        if (rc.n_tiles > 0) {
+            // Build expected sorted string for per-tile correctness
+            std::string exp_sorted = sort_rack(rc.rack_expected);
+            std::string got_sorted = sort_rack(rc.rack_got);
+
+            out << "<div class=\"tiles-row\">\n";
+            for (int ti = 0; ti < rc.n_tiles; ti++) {
+                char got_ch = rc.rack_cr[ti].letter;
+
+                out << "<div class=\"tile-card\">\n";
+                if (ti < (int)rc.tile_pngs.size() && !rc.tile_pngs[ti].empty()) {
+                    out << "<img src=\"data:image/png;base64,"
+                        << base64_encode(rc.tile_pngs[ti]) << "\">\n";
+                }
+                out << "<div class=\"tile-letter"
+                    << (rc.rack_cr[ti].is_blank ? " blank" : "")
+                    << "\">" << got_ch << "</div>\n";
+                out << "<div class=\"tile-conf\">"
+                    << static_cast<int>(rc.rack_cr[ti].confidence * 100)
+                    << "%</div>\n";
+                // Top-5 candidates
+                out << "<div class=\"tile-cands\">";
+                for (int k = 0; k < 5; k++) {
+                    char cl = rc.rack_cr[ti].cand_letters[k];
+                    if (cl < 'A' || cl > 'Z') break;
+                    if (k > 0) out << " ";
+                    out << "<b>" << cl << "</b>"
+                        << static_cast<int>(rc.rack_cr[ti].cand_scores[k] * 100);
+                }
+                out << "</div>\n";
+                out << "</div>\n"; // tile-card
+            }
+            out << "</div>\n"; // tiles-row
+        } else {
+            out << "<div class=\"no-tiles\">No tiles detected</div>\n";
+        }
+
+        out << "</div>\n"; // rack-content
+        out << "</div>\n"; // case
+    }
+
+    out << "</body></html>\n";
+    std::fprintf(stderr, "Rack HTML report written: %s (%zu cases)\n",
+                 path.c_str(), cases.size());
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
     std::setbuf(stdout, nullptr);
     if (argc < 2) {
-        std::cerr << "Usage: eval_local <testdata_dir> [--html <output.html>]\n";
+        std::cerr << "Usage: eval_local <testdata_dir> [--html <output.html>] [--rack-html <output.html>]\n";
         return 1;
     }
     std::string dir = argv[1];
     std::string html_path;
+    std::string rack_html_path;
     for (int i = 2; i < argc - 1; i++) {
         if (std::string(argv[i]) == "--html") {
             html_path = argv[i+1];
+            i++;
+        } else if (std::string(argv[i]) == "--rack-html") {
+            rack_html_path = argv[i+1];
             i++;
         }
     }
@@ -487,6 +712,7 @@ int main(int argc, char* argv[]) {
     int rack_per_letter_correct[26] = {};
 
     std::vector<FailCase> fail_cases;
+    std::vector<RackCase> rack_eval_cases;
 
     std::vector<std::string> files;
     for (auto& entry : fs::directory_iterator(dir)) {
@@ -629,6 +855,19 @@ int main(int argc, char* argv[]) {
         if (has_rack) {
             std::printf("  %d/%d%s", rack_tile_correct, rack_n_exp,
                         rack_ok ? "" : " MISS");
+            if (!rack_ok) {
+                std::fprintf(stderr, "  RACK MISS: exp=%s got=%s\n",
+                             sort_rack(expected_rack).c_str(), sort_rack(got_rack).c_str());
+                for (int i = 0; i < std::min(rack_n_rt, 7); i++) {
+                    std::fprintf(stderr, "    tile[%d]: %c conf=%.4f blank=%d",
+                                 i, rack_cr[i].letter, rack_cr[i].confidence, rack_cr[i].is_blank);
+                    for (int k = 0; k < 5; k++) {
+                        if (rack_cr[i].cand_letters[k])
+                            std::fprintf(stderr, " %c:%.3f", rack_cr[i].cand_letters[k], rack_cr[i].cand_scores[k]);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
         } else if (expected_rack.empty()) {
             std::printf("  -");
         } else {
@@ -664,6 +903,25 @@ int main(int argc, char* argv[]) {
                                                        : std::vector<uint8_t>{});
             }
             fail_cases.push_back(std::move(fc));
+        }
+
+        // Collect rack case for rack HTML report
+        if (!rack_html_path.empty() && has_rack) {
+            RackCase rc;
+            rc.name = name;
+            rc.rack_expected = sort_rack(expected_rack);
+            rc.rack_got = sort_rack(got_rack);
+            rc.rack_ok = rack_ok;
+            rc.n_tiles = std::min(rack_n_rt, 7);
+            std::memcpy(rc.rack_cr, rack_cr, sizeof(rack_cr));
+            for (int i = 0; i < rc.n_tiles; i++)
+                rc.tile_pngs.push_back(
+                    i < (int)rack_tiles_vec.size() ? rack_tiles_vec[i].png
+                                                   : std::vector<uint8_t>{});
+            rc.rack_region_png = make_rack_region_image(
+                imgdata, dr.board_rect.x, dr.board_rect.y, dr.cell_size,
+                rack_tiles_vec);
+            rack_eval_cases.push_back(std::move(rc));
         }
 
         total_tiles += tiles;
@@ -714,5 +972,12 @@ int main(int argc, char* argv[]) {
         write_html_report(html_path, fail_cases,
                           n_files, total_tiles, total_correct,
                           total_occ_errors, perfect_cases);
+    }
+
+    // Generate rack HTML report if requested
+    if (!rack_html_path.empty()) {
+        write_rack_html_report(rack_html_path, rack_eval_cases,
+                                rack_correct_tiles, rack_total_tiles,
+                                rack_perfect, rack_cases);
     }
 }

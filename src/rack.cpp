@@ -55,6 +55,56 @@ bool detect_board_mode(const std::vector<uint8_t>& image_data,
     return mean_v > 150;
 }
 
+// Prepare a rack tile crop for CNN classification:
+// 1. Adaptive bottom trim (capped at 25%)
+// 2. Square the crop: center-crop if wide, pad with border replication if tall
+static cv::Mat prepare_rack_crop(const cv::Mat& crop) {
+    cv::Mat gray;
+    cv::cvtColor(crop, gray, cv::COLOR_BGR2GRAY);
+
+    // Adaptive bottom trim: detect uniform-brightness bars at bottom
+    // (e.g., memento score margin bar). Cap at 25% to avoid trimming letter content.
+    int trim_bot = crop.rows * 15 / 100;
+    int max_trim = crop.rows / 4;  // cap at 25%
+    for (int y = crop.rows - 1; y > crop.rows / 2; y--) {
+        cv::Mat row_data = gray.row(y);
+        cv::Scalar m, s;
+        cv::meanStdDev(row_data, m, s);
+        if (s[0] < 15) {
+            int extra_trim = crop.rows - y;
+            if (extra_trim > trim_bot && extra_trim <= max_trim)
+                trim_bot = extra_trim;
+        } else {
+            break;
+        }
+    }
+    int new_h = std::max(1, crop.rows - trim_bot);
+    int new_w = crop.cols;
+
+    int x_off = 0, y_off = 0;
+    if (new_w > new_h) {
+        // Wide crop: center-crop horizontally to make square
+        x_off = (new_w - new_h) / 2;
+        new_w = new_h;
+    }
+    cv::Rect letter_roi(x_off, y_off, new_w, new_h);
+    letter_roi &= cv::Rect(0, 0, crop.cols, crop.rows);
+    cv::Mat sq = crop(letter_roi);
+
+    if (new_h > new_w * 5 / 4) {
+        // Tall/narrow crop: pad sides with border replication to make square.
+        // This prevents stretching narrow crops (e.g., memento partial tiles).
+        int target = new_h;
+        int pad_left = (target - new_w) / 2;
+        int pad_right = target - new_w - pad_left;
+        cv::Mat padded;
+        cv::copyMakeBorder(sq, padded, 0, 0, pad_left, pad_right,
+                           cv::BORDER_REPLICATE);
+        return padded;
+    }
+    return sq;
+}
+
 CellResult classify_rack_tile_full(const RackTile& rt) {
     CellResult cr = {};
     if (rt.is_blank) {
@@ -67,22 +117,74 @@ CellResult classify_rack_tile_full(const RackTile& rt) {
     cv::Mat crop = cv::imdecode(raw, cv::IMREAD_COLOR);
     if (crop.empty()) { cr.letter = '?'; return cr; }
 
-    int trim_bot = crop.rows * 15 / 100;
-    int new_h = std::max(1, crop.rows - trim_bot);
-
-    int new_w = crop.cols;
-    int x_off = 0;
-    if (new_w > new_h) {
-        x_off = (new_w - new_h) / 2;
-        new_w = new_h;
-    }
-    cv::Rect letter_roi(x_off, 0, new_w, new_h);
-    letter_roi &= cv::Rect(0, 0, crop.cols, crop.rows);
-    cv::Mat letter_crop = crop(letter_roi);
-
-    cr = classify_single_tile(letter_crop);
+    // Primary classification: standard crop
+    cv::Mat letter_crop = prepare_rack_crop(crop);
+    float scores_main[26] = {};
+    cr = classify_single_tile_ex(letter_crop, 0, scores_main);
     if (cr.letter >= 'a' && cr.letter <= 'z')
         cr.letter = static_cast<char>(cr.letter - 32);
+
+    // Multi-crop: try alternative crops when confidence is not very high.
+    // This helps when the primary crop's bottom trim or squaring removes
+    // critical letter features (e.g., J's descender hook, Q's tail).
+    if (cr.confidence < 0.99f && crop.cols > 12 && crop.rows > 12) {
+        float scores_alt[26] = {};
+        int n_alt = 0;
+        float scores_sum[26] = {};
+        for (int i = 0; i < 26; i++) scores_sum[i] = scores_main[i];
+
+        // Alt 1: no bottom trim — just center-crop to square
+        {
+            int w = crop.cols, h = crop.rows;
+            int s = std::min(w, h);
+            int x_off = (w > h) ? (w - h) / 2 : 0;
+            int y_off = (h > w) ? (h - w) / 2 : 0;
+            cv::Rect sq(x_off, y_off, s, s);
+            sq &= cv::Rect(0, 0, w, h);
+            if (sq.width > 8 && sq.height > 8) {
+                classify_single_tile_ex(crop(sq), 0, scores_alt);
+                for (int i = 0; i < 26; i++) scores_sum[i] += scores_alt[i];
+                n_alt++;
+            }
+        }
+
+        // Alt 2: inset crop (12.5% from each side)
+        {
+            int ix = crop.cols / 8, iy = crop.rows / 8;
+            cv::Rect inset(ix, iy, crop.cols - 2 * ix, crop.rows - 2 * iy);
+            inset &= cv::Rect(0, 0, crop.cols, crop.rows);
+            if (inset.width > 8 && inset.height > 8) {
+                cv::Mat isq = prepare_rack_crop(crop(inset));
+                classify_single_tile_ex(isq, 0, scores_alt);
+                for (int i = 0; i < 26; i++) scores_sum[i] += scores_alt[i];
+                n_alt++;
+            }
+        }
+
+        if (n_alt > 0) {
+            float best_avg = 0;
+            int best_idx = 0;
+            for (int i = 0; i < 26; i++) {
+                scores_sum[i] /= (1 + n_alt);
+                if (scores_sum[i] > best_avg) { best_avg = scores_sum[i]; best_idx = i; }
+            }
+            char new_letter = 'A' + best_idx;
+            if (new_letter != cr.letter) {
+                std::fprintf(stderr, "  rack multi-crop: %c(%.3f)->%c(%.3f)\n",
+                             cr.letter, cr.confidence, new_letter, best_avg);
+                cr.letter = new_letter;
+                cr.confidence = best_avg;
+                int idx[26];
+                for (int i = 0; i < 26; i++) idx[i] = i;
+                std::sort(idx, idx + 26, [&](int a, int b) {
+                    return scores_sum[a] > scores_sum[b]; });
+                for (int k = 0; k < 5; k++) {
+                    cr.cand_letters[k] = 'A' + idx[k];
+                    cr.cand_scores[k] = scores_sum[idx[k]];
+                }
+            }
+        }
+    }
     return cr;
 }
 
@@ -216,7 +318,7 @@ void alphagram_tiebreak(CellResult rack_results[], int n_tiles) {
     for (int i = 0; i < n_tiles; i++) {
         CellResult& cr = rack_results[i];
         if (cr.letter == '?' || cr.is_blank) continue;
-        if (cr.confidence > 0.98f) continue;
+        if (cr.confidence > 0.995f) continue;
 
         bool has_violation = false;
         if (i > 0) {
@@ -299,23 +401,27 @@ std::vector<RackTile> detect_rack_tiles(
                             sample_mean_v(v_chan.cols - sample_sz, v_chan.rows - sample_sz)});
     bool rack_bg_is_light = (bg_v > 150);
 
+    // Blur V channel to reduce JPEG artifact noise in threshold masks
+    cv::Mat v_blur;
+    cv::GaussianBlur(v_chan, v_blur, cv::Size(3, 3), 0);
+    cv::Mat s_chan;
+    cv::extractChannel(hsv, s_chan, 1);
+
     cv::Mat mask;
     if (rack_bg_is_light) {
-        cv::Mat s_chan;
-        cv::extractChannel(hsv, s_chan, 1);
-        cv::threshold(s_chan, mask, 25, 255, cv::THRESH_BINARY);
+        cv::threshold(s_chan, mask, 26, 255, cv::THRESH_BINARY);
         cv::Mat not_dark;
-        cv::threshold(v_chan, not_dark, 50, 255, cv::THRESH_BINARY);
+        cv::threshold(v_blur, not_dark, 50, 255, cv::THRESH_BINARY);
         mask &= not_dark;
     } else {
         int thresh = std::max(80, (int)(bg_v + 40));
-        cv::threshold(v_chan, mask, thresh, 255, cv::THRESH_BINARY);
-        cv::Mat s_chan;
-        cv::extractChannel(hsv, s_chan, 1);
+        cv::threshold(v_blur, mask, thresh, 255, cv::THRESH_BINARY);
+        cv::Mat s_blur;
+        cv::GaussianBlur(s_chan, s_blur, cv::Size(3, 3), 0);
         cv::Mat s_mask;
-        cv::threshold(s_chan, s_mask, 40, 255, cv::THRESH_BINARY);
+        cv::threshold(s_blur, s_mask, 40, 255, cv::THRESH_BINARY);
         cv::Mat v_above_bg;
-        cv::threshold(v_chan, v_above_bg, (int)(bg_v + 10), 255, cv::THRESH_BINARY);
+        cv::threshold(v_blur, v_above_bg, (int)(bg_v + 10), 255, cv::THRESH_BINARY);
         s_mask &= v_above_bg;
         mask |= s_mask;
     }
@@ -533,14 +639,8 @@ std::vector<RackTile> detect_rack_tiles(
 
     // --- Dimension sweep ---
     auto prep_and_classify = [](const cv::Mat& crop) -> CellResult {
-        int trim_bot = crop.rows * 15 / 100;
-        int nh = std::max(1, crop.rows - trim_bot);
-        int nw = crop.cols;
-        int xo = 0;
-        if (nw > nh) { xo = (nw - nh) / 2; nw = nh; }
-        cv::Rect roi(xo, 0, nw, nh);
-        roi &= cv::Rect(0, 0, crop.cols, crop.rows);
-        return classify_single_tile(crop(roi), false);
+        cv::Mat sq = prepare_rack_crop(crop);
+        return classify_single_tile(sq, false);
     };
 
     int n_tiles_count = (int)filtered.size();

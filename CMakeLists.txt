@@ -88,10 +88,12 @@ target_link_libraries(cell_hsv PRIVATE board_lib)
 
 # ── Gemini parse unit tests ────────────────────────────────────────────────
 
-add_executable(test_gemini_parse tests/test_gemini_parse.cpp)
-target_include_directories(test_gemini_parse PRIVATE src ${OpenCV_INCLUDE_DIRS})
-target_compile_definitions(test_gemini_parse PRIVATE
-    SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_gemini_parse.cpp")
+    add_executable(test_gemini_parse tests/test_gemini_parse.cpp)
+    target_include_directories(test_gemini_parse PRIVATE src ${OpenCV_INCLUDE_DIRS})
+    target_compile_definitions(test_gemini_parse PRIVATE
+        SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
 
 add_executable(diag src/diag.cpp)
 target_link_libraries(diag PRIVATE board_lib)
@@ -107,6 +109,11 @@ target_link_libraries(extract_label_crops PRIVATE board_lib)
 add_executable(eval_local src/eval_local.cpp)
 target_link_libraries(eval_local PRIVATE board_lib)
 
+add_executable(extract_rack_crops src/extract_rack_crops.cpp)
+target_link_libraries(extract_rack_crops PRIVATE board_lib)
+
 # ── Rack HSV diagnostic ──────────────────────────────────────────────────
-add_executable(rack_diag /tmp/rack_diag.cpp)
-target_link_libraries(rack_diag PRIVATE board_lib)
+if(EXISTS "${CMAKE_SOURCE_DIR}/src/rack_diag.cpp")
+    add_executable(rack_diag src/rack_diag.cpp)
+    target_link_libraries(rack_diag PRIVATE board_lib)
+endif()

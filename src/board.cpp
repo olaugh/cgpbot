@@ -1172,6 +1172,7 @@ static int point_value_of(char ch) {
     }
 }
 
+
 // Prepare a grayscale cell crop for Tesseract OCR.
 static cv::Mat prepare_ocr_image(const cv::Mat& crop, int target_size) {
     cv::Mat upscaled;
