@@ -766,6 +766,20 @@ std::vector<RackTile> detect_rack_tiles(
         r &= cv::Rect(0, 0, img.cols, img.rows);
         if (r.width <= 0 || r.height <= 0) continue;
 
+        // Cap tile dimensions to cell_sz: rack tiles are square (same size
+        // as board cells). This excludes progress bars below the tile and
+        // excess width that includes neighboring gaps.
+        if (r.height > cell_sz) {
+            r.height = cell_sz;
+        }
+        if (r.width > cell_sz) {
+            int cx = r.x + r.width / 2;
+            r.x = cx - cell_sz / 2;
+            r.width = cell_sz;
+            if (r.x < 0) r.x = 0;
+            if (r.x + r.width > img.cols) r.x = img.cols - r.width;
+        }
+
         bool is_blank_tile = is_blank[i];
 
         int p = 2;
