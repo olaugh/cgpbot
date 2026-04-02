@@ -478,20 +478,25 @@ std::vector<RackTile> detect_rack_tiles(
     int abs_y = search_roi.y + band_top;
     int abs_h = band_bot - band_top;
 
+    // Estimate tile width from the band height (tiles are ~square).
+    // Use abs_h as baseline since it reflects the actual rack tile size
+    // (which can be ~1.3x cell_sz on mobile).
+    int tile_w_est = std::max(abs_h, cell_sz * 3 / 4);
+
     for (auto& [sx, ex] : segments) {
         int seg_w = ex - sx;
         if (seg_w < cell_sz / 3) continue;
 
         int abs_x = search_roi.x + sx;
 
-        if (seg_w <= cell_sz * 3 / 2) {
+        if (seg_w <= tile_w_est * 3 / 2) {
             candidates.push_back({{abs_x, abs_y, seg_w, abs_h}});
         } else {
-            int n_tiles_est = std::max(1, (seg_w + cell_sz / 3) / cell_sz);
+            int n_tiles_est = std::max(1, (seg_w + tile_w_est / 3) / tile_w_est);
             if (n_tiles_est > 7) n_tiles_est = 7;
 
             std::vector<int> split_points;
-            int min_gap = cell_sz / 4;
+            int min_gap = tile_w_est / 4;
             for (int x = min_gap; x < seg_w - min_gap; x++) {
                 int v = col_sum.at<int>(0, sx + x);
                 bool is_min = true;
@@ -502,7 +507,18 @@ std::vector<RackTile> detect_rack_tiles(
                         if (col_sum.at<int>(0, nx) < v) is_min = false;
                     }
                 }
-                if (is_min && v < col_thresh) {
+                if (!is_min) continue;
+                // Accept the split if the valley is below absolute threshold,
+                // OR if it's a significant relative dip (< 60% of neighbors).
+                // The relative check handles JPEG-compressed gaps.
+                bool abs_ok = (v < col_thresh);
+                int left_val = (sx + x - win >= 0) ?
+                    col_sum.at<int>(0, sx + x - win) : v;
+                int right_val = (sx + x + win < col_sum.cols) ?
+                    col_sum.at<int>(0, sx + x + win) : v;
+                int neighbor_avg = (left_val + right_val) / 2;
+                bool rel_ok = (neighbor_avg > 0 && v < neighbor_avg * 3 / 5);
+                if (abs_ok || rel_ok) {
                     if (split_points.empty() || x - split_points.back() >= min_gap)
                         split_points.push_back(x);
                 }
@@ -622,9 +638,9 @@ std::vector<RackTile> detect_rack_tiles(
         }
     }
 
-    // Ensure detected tiles are at least cell_sz*3/4 wide
+    // Ensure detected tiles are at least tile_w_est*3/4 wide
     {
-        int min_w = cell_sz * 3 / 4;
+        int min_w = tile_w_est * 3 / 4;
         for (auto& c : filtered) {
             if (c.rect.width < min_w) {
                 int cx = c.rect.x + c.rect.width / 2;
