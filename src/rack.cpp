@@ -480,8 +480,9 @@ std::vector<RackTile> detect_rack_tiles(
 
     // Estimate tile width from the band height (tiles are ~square).
     // Use abs_h as baseline since it reflects the actual rack tile size
-    // (which can be ~1.3x cell_sz on mobile).
-    int tile_w_est = std::max(abs_h, cell_sz * 3 / 4);
+    // (which can be ~1.3x cell_sz on mobile). Floor at cell_sz to avoid
+    // overcounting when band_bot is clamped by the search region boundary.
+    int tile_w_est = std::max(abs_h, cell_sz);
 
     for (auto& [sx, ex] : segments) {
         int seg_w = ex - sx;
