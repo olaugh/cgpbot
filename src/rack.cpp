@@ -478,11 +478,35 @@ std::vector<RackTile> detect_rack_tiles(
     int abs_y = search_roi.y + band_top;
     int abs_h = band_bot - band_top;
 
-    // Estimate tile width from the band height (tiles are ~square).
-    // Use abs_h as baseline since it reflects the actual rack tile size
-    // (which can be ~1.3x cell_sz on mobile). Floor at cell_sz to avoid
-    // overcounting when band_bot is clamped by the search region boundary.
+    // Estimate tile width from the band height (tiles are ~square) and
+    // from single-tile segments when available.  On mobile/tablet, rack
+    // tiles are $tile-size-desktop (~1.29x cell_sz) while board cells
+    // use $tile-size-mobile.  abs_h and cell_sz underestimate because
+    // the vertical scan window is shorter than the tiles.  Boost
+    // tile_w_est with the minimum width of single-tile-sized segments
+    // (those ≤ 2*cell_sz), which captures the true rendered tile width.
+    // On mobile layout, rack tiles render at $tile-size-desktop
+    // (~1.29x cell_sz).  Detect mobile by: board fills image width,
+    // image is portrait, AND segments confirm the expected tile width.
     int tile_w_est = std::max(abs_h, cell_sz);
+    {
+        int board_w = 15 * cell_sz;
+        // cell_sz > 50 excludes 1x-DPR desktop crops where cell_sz≈34
+        bool maybe_mobile = (cell_sz > 50)
+                          && (board_w > img.cols * 4 / 5)
+                          && (img.rows > img.cols * 5 / 4);
+        if (maybe_mobile) {
+            int expected_tw = cell_sz * 44 / 34;
+            int match_count = 0;
+            for (auto& [s, e] : segments) {
+                int w = e - s;
+                if (w > expected_tw * 85 / 100 && w < expected_tw * 115 / 100)
+                    match_count++;
+            }
+            if (match_count >= 2)
+                tile_w_est = std::max(tile_w_est, expected_tw);
+        }
+    }
 
     for (auto& [sx, ex] : segments) {
         int seg_w = ex - sx;
