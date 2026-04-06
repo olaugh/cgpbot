@@ -55,7 +55,8 @@ target_link_libraries(board_lib PUBLIC ${OpenCV_LIBS} PkgConfig::FREETYPE2)
 target_compile_definitions(board_lib PUBLIC
     FONT_PATH="${CMAKE_SOURCE_DIR}/fonts/RobotoMono-Bold.ttf"
     TILE_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/tile_model.onnx"
-    LABEL_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/label_model.onnx")
+    LABEL_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/label_model.onnx"
+    OCC_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/occ_model.onnx")
 
 if(TESSERACT_FOUND)
     target_compile_definitions(board_lib PUBLIC HAS_TESSERACT=1)

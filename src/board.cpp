@@ -1390,6 +1390,33 @@ static bool tile_net_available() {
     return !get_tile_net().empty();
 }
 
+// Occupancy classifier: binary CNN (tile=1, empty=0)
+static cv::dnn::Net& get_occ_net() {
+    static cv::dnn::Net net;
+    static bool attempted = false;
+    if (!attempted) {
+        attempted = true;
+        const char* model_paths[] = {
+#ifdef OCC_MODEL_PATH
+            OCC_MODEL_PATH,
+#endif
+            "models/occ_model.onnx",
+            nullptr
+        };
+        for (int i = 0; model_paths[i]; i++) {
+            try {
+                net = cv::dnn::readNetFromONNX(model_paths[i]);
+                if (!net.empty()) break;
+            } catch (...) {}
+        }
+    }
+    return net;
+}
+
+static bool occ_net_available() {
+    return !get_occ_net().empty();
+}
+
 // Preprocess cell for CNN: must exactly match training/dataset.py preprocess().
 static cv::Mat preprocess_for_cnn(const cv::Mat& cell) {
     cv::Mat resized;
@@ -1410,6 +1437,24 @@ static cv::Mat preprocess_for_cnn(const cv::Mat& cell) {
     cv::equalizeHist(gray, gray);
 
     return gray;
+}
+
+// Classify occupancy using the binary CNN.  Returns true if the cell
+// contains a tile.
+static bool classify_occupancy_cnn(const cv::Mat& cell) {
+    cv::Mat preprocessed = preprocess_for_cnn(cell);
+    cv::Mat blob;
+    preprocessed.convertTo(blob, CV_32F, 1.0 / 255.0);
+    cv::Mat input = cv::dnn::blobFromImage(blob);
+
+    cv::dnn::Net& net = get_occ_net();
+    net.setInput(input);
+    cv::Mat output = net.forward();
+
+    // output shape: [1, 2] — class 0=empty, class 1=tile
+    float empty_score = output.at<float>(0, 0);
+    float tile_score = output.at<float>(0, 1);
+    return tile_score > empty_score;
 }
 
 // Compute scores using CNN.  Output is softmax probabilities in scores[26].
@@ -1862,8 +1907,9 @@ static void classify_cells(const CellImages& cell_imgs,
                     cv::Mat cg;
                     cv::cvtColor(ctr, cg, cv::COLOR_BGR2GRAY);
                     cv::meanStdDev(cg, gm, gs);
-                    bool det = is_tile(ci, is_light, r, c, log);
-                    // Temporary: log all cells for dark mode debugging
+                    bool det = occ_net_available()
+                        ? classify_occupancy_cnn(ci)
+                        : is_tile(ci, is_light, r, c, log);
                     log << "  [" << r+1 << "," << (char)('A'+c) << "]"
                         << (det ? " TILE" : " skip")
                         << " H=" << (int)hm[0] << " S=" << (int)hm[1]
@@ -1872,7 +1918,15 @@ static void classify_cells(const CellImages& cell_imgs,
                         << " con=" << (int)gs[0] << "\n";
                 }
             }
-            if (!is_tile(cell_imgs[r][c], is_light, r, c, log)) continue;
+            // Occupancy detection: use CNN classifier if available,
+            // fall back to heuristic is_tile().
+            bool occupied;
+            if (occ_net_available()) {
+                occupied = classify_occupancy_cnn(cell_imgs[r][c]);
+            } else {
+                occupied = is_tile(cell_imgs[r][c], is_light, r, c, log);
+            }
+            if (!occupied) continue;
 
             tile_refs.push_back({r, c});
             tile_images.push_back(cell_imgs[r][c]);
